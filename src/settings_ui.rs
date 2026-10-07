@@ -10,20 +10,28 @@ use windows_sys::Win32::{
         DeleteObject, DrawTextW, EndPaint, FillRect, GetStockObject, InvalidateRect, NULL_PEN,
         PAINTSTRUCT, Polygon, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
     },
-    UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, RegisterClassW, SW_HIDE, SW_SHOW, SetForegroundWindow,
-        ShowWindow, WM_CLOSE, WM_LBUTTONDOWN, WM_PAINT, WNDCLASSW, WS_CAPTION, WS_MINIMIZEBOX,
-        WS_OVERLAPPED, WS_SYSMENU,
+    UI::{
+        HiDpi::AdjustWindowRectExForDpi,
+        WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, IsWindowVisible, RegisterClassW, SW_HIDE, SW_SHOW,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
+            ShowWindow, WINDOW_STYLE, WM_CLOSE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_PAINT,
+            WNDCLASSW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+        },
     },
 };
 
 use crate::{
     config::{self, TargetFormat},
+    dpi,
     image_actions::ImageKind,
 };
 
+// Размер клиентской области в логических единицах (при 100% масштабе).
 const WIDTH: i32 = 500;
 const HEIGHT: i32 = 530;
+
+const WINDOW_STYLE_FLAGS: WINDOW_STYLE = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 
 const WHEEL_CENTER_X: f64 = 250.0;
 const WHEEL_CENTER_Y: f64 = 290.0;
@@ -172,6 +180,10 @@ unsafe fn paint(hwnd: HWND) {
         return;
     }
 
+    unsafe {
+        dpi::apply_to_dc(hdc, dpi::for_window(hwnd));
+    }
+
     let background = unsafe { CreateSolidBrush(rgb(27, 29, 34)) };
 
     let full_rect = RECT {
@@ -242,7 +254,7 @@ unsafe fn paint(hwnd: HWND) {
 
         let end = center_angle + 20.5;
 
-        let target = config::target_for_slot(selected_kind, slot);
+        let target = config::draft_target_for_slot(selected_kind, slot);
 
         let brush = unsafe {
             CreateSolidBrush(if target.is_some() {
@@ -349,16 +361,22 @@ unsafe fn paint(hwnd: HWND) {
 
     draw_text(hdc, "Save", save, rgb(255, 255, 255));
 
+    let (hint, hint_color) = if config::has_unsaved_changes() {
+        ("Unsaved changes — press Save", rgb(235, 190, 110))
+    } else {
+        ("Click a sector to change its action", rgb(170, 175, 185))
+    };
+
     draw_text(
         hdc,
-        "Click a sector to change its action",
+        hint,
         RECT {
-            left: 80,
+            left: 60,
             top: 430,
-            right: 420,
+            right: 440,
             bottom: 458,
         },
-        rgb(170, 175, 185),
+        hint_color,
     );
 
     unsafe {
@@ -386,9 +404,11 @@ unsafe extern "system" fn window_proc(
         }
 
         WM_LBUTTONDOWN => {
-            let x = (lparam as u32 & 0xFFFF) as i16 as i32;
+            let window_dpi = dpi::for_window(hwnd);
 
-            let y = ((lparam as u32 >> 16) & 0xFFFF) as i16 as i32;
+            let x = dpi::unscale((lparam as u32 & 0xFFFF) as i16 as i32, window_dpi);
+
+            let y = dpi::unscale(((lparam as u32 >> 16) & 0xFFFF) as i16 as i32, window_dpi);
 
             for index in 0..3 {
                 if point_in_rect(x, y, tab_rect(index)) {
@@ -413,23 +433,48 @@ unsafe extern "system" fn window_proc(
                     }
                 }
 
+                unsafe {
+                    InvalidateRect(hwnd, null(), 1);
+                }
+
                 return 0;
             }
 
             if let Some(slot) = slot_from_point(x, y) {
                 let kind = current_kind();
 
-                let current = config::target_for_slot(kind, slot);
+                let current = config::draft_target_for_slot(kind, slot);
 
                 let next = next_target(kind, current);
 
-                config::set_target_for_slot(kind, slot, next);
+                config::set_draft_target_for_slot(kind, slot, next);
 
                 unsafe {
                     InvalidateRect(hwnd, null(), 1);
                 }
 
                 return 0;
+            }
+
+            0
+        }
+
+        // Окно перетащили на монитор с другим масштабом.
+        WM_DPICHANGED => {
+            let suggested = unsafe { &*(lparam as *const RECT) };
+
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+
+                InvalidateRect(hwnd, null(), 1);
             }
 
             0
@@ -485,7 +530,7 @@ impl SettingsUi {
                 0,
                 CLASS_NAME.as_ptr(),
                 CLASS_NAME.as_ptr(),
-                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                WINDOW_STYLE_FLAGS,
                 200,
                 120,
                 WIDTH,
@@ -501,16 +546,52 @@ impl SettingsUi {
             return None;
         }
 
+        unsafe {
+            fit_client_area(hwnd);
+        }
+
         Some(Self { hwnd })
     }
 
     pub unsafe fn show(&self) {
         unsafe {
+            // Повторное нажатие горячей клавиши не должно сбрасывать начатые правки.
+            if IsWindowVisible(self.hwnd) == 0 {
+                config::begin_edit();
+            }
+
             ShowWindow(self.hwnd, SW_SHOW);
 
             SetForegroundWindow(self.hwnd);
 
             InvalidateRect(self.hwnd, null(), 1);
         }
+    }
+}
+
+// Подгоняет размер окна так, чтобы клиентская область была WIDTH x HEIGHT
+// логических единиц при текущем масштабе монитора.
+unsafe fn fit_client_area(hwnd: HWND) {
+    let window_dpi = dpi::for_window(hwnd);
+
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: dpi::scale(WIDTH, window_dpi),
+        bottom: dpi::scale(HEIGHT, window_dpi),
+    };
+
+    unsafe {
+        AdjustWindowRectExForDpi(&mut rect, WINDOW_STYLE_FLAGS, 0, 0, window_dpi);
+
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            0,
+            0,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
     }
 }

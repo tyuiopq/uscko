@@ -1,30 +1,32 @@
 use std::mem::zeroed;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use windows_sys::Win32::{
-    Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::{
         BeginPaint, CreateSolidBrush, DEFAULT_GUI_FONT, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
         DeleteObject, DrawTextW, EndPaint, FillRect, GetStockObject, InvalidateRect, PAINTSTRUCT,
         SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
     },
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, GetSystemMetrics, HWND_TOPMOST, KillTimer, LWA_ALPHA,
-        RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+        CreateWindowExW, DefWindowProcW, GetCursorPos, HWND_TOPMOST, KillTimer, LWA_ALPHA,
+        RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
         SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, WM_PAINT, WNDCLASSW,
         WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
         WS_POPUP,
     },
 };
 
-use crate::job_manager;
+use crate::{dpi, job_manager};
 
 const WIDTH: i32 = 270;
 const HEIGHT: i32 = 52;
 
+// Отступы от края рабочей области (панель задач уже исключена).
 const MARGIN_RIGHT: i32 = 18;
-const MARGIN_BOTTOM: i32 = 72;
+const MARGIN_BOTTOM: i32 = 18;
 
 pub const TIMER_DELAY_ID: usize = 2001;
 pub const TIMER_ANIMATION_ID: usize = 2002;
@@ -40,6 +42,11 @@ const ANIMATION_MS: u32 = 45;
 static MODE: AtomicI32 = AtomicI32::new(0);
 
 static PHASE: AtomicI32 = AtomicI32::new(0);
+
+static WINDOW_DPI: AtomicU32 = AtomicU32::new(dpi::BASE_DPI);
+
+// Формат, в который идёт текущая конвертация.
+static TARGET_LABEL: Mutex<&'static str> = Mutex::new("");
 
 static CLASS_NAME: &[u16] = &[
     'F' as u16, 'i' as u16, 'l' as u16, 'e' as u16, 'H' as u16, 'a' as u16, 'l' as u16, 'o' as u16,
@@ -82,6 +89,10 @@ unsafe fn paint(hwnd: HWND) {
 
     if hdc.is_null() {
         return;
+    }
+
+    unsafe {
+        dpi::apply_to_dc(hdc, WINDOW_DPI.load(Ordering::Relaxed));
     }
 
     let mode = MODE.load(Ordering::Relaxed);
@@ -161,7 +172,9 @@ unsafe fn paint(hwnd: HWND) {
         }
 
         2 => {
-            draw_text(hdc, "✓ PNG готов", rgb(225, 227, 232));
+            let label = TARGET_LABEL.lock().map(|label| *label).unwrap_or("");
+
+            draw_text(hdc, &format!("✓ {label} готов"), rgb(225, 227, 232));
         }
 
         3 => {
@@ -266,7 +279,11 @@ impl StatusUi {
         self.hwnd
     }
 
-    pub unsafe fn begin_pending(&self) {
+    pub unsafe fn begin_pending(&self, target_label: &'static str) {
+        if let Ok(mut label) = TARGET_LABEL.lock() {
+            *label = target_label;
+        }
+
         MODE.store(0, Ordering::Relaxed);
 
         PHASE.store(0, Ordering::Relaxed);
@@ -284,14 +301,29 @@ impl StatusUi {
         }
     }
 
+    // Показывает окно в углу того монитора, где сейчас курсор.
     unsafe fn show_window(&self) {
-        let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        let mut cursor = POINT { x: 0, y: 0 };
 
-        let screen_height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+        unsafe {
+            GetCursorPos(&mut cursor);
+        }
 
-        let x = screen_width - WIDTH - MARGIN_RIGHT;
+        let Some(area) = dpi::work_area_at(cursor) else {
+            return;
+        };
 
-        let y = screen_height - HEIGHT - MARGIN_BOTTOM;
+        let window_dpi = dpi::for_point(cursor);
+
+        WINDOW_DPI.store(window_dpi, Ordering::Relaxed);
+
+        let width = dpi::scale(WIDTH, window_dpi);
+
+        let height = dpi::scale(HEIGHT, window_dpi);
+
+        let x = area.right - width - dpi::scale(MARGIN_RIGHT, window_dpi);
+
+        let y = area.bottom - height - dpi::scale(MARGIN_BOTTOM, window_dpi);
 
         unsafe {
             SetWindowPos(
@@ -299,8 +331,8 @@ impl StatusUi {
                 HWND_TOPMOST,
                 x,
                 y,
-                WIDTH,
-                HEIGHT,
+                width,
+                height,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
 

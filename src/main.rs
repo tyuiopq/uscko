@@ -1,5 +1,6 @@
 mod config;
 mod converter;
+mod dpi;
 mod explorer_selection;
 mod foreground;
 mod image_actions;
@@ -11,7 +12,7 @@ use std::f64::consts::PI;
 use std::mem::zeroed;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 
@@ -41,12 +42,20 @@ const SETTINGS_HOTKEY_ID: i32 = 2;
 const VK_SPACE: i32 = 0x20;
 const VK_CONTROL: i32 = 0x11;
 const VK_MENU: i32 = 0x12;
-const VK_S: u32 = 0x53;
+// Не буква: на раскладках с AltGr (польская и др.) Ctrl+Alt+буква
+// печатает символ, и глобальная горячая клавиша мешала бы набору текста.
+const VK_F12: u32 = 0x7B;
 
 const OVERLAY_SIZE: i32 = 280;
 
 const TIMER_INTERVAL_MS: u32 = 16;
 const TIMER_ID: usize = 1;
+
+// Проводник замечает новый файл не сразу, поэтому выделить результат
+// конвертации пробуем несколько раз: каждые 100 мс в течение 2 секунд.
+const SELECT_TIMER_ID: usize = 3;
+const SELECT_RETRY_MS: u32 = 100;
+const SELECT_MAX_ATTEMPTS: u32 = 20;
 
 const OUTER_RADIUS: f64 = 122.0;
 const INNER_RADIUS: i32 = 43;
@@ -55,6 +64,9 @@ const DEAD_ZONE_RADIUS: f64 = 43.0;
 const SECTOR_HYSTERESIS_DEGREES: f64 = 7.0;
 
 static ACTIVE_DIRECTION: AtomicI32 = AtomicI32::new(-1);
+
+// Масштаб монитора, на котором открыто колесо.
+static WHEEL_DPI: AtomicU32 = AtomicU32::new(dpi::BASE_DPI);
 
 // -1 = none
 // 0 = JPEG
@@ -262,6 +274,10 @@ unsafe fn draw_wheel(hwnd: HWND) {
         return;
     }
 
+    unsafe {
+        dpi::apply_to_dc(hdc, WHEEL_DPI.load(Ordering::Relaxed));
+    }
+
     let rect = RECT {
         left: 0,
         top: 0,
@@ -393,11 +409,13 @@ unsafe extern "system" fn window_proc(
 }
 
 fn main() {
+    dpi::enable_per_monitor_awareness();
+
     println!("FileHalo starting...");
 
     println!("Hold: Ctrl + Alt + Space");
 
-    println!("Settings: Ctrl + Alt + S");
+    println!("Settings: Ctrl + Alt + F12");
 
     let config_path = match config::initialize() {
         Ok(path) => path,
@@ -501,7 +519,7 @@ fn main() {
             null_mut(),
             SETTINGS_HOTKEY_ID,
             MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
-            VK_S,
+            VK_F12,
         );
 
         if settings_registered == 0 {
@@ -526,6 +544,9 @@ fn main() {
 
         let mut active_file: Option<PathBuf> = None;
 
+        // Результат конвертации, который ещё нужно выделить в Проводнике.
+        let mut pending_select: Option<(PathBuf, u32)> = None;
+
         loop {
             let result = GetMessageW(&mut message, null_mut(), 0, 0);
 
@@ -549,6 +570,14 @@ fn main() {
                         println!("DONE: {}", output.display(),);
 
                         status_ui.finish_success();
+
+                        if explorer_selection::select_file(&output) {
+                            pending_select = None;
+                        } else {
+                            pending_select = Some((output, 1));
+
+                            SetTimer(overlay, SELECT_TIMER_ID, SELECT_RETRY_MS, None);
+                        }
                     }
 
                     Some(job_manager::JobResult::Failed(error)) => {
@@ -558,6 +587,33 @@ fn main() {
                     }
 
                     None => {}
+                }
+
+                continue;
+            }
+
+            // -------------------------
+            // SELECT CONVERTED FILE
+            // -------------------------
+
+            if message.message == WM_TIMER
+                && message.hwnd == overlay
+                && message.wParam == SELECT_TIMER_ID
+            {
+                let done = match &mut pending_select {
+                    Some((path, attempts)) => {
+                        *attempts += 1;
+
+                        explorer_selection::select_file(path) || *attempts >= SELECT_MAX_ATTEMPTS
+                    }
+
+                    None => true,
+                };
+
+                if done {
+                    KillTimer(overlay, SELECT_TIMER_ID);
+
+                    pending_select = None;
                 }
 
                 continue;
@@ -616,17 +672,23 @@ fn main() {
                     if GetCursorPos(&mut center) != 0 {
                         ACTIVE_DIRECTION.store(-1, Ordering::Relaxed);
 
-                        let x = center.x - OVERLAY_SIZE / 2;
+                        let wheel_dpi = dpi::for_point(center);
 
-                        let y = center.y - OVERLAY_SIZE / 2;
+                        WHEEL_DPI.store(wheel_dpi, Ordering::Relaxed);
+
+                        let size = dpi::scale(OVERLAY_SIZE, wheel_dpi);
+
+                        let x = center.x - size / 2;
+
+                        let y = center.y - size / 2;
 
                         SetWindowPos(
                             overlay,
                             HWND_TOPMOST,
                             x,
                             y,
-                            OVERLAY_SIZE,
-                            OVERLAY_SIZE,
+                            size,
+                            size,
                             SWP_NOACTIVATE | SWP_SHOWWINDOW,
                         );
 
@@ -679,7 +741,7 @@ fn main() {
                                     );
 
                                     if started {
-                                        status_ui.begin_pending();
+                                        status_ui.begin_pending(action.label());
 
                                         println!("Job started: {}", action.label());
                                     } else {
@@ -722,9 +784,12 @@ fn main() {
                 let mut cursor: POINT = zeroed();
 
                 if GetCursorPos(&mut cursor) != 0 {
-                    let dx = cursor.x - center.x;
+                    // Геометрия колеса задана в логических единицах.
+                    let wheel_dpi = WHEEL_DPI.load(Ordering::Relaxed);
 
-                    let dy = cursor.y - center.y;
+                    let dx = dpi::unscale(cursor.x - center.x, wheel_dpi);
+
+                    let dy = dpi::unscale(cursor.y - center.y, wheel_dpi);
 
                     let new_direction = direction_with_hysteresis(dx, dy, current_direction);
 

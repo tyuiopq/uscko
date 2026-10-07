@@ -1,4 +1,5 @@
 mod actions;
+mod archive;
 mod config;
 mod converter;
 mod dpi;
@@ -6,6 +7,9 @@ mod explorer_selection;
 mod file_types;
 mod foreground;
 mod job_manager;
+mod metadata;
+mod output;
+mod pdf;
 mod settings_ui;
 mod status_ui;
 
@@ -16,7 +20,7 @@ use std::ptr::{null, null_mut};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
-use actions::{ActionId, Category, Selection};
+use actions::{ActionId, ActionOutcome, Category, Selection};
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 
@@ -228,18 +232,42 @@ fn set_wheel_slots(slots: [Option<ActionId>; 8]) {
     }
 }
 
-fn result_text(action: ActionId, outputs: usize, failures: usize) -> (bool, String) {
-    let label = action.label();
+// Текст окна статуса: (успех?, текст).
+fn result_text(outcome: &ActionOutcome) -> (bool, String) {
+    let done = outcome.outputs.len();
+    let skipped = outcome.skipped.len();
+    let failed = outcome.failures.len();
 
-    match (outputs, failures) {
-        (1, 0) => (true, format!("✓ {label} готов")),
-
-        (_, 0) => (true, format!("✓ Готово: {outputs} → {label}")),
-
-        (0, 1) => (false, "Conversion failed".to_string()),
-
-        _ => (false, format!("Failed: {failures} of {}", outputs + failures)),
+    if failed > 0 {
+        return if done == 0 && skipped == 0 && failed == 1 {
+            (false, "Ошибка".to_string())
+        } else {
+            (false, format!("Ошибок: {failed} из {}", done + skipped + failed))
+        };
     }
+
+    if done == 0 {
+        return match outcome.skipped.as_slice() {
+            [(_, reason)] => (true, format!("Пропущено: {reason}")),
+
+            _ => (true, format!("Пропущено: {skipped}")),
+        };
+    }
+
+    let mut text = match outcome.outputs.as_slice() {
+        [output] => format!(
+            "✓ {}",
+            output.file_name().unwrap_or_default().to_string_lossy()
+        ),
+
+        _ => format!("✓ Готово: {done}"),
+    };
+
+    if skipped > 0 {
+        text.push_str(&format!(", пропущено: {skipped}"));
+    }
+
+    (true, text)
 }
 
 unsafe fn draw_label(
@@ -589,16 +617,21 @@ fn main() {
             if message.message == job_manager::WM_FILEHALO_JOB_DONE {
                 if let Some(job_manager::JobResult { action, outcome }) = job_manager::take_result()
                 {
+                    println!("FINISHED: {}", action.label());
+
                     for output in &outcome.outputs {
                         println!("DONE: {}", output.display());
+                    }
+
+                    for (input, reason) in &outcome.skipped {
+                        println!("SKIPPED: {}: {}", input.display(), reason);
                     }
 
                     for (input, error) in &outcome.failures {
                         eprintln!("FAILED: {}: {}", input.display(), error);
                     }
 
-                    let (success, text) =
-                        result_text(action, outcome.outputs.len(), outcome.failures.len());
+                    let (success, text) = result_text(&outcome);
 
                     if success {
                         status_ui.finish_success(text);

@@ -86,16 +86,75 @@ impl SlotLayout {
 #[serde(default)]
 pub struct WheelConfig {
     pub images: SlotLayout,
+    pub pdf: SlotLayout,
+    pub archive: SlotLayout,
+    pub files: SlotLayout,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+// Версия формата конфига. Повышается, когда новым действиям нужно место
+// в уже сохранённых раскладках (см. migrate).
+const CONFIG_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    // В старых файлах поля нет — это версия 0.
+    #[serde(default)]
+    pub version: u32,
+
     pub wheel: WheelConfig,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            version: CONFIG_VERSION,
+            wheel: WheelConfig::default(),
+        }
+    }
+}
+
+impl SlotLayout {
+    fn contains(&self, action: ActionId) -> bool {
+        (0..8).any(|slot| self.action_for_slot(slot) == Some(action))
+    }
+
+    // Пустые слоты заполняются действиями из defaults, если их ещё нет
+    // в раскладке. Заполненные пользователем слоты не трогаются.
+    fn fill_empty_from(&mut self, defaults: &SlotLayout) {
+        for slot in 0..8 {
+            let Some(action) = defaults.action_for_slot(slot) else {
+                continue;
+            };
+
+            if self.action_for_slot(slot).is_none() && !self.contains(action) {
+                self.set_action_for_slot(slot, Some(action));
+            }
+        }
+    }
+}
+
+// Приводит конфиг старой версии к текущей. Возвращает true, если что-то поменялось.
+fn migrate(config: &mut AppConfig) -> bool {
+    if config.version >= CONFIG_VERSION {
+        return false;
+    }
+
+    // Версия 2: у картинок появились PDF, сжатие, уменьшение, очистка и ZIP.
+    if config.version < 2 {
+        let defaults = WheelConfig::default();
+
+        config.wheel.images.fill_empty_from(&defaults.images);
+    }
+
+    config.version = CONFIG_VERSION;
+
+    true
 }
 
 // У каждого действия постоянное место, чтобы его запоминали руки.
 // Если действие к выделению неприменимо (PNG -> PNG), слот просто пустой.
+// ZIP во всех категориях на одном месте — северо-запад.
 impl Default for WheelConfig {
     fn default() -> Self {
         Self {
@@ -103,6 +162,27 @@ impl Default for WheelConfig {
                 n: Some(ActionId::ConvertToPng),
                 e: Some(ActionId::ConvertToJpeg),
                 s: Some(ActionId::ConvertToWebp),
+                w: Some(ActionId::ImagesToPdf),
+                ne: Some(ActionId::CompressImages),
+                se: Some(ActionId::ResizeImages),
+                sw: Some(ActionId::StripMetadata),
+                nw: Some(ActionId::CreateZip),
+            },
+
+            pdf: SlotLayout {
+                n: Some(ActionId::PdfToImages),
+                e: Some(ActionId::MergePdfs),
+                nw: Some(ActionId::CreateZip),
+                ..SlotLayout::default()
+            },
+
+            archive: SlotLayout {
+                n: Some(ActionId::ExtractArchive),
+                ..SlotLayout::default()
+            },
+
+            files: SlotLayout {
+                nw: Some(ActionId::CreateZip),
                 ..SlotLayout::default()
             },
         }
@@ -182,7 +262,15 @@ fn load_or_create() -> Result<(AppConfig, PathBuf), String> {
     }
 
     match read_config(&path) {
-        Ok(config) => Ok((config, path)),
+        Ok(mut config) => {
+            if migrate(&mut config) {
+                if let Err(error) = write_config(&path, &config) {
+                    eprintln!("{error}");
+                }
+            }
+
+            Ok((config, path))
+        }
 
         // Повреждённый конфиг не должен мешать запуску. Сохраняем его копию,
         // чтобы настройки можно было восстановить вручную, и работаем с умолчаниями.
@@ -213,12 +301,18 @@ fn load_or_create() -> Result<(AppConfig, PathBuf), String> {
 fn layout(config: &AppConfig, category: Category) -> &SlotLayout {
     match category {
         Category::Images => &config.wheel.images,
+        Category::Pdf => &config.wheel.pdf,
+        Category::Archive => &config.wheel.archive,
+        Category::Files => &config.wheel.files,
     }
 }
 
 fn layout_mut(config: &mut AppConfig, category: Category) -> &mut SlotLayout {
     match category {
         Category::Images => &mut config.wheel.images,
+        Category::Pdf => &mut config.wheel.pdf,
+        Category::Archive => &mut config.wheel.archive,
+        Category::Files => &mut config.wheel.files,
     }
 }
 

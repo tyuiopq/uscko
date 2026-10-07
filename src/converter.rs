@@ -1,59 +1,38 @@
-use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use image::{
     DynamicImage, ImageDecoder, ImageEncoder, ImageReader, RgbImage,
-    codecs::{jpeg::JpegEncoder, png::PngEncoder},
+    codecs::{
+        jpeg::JpegEncoder,
+        png::{CompressionType, FilterType as PngFilterType, PngEncoder},
+    },
+    imageops::FilterType,
     metadata::Orientation,
 };
 
+use crate::actions::ActionError;
 use crate::file_types::{self, ImageKind};
+use crate::output;
 
 const JPEG_QUALITY: u8 = 92;
 
 const WEBP_QUALITY: f32 = 90.0;
 
+const COMPRESS_JPEG_QUALITY: u8 = 80;
+
+const COMPRESS_WEBP_QUALITY: f32 = 75.0;
+
 // Ограничение формата WebP.
 const WEBP_MAX_DIMENSION: u32 = 16383;
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempGuard {
-    path: PathBuf,
-    committed: bool,
+pub struct DecodedImage {
+    pub image: DynamicImage,
+    pub icc_profile: Option<Vec<u8>>,
 }
 
-impl TempGuard {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            committed: false,
-        }
-    }
-
-    fn commit(&mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for TempGuard {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-struct DecodedImage {
-    image: DynamicImage,
-    icc_profile: Option<Vec<u8>>,
-}
-
-fn decode(source: &Path) -> Result<DecodedImage, String> {
+pub fn decode(source: &Path) -> Result<DecodedImage, String> {
     let mut decoder = ImageReader::open(source)
         .map_err(|error| format!("Could not open source image: {error}"))?
         .with_guessed_format()
@@ -94,9 +73,10 @@ fn is_rgb_profile(profile: &[u8], image: &DynamicImage) -> bool {
 }
 
 // JPEG не поддерживает прозрачность: без этого прозрачные области становятся чёрными.
-fn flatten_on_white(image: DynamicImage) -> DynamicImage {
+// None — прозрачности нет, картинку можно кодировать как есть.
+pub fn flatten_on_white(image: &DynamicImage) -> Option<DynamicImage> {
     if !image.has_alpha() {
-        return image;
+        return None;
     }
 
     let rgba = image.to_rgba8();
@@ -113,154 +93,193 @@ fn flatten_on_white(image: DynamicImage) -> DynamicImage {
         }
     }
 
-    DynamicImage::ImageRgb8(rgb)
+    Some(DynamicImage::ImageRgb8(rgb))
 }
 
-fn available_output_path(source: &Path, extension: &str) -> Result<PathBuf, String> {
-    let parent = source.parent().ok_or("Source has no parent directory")?;
+#[derive(Debug, Clone, Copy)]
+pub enum Encoding {
+    // best: медленнее, но файл меньше (для сжатия).
+    Png { best: bool },
+    Jpeg { quality: u8 },
+    // quality: None — без потерь.
+    WebP { quality: Option<f32> },
+}
 
-    let stem = source.file_stem().ok_or("Source has no filename")?;
+impl Encoding {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Png { .. } => "png",
+            Self::Jpeg { .. } => "jpg",
+            Self::WebP { .. } => "webp",
+        }
+    }
+}
 
-    for number in 0..100_000u32 {
-        let mut name = OsString::from(stem);
+pub fn encode(
+    image: &DynamicImage,
+    icc_profile: Option<&[u8]>,
+    encoding: Encoding,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
 
-        if number > 0 {
-            name.push(format!(" ({number})"));
+    match encoding {
+        Encoding::Png { best } => {
+            let mut encoder = if best {
+                PngEncoder::new_with_quality(
+                    &mut bytes,
+                    CompressionType::Best,
+                    PngFilterType::Adaptive,
+                )
+            } else {
+                PngEncoder::new(&mut bytes)
+            };
+
+            if let Some(profile) = icc_profile {
+                let _ = encoder.set_icc_profile(profile.to_vec());
+            }
+
+            image
+                .write_with_encoder(encoder)
+                .map_err(|error| format!("PNG encoding failed: {error}"))?;
         }
 
-        name.push(".");
-        name.push(extension);
+        Encoding::Jpeg { quality } => {
+            let flattened = flatten_on_white(image);
 
-        let candidate = parent.join(name);
+            let mut encoder = JpegEncoder::new_with_quality(&mut bytes, quality);
 
-        if !candidate.exists() {
-            return Ok(candidate);
+            if let Some(profile) = icc_profile {
+                let _ = encoder.set_icc_profile(profile.to_vec());
+            }
+
+            flattened
+                .as_ref()
+                .unwrap_or(image)
+                .write_with_encoder(encoder)
+                .map_err(|error| format!("JPEG encoding failed: {error}"))?;
+        }
+
+        Encoding::WebP { quality } => {
+            bytes = encode_webp(image, quality)?;
+
+            if let Some(profile) = icc_profile {
+                bytes = embed_webp_icc_profile(bytes, profile, image)?;
+            }
         }
     }
 
-    Err("Could not find available output filename".to_string())
+    Ok(bytes)
 }
 
-fn create_temp_file(parent: &Path) -> Result<(PathBuf, File), String> {
-    let pid = std::process::id();
-
-    for _ in 0..100 {
-        let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-        let path = parent.join(format!(".filehalo-{pid}-{id}.tmp"));
-
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => {
-                return Ok((path, file));
-            }
-
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                continue;
-            }
-
-            Err(error) => {
-                return Err(format!("Could not create temporary file: {error}"));
-            }
-        }
-    }
-
-    Err("Could not create temporary filename".to_string())
-}
-
-// Пишет результат во временный файл рядом с исходником и только потом
-// переименовывает его, чтобы никогда не оставлять недописанный файл.
-fn write_output(
-    source: &Path,
-    extension: &str,
-    write: impl FnOnce(&mut BufWriter<File>) -> Result<(), String>,
-) -> Result<PathBuf, String> {
-    let output = available_output_path(source, extension)?;
-
-    let parent = output.parent().ok_or("Invalid output directory")?;
-
-    let (temp_path, temp_file) = create_temp_file(parent)?;
-
-    let mut guard = TempGuard::new(temp_path.clone());
-
-    {
-        let mut writer = BufWriter::new(temp_file);
-
-        write(&mut writer)?;
-
+fn save_bytes(bytes: &[u8], output: &Path) -> Result<PathBuf, String> {
+    output::write_file(output, |writer| {
         writer
-            .flush()
-            .map_err(|error| format!("Could not flush output: {error}"))?;
-
-        writer
-            .get_ref()
-            .sync_all()
-            .map_err(|error| format!("Could not sync output: {error}"))?;
-    }
-
-    fs::rename(&temp_path, &output)
-        .map_err(|error| format!("Could not finalize output file: {error}"))?;
-
-    guard.commit();
-
-    Ok(output)
-}
-
-pub fn to_png(source: &Path) -> Result<PathBuf, String> {
-    let decoded = decode(source)?;
-
-    write_output(source, "png", |writer| {
-        let mut encoder = PngEncoder::new(writer);
-
-        if let Some(profile) = decoded.icc_profile {
-            let _ = encoder.set_icc_profile(profile);
-        }
-
-        decoded
-            .image
-            .write_with_encoder(encoder)
-            .map_err(|error| format!("PNG encoding failed: {error}"))
+            .write_all(bytes)
+            .map_err(|error| format!("Could not write output: {error}"))
     })
 }
 
-pub fn to_jpeg(source: &Path) -> Result<PathBuf, String> {
-    let decoded = decode(source)?;
+// Источник сжат с потерями (JPEG или WebP с потерями).
+pub fn is_lossy_source(source: &Path) -> bool {
+    match file_types::image_kind(source) {
+        Some(ImageKind::Jpeg) => true,
 
-    let image = flatten_on_white(decoded.image);
+        Some(ImageKind::WebP) => !webp_is_lossless(source),
 
-    write_output(source, "jpg", |writer| {
-        let mut encoder = JpegEncoder::new_with_quality(writer, JPEG_QUALITY);
-
-        if let Some(profile) = decoded.icc_profile {
-            let _ = encoder.set_icc_profile(profile);
-        }
-
-        image
-            .write_with_encoder(encoder)
-            .map_err(|error| format!("JPEG encoding failed: {error}"))
-    })
+        _ => false,
+    }
 }
 
-pub fn to_webp(source: &Path) -> Result<PathBuf, String> {
+pub fn convert(source: &Path, target: ImageKind) -> Result<PathBuf, String> {
     let decoded = decode(source)?;
 
-    // JPEG уже сжат с потерями, поэтому WebP с потерями ничего заметного не теряет.
-    // PNG обычно графика или скриншоты, там важна точность пикселей.
-    let lossless = file_types::image_kind(source) != Some(ImageKind::Jpeg);
+    let encoding = match target {
+        ImageKind::Png => Encoding::Png { best: false },
 
-    let mut bytes = encode_webp(&decoded.image, lossless)?;
+        ImageKind::Jpeg => Encoding::Jpeg {
+            quality: JPEG_QUALITY,
+        },
 
-    if let Some(profile) = &decoded.icc_profile {
-        bytes = embed_webp_icc_profile(bytes, profile, &decoded.image)?;
+        // Сжатое с потерями пересжимаем с потерями: заметно ничего не теряется,
+        // а файл получается маленьким. Графику и скриншоты — без потерь.
+        ImageKind::WebP => Encoding::WebP {
+            quality: is_lossy_source(source).then_some(WEBP_QUALITY),
+        },
+    };
+
+    let bytes = encode(&decoded.image, decoded.icc_profile.as_deref(), encoding)?;
+
+    save_bytes(&bytes, &output::next_to(source, encoding.extension())?)
+}
+
+// Тот же формат, но меньше по размеру файла.
+pub fn compress(source: &Path) -> Result<PathBuf, ActionError> {
+    let original_size = std::fs::metadata(source)
+        .map_err(|error| format!("Could not read {}: {error}", source.display()))?
+        .len();
+
+    let decoded = decode(source)?;
+
+    let encoding = match file_types::image_kind(source) {
+        Some(ImageKind::Jpeg) => Encoding::Jpeg {
+            quality: COMPRESS_JPEG_QUALITY,
+        },
+
+        Some(ImageKind::WebP) if is_lossy_source(source) => Encoding::WebP {
+            quality: Some(COMPRESS_WEBP_QUALITY),
+        },
+
+        Some(ImageKind::WebP) => Encoding::WebP { quality: None },
+
+        _ => Encoding::Png { best: true },
+    };
+
+    let bytes = encode(&decoded.image, decoded.icc_profile.as_deref(), encoding)?;
+
+    // Экономия меньше 5% не стоит лишнего файла.
+    if bytes.len() as u64 >= original_size / 100 * 95 {
+        return Err(ActionError::Skipped("уже сжато".to_string()));
     }
 
-    write_output(source, "webp", |writer| {
-        writer
-            .write_all(&bytes)
-            .map_err(|error| format!("Could not write WebP: {error}"))
-    })
+    Ok(save_bytes(
+        &bytes,
+        &output::next_to_with_suffix(source, "compressed", encoding.extension())?,
+    )?)
 }
 
-fn encode_webp(image: &DynamicImage, lossless: bool) -> Result<Vec<u8>, String> {
+// Уменьшает так, чтобы длинная сторона была не больше max_side.
+pub fn resize(source: &Path, max_side: u32) -> Result<PathBuf, ActionError> {
+    let decoded = decode(source)?;
+
+    if decoded.image.width().max(decoded.image.height()) <= max_side {
+        return Err(ActionError::Skipped(format!("уже не больше {max_side} px")));
+    }
+
+    let image = decoded
+        .image
+        .resize(max_side, max_side, FilterType::Lanczos3);
+
+    let encoding = match file_types::image_kind(source) {
+        Some(ImageKind::Jpeg) => Encoding::Jpeg {
+            quality: JPEG_QUALITY,
+        },
+
+        Some(ImageKind::WebP) => Encoding::WebP {
+            quality: is_lossy_source(source).then_some(WEBP_QUALITY),
+        },
+
+        _ => Encoding::Png { best: false },
+    };
+
+    let bytes = encode(&image, decoded.icc_profile.as_deref(), encoding)?;
+
+    Ok(save_bytes(
+        &bytes,
+        &output::next_to_with_suffix(source, &format!("{max_side}px"), encoding.extension())?,
+    )?)
+}
+
+fn encode_webp(image: &DynamicImage, quality: Option<f32>) -> Result<Vec<u8>, String> {
     let (width, height) = (image.width(), image.height());
 
     if width > WEBP_MAX_DIMENSION || height > WEBP_MAX_DIMENSION {
@@ -292,17 +311,17 @@ fn encode_webp(image: &DynamicImage, lossless: bool) -> Result<Vec<u8>, String> 
 
         let data = pixels.as_ptr();
 
-        match (has_alpha, lossless) {
-            (true, true) => WebPEncodeLosslessRGBA(data, width, height, stride, &mut output),
+        match (has_alpha, quality) {
+            (true, None) => WebPEncodeLosslessRGBA(data, width, height, stride, &mut output),
 
-            (true, false) => {
-                WebPEncodeRGBA(data, width, height, stride, WEBP_QUALITY, &mut output)
+            (true, Some(quality)) => {
+                WebPEncodeRGBA(data, width, height, stride, quality, &mut output)
             }
 
-            (false, true) => WebPEncodeLosslessRGB(data, width, height, stride, &mut output),
+            (false, None) => WebPEncodeLosslessRGB(data, width, height, stride, &mut output),
 
-            (false, false) => {
-                WebPEncodeRGB(data, width, height, stride, WEBP_QUALITY, &mut output)
+            (false, Some(quality)) => {
+                WebPEncodeRGB(data, width, height, stride, quality, &mut output)
             }
         }
     };
@@ -320,7 +339,7 @@ fn encode_webp(image: &DynamicImage, lossless: bool) -> Result<Vec<u8>, String> 
     Ok(bytes)
 }
 
-fn push_chunk(target: &mut Vec<u8>, fourcc: &[u8; 4], payload: &[u8]) {
+pub fn push_chunk(target: &mut Vec<u8>, fourcc: &[u8; 4], payload: &[u8]) {
     target.extend_from_slice(fourcc);
     target.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     target.extend_from_slice(payload);
@@ -340,34 +359,7 @@ fn embed_webp_icc_profile(
     const ICC_FLAG: u8 = 0x20;
     const ALPHA_FLAG: u8 = 0x10;
 
-    let invalid = || "Unexpected WebP structure".to_string();
-
-    if webp.len() < 12 || &webp[0..4] != b"RIFF" || &webp[8..12] != b"WEBP" {
-        return Err(invalid());
-    }
-
-    let mut chunks: Vec<([u8; 4], &[u8])> = Vec::new();
-
-    let mut offset = 12;
-
-    while offset + 8 <= webp.len() {
-        let fourcc: [u8; 4] = webp[offset..offset + 4].try_into().map_err(|_| invalid())?;
-
-        let size =
-            u32::from_le_bytes(webp[offset + 4..offset + 8].try_into().map_err(|_| invalid())?)
-                as usize;
-
-        let start = offset + 8;
-        let end = start.checked_add(size).ok_or_else(invalid)?;
-
-        if end > webp.len() {
-            return Err(invalid());
-        }
-
-        chunks.push((fourcc, &webp[start..end]));
-
-        offset = end + size % 2;
-    }
+    let chunks = webp_chunks(&webp)?;
 
     let mut body = Vec::with_capacity(webp.len() + profile.len() + 32);
 
@@ -407,14 +399,63 @@ fn embed_webp_icc_profile(
             }
         }
 
-        None => return Err(invalid()),
+        None => return Err("Unexpected WebP structure".to_string()),
     }
 
+    Ok(riff_from_body(body))
+}
+
+pub fn riff_from_body(body: Vec<u8>) -> Vec<u8> {
     let mut result = Vec::with_capacity(body.len() + 8);
 
     result.extend_from_slice(b"RIFF");
     result.extend_from_slice(&(body.len() as u32).to_le_bytes());
     result.extend_from_slice(&body);
 
-    Ok(result)
+    result
+}
+
+// Чанки файла WebP (RIFF): (тип, содержимое).
+pub fn webp_chunks(webp: &[u8]) -> Result<Vec<([u8; 4], &[u8])>, String> {
+    let invalid = || "Unexpected WebP structure".to_string();
+
+    if webp.len() < 12 || &webp[0..4] != b"RIFF" || &webp[8..12] != b"WEBP" {
+        return Err(invalid());
+    }
+
+    let mut chunks = Vec::new();
+
+    let mut offset = 12;
+
+    while offset + 8 <= webp.len() {
+        let fourcc: [u8; 4] = webp[offset..offset + 4].try_into().map_err(|_| invalid())?;
+
+        let size =
+            u32::from_le_bytes(webp[offset + 4..offset + 8].try_into().map_err(|_| invalid())?)
+                as usize;
+
+        let start = offset + 8;
+        let end = start.checked_add(size).ok_or_else(invalid)?;
+
+        if end > webp.len() {
+            return Err(invalid());
+        }
+
+        chunks.push((fourcc, &webp[start..end]));
+
+        offset = end + size % 2;
+    }
+
+    Ok(chunks)
+}
+
+// WebP без потерь хранит картинку в чанке VP8L, с потерями — в VP8.
+fn webp_is_lossless(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+
+    webp_chunks(&bytes)
+        .map(|chunks| chunks.iter().any(|(fourcc, _)| fourcc == b"VP8L"))
+        .unwrap_or(false)
 }

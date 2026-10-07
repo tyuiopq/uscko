@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use windows_sys::Win32::{
     Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::{
-        BeginPaint, CreateSolidBrush, DEFAULT_GUI_FONT, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+        BeginPaint, CreateSolidBrush, DEFAULT_GUI_FONT, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
+        DT_VCENTER,
         DeleteObject, DrawTextW, EndPaint, FillRect, GetStockObject, InvalidateRect, PAINTSTRUCT,
         SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
     },
@@ -77,7 +78,7 @@ fn draw_text(hdc: *mut std::ffi::c_void, text: &str, color: COLORREF) {
             wide.as_ptr(),
             wide.len() as i32,
             &mut rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
     }
 }
@@ -121,9 +122,9 @@ unsafe fn paint(hwnd: HWND) {
             let (done, total) = job_manager::progress();
 
             let text = if total > 1 {
-                format!("Converting {done}/{total}…")
+                format!("Обработка {done}/{total}…")
             } else {
-                "Converting…".to_string()
+                "Обработка…".to_string()
             };
 
             draw_text(hdc, &text, rgb(225, 227, 232));

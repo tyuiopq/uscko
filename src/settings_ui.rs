@@ -22,9 +22,8 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    config::{self, TargetFormat},
-    dpi,
-    image_actions::ImageKind,
+    actions::{ActionId, Category},
+    config, dpi,
 };
 
 // Размер клиентской области в логических единицах (при 100% масштабе).
@@ -39,7 +38,8 @@ const WHEEL_CENTER_Y: f64 = 290.0;
 const OUTER_RADIUS: f64 = 145.0;
 const INNER_RADIUS: f64 = 60.0;
 
-static ACTIVE_KIND: AtomicI32 = AtomicI32::new(0);
+// Индекс открытой вкладки в Category::ALL.
+static ACTIVE_CATEGORY: AtomicI32 = AtomicI32::new(0);
 
 static CLASS_NAME: &[u16] = &[
     'F' as u16, 'i' as u16, 'l' as u16, 'e' as u16, 'H' as u16, 'a' as u16, 'l' as u16, 'o' as u16,
@@ -61,20 +61,10 @@ fn point_on_circle(radius: f64, degrees: f64) -> POINT {
     }
 }
 
-fn current_kind() -> ImageKind {
-    match ACTIVE_KIND.load(Ordering::Relaxed) {
-        1 => ImageKind::Png,
-        2 => ImageKind::WebP,
-        _ => ImageKind::Jpeg,
-    }
-}
+fn current_category() -> Category {
+    let index = ACTIVE_CATEGORY.load(Ordering::Relaxed) as usize;
 
-fn kind_label(kind: ImageKind) -> &'static str {
-    match kind {
-        ImageKind::Jpeg => "JPEG",
-        ImageKind::Png => "PNG",
-        ImageKind::WebP => "WebP",
-    }
+    Category::ALL.get(index).copied().unwrap_or(Category::ALL[0])
 }
 
 fn draw_text(hdc: *mut std::ffi::c_void, text: &str, mut rect: RECT, color: COLORREF) {
@@ -95,10 +85,18 @@ fn draw_text(hdc: *mut std::ffi::c_void, text: &str, mut rect: RECT, color: COLO
     }
 }
 
+// Вкладки категорий, выровненные по центру.
 fn tab_rect(index: i32) -> RECT {
-    let width = 110;
+    const TAB_WIDTH: i32 = 110;
+    const TAB_GAP: i32 = 10;
 
-    let left = 70 + index * 120;
+    let count = Category::ALL.len() as i32;
+
+    let total = count * TAB_WIDTH + (count - 1) * TAB_GAP;
+
+    let width = TAB_WIDTH;
+
+    let left = (WIDTH - total) / 2 + index * (TAB_WIDTH + TAB_GAP);
 
     RECT {
         left,
@@ -141,34 +139,18 @@ fn slot_from_point(x: i32, y: i32) -> Option<i32> {
     Some(((angle + 22.5) / 45.0).floor() as i32 % 8)
 }
 
-fn next_target(source: ImageKind, current: Option<TargetFormat>) -> Option<TargetFormat> {
-    let candidates = [
-        None,
-        Some(TargetFormat::Jpg),
-        Some(TargetFormat::Png),
-        Some(TargetFormat::Webp),
-    ];
+// Клик по сектору перебирает: пусто -> действия категории по порядку -> пусто.
+fn next_action(category: Category, current: Option<ActionId>) -> Option<ActionId> {
+    let candidates: Vec<Option<ActionId>> = std::iter::once(None)
+        .chain(category.actions().map(Some))
+        .collect();
 
     let current_index = candidates
         .iter()
         .position(|value| *value == current)
         .unwrap_or(0);
 
-    for offset in 1..=candidates.len() {
-        let candidate = candidates[(current_index + offset) % candidates.len()];
-
-        match candidate {
-            Some(format) if format.matches_source(source) => {
-                continue;
-            }
-
-            _ => {
-                return candidate;
-            }
-        }
-    }
-
-    None
+    candidates[(current_index + 1) % candidates.len()]
 }
 
 unsafe fn paint(hwnd: HWND) {
@@ -215,19 +197,13 @@ unsafe fn paint(hwnd: HWND) {
         rgb(240, 242, 246),
     );
 
-    let selected_kind = current_kind();
+    let selected_category = current_category();
 
-    for index in 0..3 {
-        let kind = match index {
-            1 => ImageKind::Png,
-            2 => ImageKind::WebP,
-            _ => ImageKind::Jpeg,
-        };
-
-        let rect = tab_rect(index);
+    for (index, &category) in Category::ALL.iter().enumerate() {
+        let rect = tab_rect(index as i32);
 
         let brush = unsafe {
-            CreateSolidBrush(if kind == selected_kind {
+            CreateSolidBrush(if category == selected_category {
                 rgb(75, 105, 170)
             } else {
                 rgb(45, 48, 56)
@@ -240,7 +216,7 @@ unsafe fn paint(hwnd: HWND) {
             DeleteObject(brush);
         }
 
-        draw_text(hdc, kind_label(kind), rect, rgb(235, 237, 242));
+        draw_text(hdc, category.label(), rect, rgb(235, 237, 242));
     }
 
     let null_pen = unsafe { GetStockObject(NULL_PEN) };
@@ -254,7 +230,7 @@ unsafe fn paint(hwnd: HWND) {
 
         let end = center_angle + 20.5;
 
-        let target = config::draft_target_for_slot(selected_kind, slot);
+        let target = config::draft_action_for_slot(selected_category, slot);
 
         let brush = unsafe {
             CreateSolidBrush(if target.is_some() {
@@ -292,7 +268,7 @@ unsafe fn paint(hwnd: HWND) {
         }
 
         let label = match target {
-            Some(format) => format.label(),
+            Some(action) => action.label(),
 
             None => "—",
         };
@@ -339,7 +315,7 @@ unsafe fn paint(hwnd: HWND) {
 
     draw_text(
         hdc,
-        kind_label(selected_kind),
+        selected_category.label(),
         RECT {
             left: 200,
             top: 270,
@@ -410,9 +386,9 @@ unsafe extern "system" fn window_proc(
 
             let y = dpi::unscale(((lparam as u32 >> 16) & 0xFFFF) as i16 as i32, window_dpi);
 
-            for index in 0..3 {
+            for index in 0..Category::ALL.len() as i32 {
                 if point_in_rect(x, y, tab_rect(index)) {
-                    ACTIVE_KIND.store(index, Ordering::Relaxed);
+                    ACTIVE_CATEGORY.store(index, Ordering::Relaxed);
 
                     unsafe {
                         InvalidateRect(hwnd, null(), 1);
@@ -441,13 +417,13 @@ unsafe extern "system" fn window_proc(
             }
 
             if let Some(slot) = slot_from_point(x, y) {
-                let kind = current_kind();
+                let category = current_category();
 
-                let current = config::draft_target_for_slot(kind, slot);
+                let current = config::draft_action_for_slot(category, slot);
 
-                let next = next_target(kind, current);
+                let next = next_action(category, current);
 
-                config::set_draft_target_for_slot(kind, slot, next);
+                config::set_draft_action_for_slot(category, slot, next);
 
                 unsafe {
                     InvalidateRect(hwnd, null(), 1);

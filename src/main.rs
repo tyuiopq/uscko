@@ -1,9 +1,10 @@
+mod actions;
 mod config;
 mod converter;
 mod dpi;
 mod explorer_selection;
+mod file_types;
 mod foreground;
-mod image_actions;
 mod job_manager;
 mod settings_ui;
 mod status_ui;
@@ -12,7 +13,10 @@ use std::f64::consts::PI;
 use std::mem::zeroed;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+
+use actions::{ActionId, Category, Selection};
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 
@@ -68,11 +72,9 @@ static ACTIVE_DIRECTION: AtomicI32 = AtomicI32::new(-1);
 // Масштаб монитора, на котором открыто колесо.
 static WHEEL_DPI: AtomicU32 = AtomicU32::new(dpi::BASE_DPI);
 
-// -1 = none
-// 0 = JPEG
-// 1 = PNG
-// 2 = WebP
-static ACTIVE_IMAGE_KIND: AtomicI32 = AtomicI32::new(-1);
+// Действия в слотах открытого колеса (индекс = слот). Заполняется при
+// открытии: только те действия из конфига, что применимы к выделению.
+static WHEEL_SLOTS: Mutex<[Option<ActionId>; 8]> = Mutex::new([None; 8]);
 
 static CLASS_NAME: &[u16] = &[
     'F' as u16, 'i' as u16, 'l' as u16, 'e' as u16, 'H' as u16, 'a' as u16, 'l' as u16, 'o' as u16,
@@ -214,8 +216,30 @@ fn direction_with_hysteresis(dx: i32, dy: i32, current: Option<Direction>) -> Op
     }
 }
 
-fn current_image_kind() -> Option<image_actions::ImageKind> {
-    image_actions::ImageKind::from_code(ACTIVE_IMAGE_KIND.load(Ordering::Relaxed))
+fn wheel_action(slot: i32) -> Option<ActionId> {
+    let slots = WHEEL_SLOTS.lock().ok()?;
+
+    slots.get(usize::try_from(slot).ok()?).copied().flatten()
+}
+
+fn set_wheel_slots(slots: [Option<ActionId>; 8]) {
+    if let Ok(mut current) = WHEEL_SLOTS.lock() {
+        *current = slots;
+    }
+}
+
+fn result_text(action: ActionId, outputs: usize, failures: usize) -> (bool, String) {
+    let label = action.label();
+
+    match (outputs, failures) {
+        (1, 0) => (true, format!("✓ {label} готов")),
+
+        (_, 0) => (true, format!("✓ Готово: {outputs} → {label}")),
+
+        (0, 1) => (false, "Conversion failed".to_string()),
+
+        _ => (false, format!("Failed: {failures} of {}", outputs + failures)),
+    }
 }
 
 unsafe fn draw_label(
@@ -297,8 +321,6 @@ unsafe fn draw_wheel(hwnd: HWND) {
 
     let active = ACTIVE_DIRECTION.load(Ordering::Relaxed);
 
-    let active_kind = current_image_kind();
-
     let null_pen = unsafe { GetStockObject(NULL_PEN) };
 
     let old_pen = unsafe { SelectObject(hdc, null_pen) };
@@ -314,7 +336,7 @@ unsafe fn draw_wheel(hwnd: HWND) {
 
         let end_angle = center_angle + 20.5;
 
-        let action = active_kind.and_then(|kind| config::action_for_slot(kind, index as i32));
+        let action = wheel_action(index as i32);
 
         let has_action = action.is_some();
 
@@ -542,10 +564,10 @@ fn main() {
 
         let mut current_direction: Option<Direction> = None;
 
-        let mut active_file: Option<PathBuf> = None;
+        let mut active_selection: Option<Selection> = None;
 
-        // Результат конвертации, который ещё нужно выделить в Проводнике.
-        let mut pending_select: Option<(PathBuf, u32)> = None;
+        // Результаты, которые ещё нужно выделить в Проводнике.
+        let mut pending_select: Option<(Vec<PathBuf>, u32)> = None;
 
         loop {
             let result = GetMessageW(&mut message, null_mut(), 0, 0);
@@ -565,28 +587,34 @@ fn main() {
             // -------------------------
 
             if message.message == job_manager::WM_FILEHALO_JOB_DONE {
-                match job_manager::take_result() {
-                    Some(job_manager::JobResult::Completed(output)) => {
-                        println!("DONE: {}", output.display(),);
+                if let Some(job_manager::JobResult { action, outcome }) = job_manager::take_result()
+                {
+                    for output in &outcome.outputs {
+                        println!("DONE: {}", output.display());
+                    }
 
-                        status_ui.finish_success();
+                    for (input, error) in &outcome.failures {
+                        eprintln!("FAILED: {}: {}", input.display(), error);
+                    }
 
-                        if explorer_selection::select_file(&output) {
+                    let (success, text) =
+                        result_text(action, outcome.outputs.len(), outcome.failures.len());
+
+                    if success {
+                        status_ui.finish_success(text);
+                    } else {
+                        status_ui.finish_error(text);
+                    }
+
+                    if !outcome.outputs.is_empty() {
+                        if explorer_selection::select_files(&outcome.outputs) {
                             pending_select = None;
                         } else {
-                            pending_select = Some((output, 1));
+                            pending_select = Some((outcome.outputs, 1));
 
                             SetTimer(overlay, SELECT_TIMER_ID, SELECT_RETRY_MS, None);
                         }
                     }
-
-                    Some(job_manager::JobResult::Failed(error)) => {
-                        eprintln!("CONVERSION FAILED: {}", error,);
-
-                        status_ui.finish_error();
-                    }
-
-                    None => {}
                 }
 
                 continue;
@@ -601,10 +629,10 @@ fn main() {
                 && message.wParam == SELECT_TIMER_ID
             {
                 let done = match &mut pending_select {
-                    Some((path, attempts)) => {
+                    Some((paths, attempts)) => {
                         *attempts += 1;
 
-                        explorer_selection::select_file(path) || *attempts >= SELECT_MAX_ATTEMPTS
+                        explorer_selection::select_files(paths) || *attempts >= SELECT_MAX_ATTEMPTS
                     }
 
                     None => true,
@@ -651,23 +679,32 @@ fn main() {
                         continue;
                     }
 
-                    let Some(path) = explorer_selection::selected_path() else {
+                    let selection = Selection::new(explorer_selection::selected_paths());
+
+                    if selection.files.is_empty() {
                         println!("No selected file.");
 
                         continue;
-                    };
+                    }
 
-                    println!("Selected: {}", path.display(),);
+                    println!("Selected: {} file(s)", selection.files.len());
 
-                    let Some(image_kind) = image_actions::detect_kind(&path) else {
-                        println!("Unsupported file type.");
+                    let Some(category) = Category::of(&selection) else {
+                        println!("Unsupported selection.");
 
                         continue;
                     };
 
-                    ACTIVE_IMAGE_KIND.store(image_kind.code(), Ordering::Relaxed);
+                    let mut slots = [None; 8];
 
-                    active_file = Some(path);
+                    for (slot, action) in slots.iter_mut().enumerate() {
+                        *action = config::action_for_slot(category, slot as i32)
+                            .filter(|action| !action.inputs(&selection).is_empty());
+                    }
+
+                    set_wheel_slots(slots);
+
+                    active_selection = Some(selection);
 
                     if GetCursorPos(&mut center) != 0 {
                         ACTIVE_DIRECTION.store(-1, Ordering::Relaxed);
@@ -699,9 +736,9 @@ fn main() {
                         if timer_id == 0 {
                             eprintln!("Could not start timer.");
 
-                            active_file = None;
+                            active_selection = None;
 
-                            ACTIVE_IMAGE_KIND.store(-1, Ordering::Relaxed);
+                            set_wheel_slots([None; 8]);
 
                             ShowWindow(overlay, SW_HIDE);
                         } else {
@@ -722,30 +759,26 @@ fn main() {
                     if let Some(direction) = current_direction {
                         let slot = direction_to_index(direction);
 
-                        let action = current_image_kind()
-                            .and_then(|kind| config::action_for_slot(kind, slot));
-
-                        match action {
+                        match wheel_action(slot) {
                             Some(action) => {
-                                if let Some(path) = &active_file {
-                                    println!("ACTION: {}", action.label(),);
+                                if let Some(selection) = &active_selection {
+                                    let inputs = action.inputs(selection);
 
-                                    println!("FILE: {}", path.display(),);
-
-                                    let source = path.clone();
-
-                                    let started = job_manager::start_conversion(
-                                        status_ui.hwnd(),
-                                        source,
-                                        action,
+                                    println!(
+                                        "ACTION: {} ({} file(s))",
+                                        action.label(),
+                                        inputs.len()
                                     );
 
+                                    let started =
+                                        job_manager::start(status_ui.hwnd(), action, inputs);
+
                                     if started {
-                                        status_ui.begin_pending(action.label());
+                                        status_ui.begin_pending();
 
                                         println!("Job started: {}", action.label());
                                     } else {
-                                        println!("Another conversion is already running.");
+                                        println!("Another job is already running.");
                                     }
                                 }
                             }
@@ -766,11 +799,11 @@ fn main() {
 
                     ACTIVE_DIRECTION.store(-1, Ordering::Relaxed);
 
-                    ACTIVE_IMAGE_KIND.store(-1, Ordering::Relaxed);
+                    set_wheel_slots([None; 8]);
 
                     current_direction = None;
 
-                    active_file = None;
+                    active_selection = None;
 
                     wheel_open = false;
 
@@ -800,10 +833,7 @@ fn main() {
                             Some(direction) => {
                                 let slot = direction_to_index(direction);
 
-                                let action = current_image_kind()
-                                    .and_then(|kind| config::action_for_slot(kind, slot));
-
-                                if let Some(action) = action {
+                                if let Some(action) = wheel_action(slot) {
                                     println!("Selected: {}", action.label());
 
                                     slot

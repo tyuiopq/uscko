@@ -45,8 +45,8 @@ static PHASE: AtomicI32 = AtomicI32::new(0);
 
 static WINDOW_DPI: AtomicU32 = AtomicU32::new(dpi::BASE_DPI);
 
-// Формат, в который идёт текущая конвертация.
-static TARGET_LABEL: Mutex<&'static str> = Mutex::new("");
+// Итоговый текст (успех или ошибка), который показывает окно.
+static RESULT_TEXT: Mutex<String> = Mutex::new(String::new());
 
 static CLASS_NAME: &[u16] = &[
     'F' as u16, 'i' as u16, 'l' as u16, 'e' as u16, 'H' as u16, 'a' as u16, 'l' as u16, 'o' as u16,
@@ -118,7 +118,15 @@ unsafe fn paint(hwnd: HWND) {
 
     match mode {
         1 => {
-            draw_text(hdc, "Converting…", rgb(225, 227, 232));
+            let (done, total) = job_manager::progress();
+
+            let text = if total > 1 {
+                format!("Converting {done}/{total}…")
+            } else {
+                "Converting…".to_string()
+            };
+
+            draw_text(hdc, &text, rgb(225, 227, 232));
 
             let track_rect = RECT {
                 left: 12,
@@ -172,13 +180,15 @@ unsafe fn paint(hwnd: HWND) {
         }
 
         2 => {
-            let label = TARGET_LABEL.lock().map(|label| *label).unwrap_or("");
+            let text = RESULT_TEXT.lock().map(|text| text.clone()).unwrap_or_default();
 
-            draw_text(hdc, &format!("✓ {label} готов"), rgb(225, 227, 232));
+            draw_text(hdc, &text, rgb(225, 227, 232));
         }
 
         3 => {
-            draw_text(hdc, "Conversion failed", rgb(235, 220, 220));
+            let text = RESULT_TEXT.lock().map(|text| text.clone()).unwrap_or_default();
+
+            draw_text(hdc, &text, rgb(235, 220, 220));
         }
 
         _ => {}
@@ -279,11 +289,7 @@ impl StatusUi {
         self.hwnd
     }
 
-    pub unsafe fn begin_pending(&self, target_label: &'static str) {
-        if let Ok(mut label) = TARGET_LABEL.lock() {
-            *label = target_label;
-        }
-
+    pub unsafe fn begin_pending(&self) {
         MODE.store(0, Ordering::Relaxed);
 
         PHASE.store(0, Ordering::Relaxed);
@@ -384,7 +390,11 @@ impl StatusUi {
         }
     }
 
-    pub unsafe fn finish_success(&self) {
+    pub unsafe fn finish_success(&self, text: String) {
+        if let Ok(mut result) = RESULT_TEXT.lock() {
+            *result = text;
+        }
+
         unsafe {
             KillTimer(self.hwnd, TIMER_DELAY_ID);
 
@@ -402,7 +412,11 @@ impl StatusUi {
         }
     }
 
-    pub unsafe fn finish_error(&self) {
+    pub unsafe fn finish_error(&self, text: String) {
+        if let Ok(mut result) = RESULT_TEXT.lock() {
+            *result = text;
+        }
+
         unsafe {
             KillTimer(self.hwnd, TIMER_DELAY_ID);
 

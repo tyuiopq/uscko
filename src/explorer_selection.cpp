@@ -6,6 +6,11 @@
 #include <shobjidl.h>
 #include <cwchar>
 
+// STL здесь намеренно не используется: иначе программе понадобился бы
+// msvcp140.dll (Visual C++ Redistributable).
+
+typedef void (*PathCallback)(void* context, const wchar_t* path);
+
 namespace {
 
 template <typename T>
@@ -14,6 +19,35 @@ void release(T*& pointer) {
         pointer->Release();
         pointer = nullptr;
     }
+}
+
+class ComScope {
+public:
+    ComScope() {
+        should_uninitialize_ = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+    }
+
+    ~ComScope() {
+        if (should_uninitialize_) {
+            CoUninitialize();
+        }
+    }
+
+private:
+    bool should_uninitialize_ = false;
+};
+
+IShellWindows* create_shell_windows() {
+    IShellWindows* shell_windows = nullptr;
+
+    HRESULT hr = CoCreateInstance(
+        CLSID_ShellWindows,
+        nullptr,
+        CLSCTX_ALL,
+        IID_PPV_ARGS(&shell_windows)
+    );
+
+    return SUCCEEDED(hr) ? shell_windows : nullptr;
 }
 
 bool foreground_is_desktop(HWND foreground) {
@@ -25,6 +59,29 @@ bool foreground_is_desktop(HWND foreground) {
 
     return wcscmp(class_name, L"Progman") == 0
         || wcscmp(class_name, L"WorkerW") == 0;
+}
+
+// Сравнивает пути без учёта регистра и формы записи (короткие имена 8.3
+// вроде C:\PROGRA~1 приводятся к полным).
+bool same_path(const wchar_t* left, const wchar_t* right) {
+    wchar_t left_long[MAX_PATH * 4] = {};
+    wchar_t right_long[MAX_PATH * 4] = {};
+
+    if (GetLongPathNameW(left, left_long, MAX_PATH * 4) == 0) {
+        wcsncpy_s(left_long, left, _TRUNCATE);
+    }
+
+    if (GetLongPathNameW(right, right_long, MAX_PATH * 4) == 0) {
+        wcsncpy_s(right_long, right, _TRUNCATE);
+    }
+
+    return CompareStringOrdinal(left_long, -1, right_long, -1, TRUE) == CSTR_EQUAL;
+}
+
+const wchar_t* file_name_of(const wchar_t* path) {
+    const wchar_t* slash = wcsrchr(path, L'\\');
+
+    return slash != nullptr ? slash + 1 : path;
 }
 
 // Окно Проводника (IWebBrowserApp, desktop dispatch и т.п.) -> IShellBrowser.
@@ -47,12 +104,118 @@ IShellBrowser* shell_browser_from(IUnknown* window) {
     return SUCCEEDED(hr) ? browser : nullptr;
 }
 
-// Путь первого выделенного элемента в текущей папке IShellBrowser.
-int selected_path_from(
-    IShellBrowser* browser,
-    wchar_t* output,
-    unsigned long output_capacity
-) {
+IShellBrowser* desktop_browser(IShellWindows* shell_windows) {
+    VARIANT location;
+    VariantInit(&location);
+
+    location.vt = VT_I4;
+    location.lVal = CSIDL_DESKTOP;
+
+    VARIANT empty;
+    VariantInit(&empty);
+
+    long desktop_hwnd = 0;
+
+    IDispatch* dispatch = nullptr;
+
+    HRESULT hr = shell_windows->FindWindowSW(
+        &location,
+        &empty,
+        SWC_DESKTOP,
+        &desktop_hwnd,
+        SWFO_NEEDDISPATCH,
+        &dispatch
+    );
+
+    if (FAILED(hr) || dispatch == nullptr) {
+        return nullptr;
+    }
+
+    IShellBrowser* browser = shell_browser_from(dispatch);
+
+    release(dispatch);
+
+    return browser;
+}
+
+// Вызывает visit(browser) для каждого окна и вкладки Проводника.
+// visit возвращает false, чтобы остановить перебор.
+template <typename Visit>
+void for_each_explorer_browser(IShellWindows* shell_windows, Visit visit) {
+    long window_count = 0;
+
+    if (FAILED(shell_windows->get_Count(&window_count))) {
+        return;
+    }
+
+    for (long index = 0; index < window_count; ++index) {
+        VARIANT window_index;
+        VariantInit(&window_index);
+
+        window_index.vt = VT_I4;
+        window_index.lVal = index;
+
+        IDispatch* dispatch = nullptr;
+
+        if (FAILED(shell_windows->Item(window_index, &dispatch)) || dispatch == nullptr) {
+            continue;
+        }
+
+        IShellBrowser* browser = shell_browser_from(dispatch);
+
+        release(dispatch);
+
+        if (browser == nullptr) {
+            continue;
+        }
+
+        bool keep_going = visit(browser);
+
+        release(browser);
+
+        if (!keep_going) {
+            return;
+        }
+    }
+}
+
+// Активная вкладка окна Проводника, которое сейчас на переднем плане.
+IShellBrowser* foreground_explorer_browser(IShellWindows* shell_windows, HWND foreground) {
+    // В Windows 11 у всех вкладок одного окна общий HWND. Активная вкладка —
+    // первый дочерний ShellTabWindowClass, его и сравниваем с окном вкладки.
+    HWND active_tab = FindWindowExW(foreground, nullptr, L"ShellTabWindowClass", nullptr);
+
+    IShellBrowser* found = nullptr;
+
+    for_each_explorer_browser(shell_windows, [&](IShellBrowser* browser) {
+        HWND window = nullptr;
+
+        if (FAILED(browser->GetWindow(&window))) {
+            return true;
+        }
+
+        bool matches = active_tab != nullptr
+            ? window == active_tab
+            : GetAncestor(window, GA_ROOT) == foreground;
+
+        if (!matches) {
+            return true;
+        }
+
+        browser->AddRef();
+
+        found = browser;
+
+        return false;
+    });
+
+    return found;
+}
+
+// Вызывает visit(path) для каждого выделенного элемента, у которого есть путь
+// в файловой системе. Виртуальные элементы (Корзина, Этот компьютер) пропускаются.
+template <typename Visit>
+int for_each_selected_path(IShellBrowser* browser, Visit visit) {
     IShellView* view = nullptr;
 
     if (FAILED(browser->QueryActiveShellView(&view)) || view == nullptr) {
@@ -81,251 +244,38 @@ int selected_path_from(
 
     DWORD count = 0;
 
-    IShellItem* item = nullptr;
+    if (FAILED(items->GetCount(&count))) {
+        count = 0;
+    }
 
-    if (SUCCEEDED(items->GetCount(&count)) && count > 0) {
-        items->GetItemAt(0, &item);
+    int visited = 0;
+
+    for (DWORD index = 0; index < count; ++index) {
+        IShellItem* item = nullptr;
+
+        if (FAILED(items->GetItemAt(index, &item)) || item == nullptr) {
+            continue;
+        }
+
+        PWSTR path = nullptr;
+
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path != nullptr) {
+            visit(path);
+
+            ++visited;
+
+            CoTaskMemFree(path);
+        }
+
+        release(item);
     }
 
     release(items);
 
-    if (item == nullptr) {
-        return 0;
-    }
-
-    PWSTR path = nullptr;
-
-    // Виртуальные элементы (Корзина, Этот компьютер) пути не имеют и отсеиваются здесь.
-    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &path);
-
-    release(item);
-
-    if (FAILED(hr) || path == nullptr) {
-        return 0;
-    }
-
-    int success = 0;
-
-    size_t length = wcslen(path);
-
-    if (length + 1 <= output_capacity) {
-        wmemcpy(output, path, length);
-
-        output[length] = L'\0';
-
-        success = 1;
-    }
-
-    CoTaskMemFree(path);
-
-    return success;
+    return visited;
 }
 
-int desktop_selected_path(
-    IShellWindows* shell_windows,
-    wchar_t* output,
-    unsigned long output_capacity
-) {
-    VARIANT location;
-    VariantInit(&location);
-
-    location.vt = VT_I4;
-    location.lVal = CSIDL_DESKTOP;
-
-    VARIANT empty;
-    VariantInit(&empty);
-
-    long desktop_hwnd = 0;
-
-    IDispatch* dispatch = nullptr;
-
-    HRESULT hr = shell_windows->FindWindowSW(
-        &location,
-        &empty,
-        SWC_DESKTOP,
-        &desktop_hwnd,
-        SWFO_NEEDDISPATCH,
-        &dispatch
-    );
-
-    if (FAILED(hr) || dispatch == nullptr) {
-        return 0;
-    }
-
-    IShellBrowser* browser = shell_browser_from(dispatch);
-
-    release(dispatch);
-
-    if (browser == nullptr) {
-        return 0;
-    }
-
-    int success = selected_path_from(browser, output, output_capacity);
-
-    release(browser);
-
-    return success;
-}
-
-int explorer_window_selected_path(
-    IShellWindows* shell_windows,
-    HWND foreground,
-    wchar_t* output,
-    unsigned long output_capacity
-) {
-    // В Windows 11 у всех вкладок одного окна общий HWND. Активная вкладка —
-    // первый дочерний ShellTabWindowClass, его и сравниваем с окном вкладки.
-    HWND active_tab = FindWindowExW(
-        foreground,
-        nullptr,
-        L"ShellTabWindowClass",
-        nullptr
-    );
-
-    long window_count = 0;
-
-    if (FAILED(shell_windows->get_Count(&window_count))) {
-        return 0;
-    }
-
-    for (long index = 0; index < window_count; ++index) {
-        VARIANT window_index;
-        VariantInit(&window_index);
-
-        window_index.vt = VT_I4;
-        window_index.lVal = index;
-
-        IDispatch* dispatch = nullptr;
-
-        HRESULT hr = shell_windows->Item(window_index, &dispatch);
-
-        if (FAILED(hr) || dispatch == nullptr) {
-            continue;
-        }
-
-        IWebBrowserApp* web_browser = nullptr;
-
-        hr = dispatch->QueryInterface(IID_PPV_ARGS(&web_browser));
-
-        release(dispatch);
-
-        if (FAILED(hr) || web_browser == nullptr) {
-            continue;
-        }
-
-        SHANDLE_PTR browser_hwnd = 0;
-
-        hr = web_browser->get_HWND(&browser_hwnd);
-
-        if (FAILED(hr) || reinterpret_cast<HWND>(browser_hwnd) != foreground) {
-            release(web_browser);
-            continue;
-        }
-
-        IShellBrowser* browser = shell_browser_from(web_browser);
-
-        release(web_browser);
-
-        if (browser == nullptr) {
-            continue;
-        }
-
-        if (active_tab != nullptr) {
-            HWND tab = nullptr;
-
-            if (FAILED(browser->GetWindow(&tab)) || tab != active_tab) {
-                release(browser);
-                continue;
-            }
-        }
-
-        int success = selected_path_from(browser, output, output_capacity);
-
-        release(browser);
-
-        // Нашли окно активной вкладки — других кандидатов нет.
-        return success;
-    }
-
-    return 0;
-}
-
-}  // namespace
-
-extern "C"
-int filehalo_get_selected_path(
-    wchar_t* output,
-    unsigned long output_capacity
-) {
-    if (output == nullptr || output_capacity == 0) {
-        return 0;
-    }
-
-    output[0] = L'\0';
-
-    HRESULT init_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-
-    bool should_uninitialize = SUCCEEDED(init_hr);
-
-    IShellWindows* shell_windows = nullptr;
-
-    HRESULT hr = CoCreateInstance(
-        CLSID_ShellWindows,
-        nullptr,
-        CLSCTX_ALL,
-        IID_PPV_ARGS(&shell_windows)
-    );
-
-    int success = 0;
-
-    if (SUCCEEDED(hr) && shell_windows != nullptr) {
-        HWND foreground = GetForegroundWindow();
-
-        if (foreground_is_desktop(foreground)) {
-            success = desktop_selected_path(shell_windows, output, output_capacity);
-        } else {
-            success = explorer_window_selected_path(
-                shell_windows,
-                foreground,
-                output,
-                output_capacity
-            );
-        }
-
-        release(shell_windows);
-    }
-
-    if (should_uninitialize) {
-        CoUninitialize();
-    }
-
-    return success;
-}
-
-namespace {
-
-// Сравнивает пути без учёта регистра и формы записи (короткие имена 8.3
-// вроде C:\PROGRA~1 приводятся к полным).
-bool same_path(const wchar_t* left, const wchar_t* right) {
-    wchar_t left_long[MAX_PATH * 4] = {};
-    wchar_t right_long[MAX_PATH * 4] = {};
-
-    if (GetLongPathNameW(left, left_long, MAX_PATH * 4) == 0) {
-        wcsncpy_s(left_long, left, _TRUNCATE);
-    }
-
-    if (GetLongPathNameW(right, right_long, MAX_PATH * 4) == 0) {
-        wcsncpy_s(right_long, right, _TRUNCATE);
-    }
-
-    return CompareStringOrdinal(left_long, -1, right_long, -1, TRUE) == CSTR_EQUAL;
-}
-
-bool view_folder_path(
-    IShellFolder* folder,
-    wchar_t* output,
-    unsigned long output_capacity
-) {
+bool view_folder_path(IShellFolder* folder, wchar_t* output, unsigned long output_capacity) {
     IPersistFolder2* persist = nullptr;
 
     if (FAILED(folder->QueryInterface(IID_PPV_ARGS(&persist)))) {
@@ -342,77 +292,77 @@ bool view_folder_path(
         return false;
     }
 
-    wchar_t path[MAX_PATH * 4] = {};
-
-    bool ok = SHGetPathFromIDListEx(pidl, path, MAX_PATH * 4, GPFIDL_DEFAULT) != FALSE;
+    bool ok = SHGetPathFromIDListEx(pidl, output, output_capacity, GPFIDL_DEFAULT) != FALSE;
 
     CoTaskMemFree(pidl);
 
-    if (!ok || wcslen(path) + 1 > output_capacity) {
-        return false;
-    }
-
-    wcscpy_s(output, output_capacity, path);
-
-    return true;
+    return ok;
 }
 
-// Выделяет файл в окне, если это окно сейчас показывает папку folder.
-// Возвращает true, только если файл действительно оказался выделенным.
-bool select_in_browser(
-    IShellBrowser* browser,
-    const wchar_t* folder,
-    const wchar_t* file_name,
-    const wchar_t* full_path
-) {
+// Выделяет файлы (список строк, завершённый пустой строкой) в окне, если оно
+// показывает папку folder. Возвращает true, только если все файлы выделены.
+bool select_in_browser(IShellBrowser* browser, const wchar_t* folder, const wchar_t* paths) {
     IShellView* view = nullptr;
 
     if (FAILED(browser->QueryActiveShellView(&view)) || view == nullptr) {
         return false;
     }
 
-    IFolderView* folder_view = nullptr;
+    IFolderView2* folder_view = nullptr;
 
     IShellFolder* shell_folder = nullptr;
 
-    bool selected = false;
+    bool all_selected = false;
+
+    wchar_t current_folder[MAX_PATH * 4] = {};
 
     if (SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(&folder_view)))
-        && SUCCEEDED(folder_view->GetFolder(IID_PPV_ARGS(&shell_folder))))
+        && SUCCEEDED(folder_view->GetFolder(IID_PPV_ARGS(&shell_folder)))
+        && view_folder_path(shell_folder, current_folder, MAX_PATH * 4)
+        && same_path(current_folder, folder))
     {
-        wchar_t current_folder[MAX_PATH * 4] = {};
+        all_selected = true;
 
-        bool same_folder =
-            view_folder_path(shell_folder, current_folder, MAX_PATH * 4)
-            && same_path(current_folder, folder);
+        bool first = true;
 
-        PITEMID_CHILD child = nullptr;
+        for (const wchar_t* path = paths; *path != L'\0'; path += wcslen(path) + 1) {
+            PITEMID_CHILD child = nullptr;
 
-        if (same_folder
-            && SUCCEEDED(shell_folder->ParseDisplayName(
+            HRESULT hr = shell_folder->ParseDisplayName(
                 nullptr,
                 nullptr,
-                const_cast<LPWSTR>(file_name),
+                const_cast<LPWSTR>(file_name_of(path)),
                 nullptr,
                 reinterpret_cast<PIDLIST_RELATIVE*>(&child),
                 nullptr
-            ))
-            && child != nullptr)
-        {
-            view->SelectItem(
-                child,
-                SVSI_SELECT | SVSI_DESELECTOTHERS | SVSI_ENSUREVISIBLE | SVSI_FOCUSED
             );
+
+            if (FAILED(hr) || child == nullptr) {
+                all_selected = false;
+                continue;
+            }
+
+            UINT flags = SVSI_SELECT;
+
+            if (first) {
+                flags |= SVSI_DESELECTOTHERS | SVSI_ENSUREVISIBLE | SVSI_FOCUSED;
+            }
+
+            view->SelectItem(child, flags);
+
+            // Пока Проводник не заметил новый файл, SelectItem ничего не делает,
+            // поэтому проверяем фактическое состояние элемента.
+            DWORD state = 0;
+
+            if (FAILED(folder_view->GetSelectionState(child, &state))
+                || (state & SVSI_SELECT) == 0)
+            {
+                all_selected = false;
+            }
 
             CoTaskMemFree(child);
 
-            // Пока Проводник не заметил новый файл, SelectItem ничего не делает,
-            // поэтому проверяем результат по фактическому выделению.
-            wchar_t now_selected[MAX_PATH * 4] = {};
-
-            selected =
-                selected_path_from(browser, now_selected, MAX_PATH * 4) != 0
-                && same_path(now_selected, full_path);
+            first = false;
         }
     }
 
@@ -420,115 +370,87 @@ bool select_in_browser(
     release(folder_view);
     release(view);
 
-    return selected;
+    return all_selected;
 }
 
 }  // namespace
 
+// Выделенные файлы в окне Проводника на переднем плане (или на рабочем столе).
+// Для каждого пути вызывает callback. Возвращает число путей.
 extern "C"
-int filehalo_select_file(
-    const wchar_t* folder,
-    const wchar_t* file_name,
-    const wchar_t* full_path
-) {
-    if (folder == nullptr || file_name == nullptr || full_path == nullptr) {
+int filehalo_get_selected_paths(PathCallback callback, void* context) {
+    if (callback == nullptr) {
         return 0;
     }
 
-    HRESULT init_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    ComScope com;
 
-    bool should_uninitialize = SUCCEEDED(init_hr);
+    IShellWindows* shell_windows = create_shell_windows();
 
-    IShellWindows* shell_windows = nullptr;
+    if (shell_windows == nullptr) {
+        return 0;
+    }
 
-    HRESULT hr = CoCreateInstance(
-        CLSID_ShellWindows,
-        nullptr,
-        CLSCTX_ALL,
-        IID_PPV_ARGS(&shell_windows)
-    );
+    HWND foreground = GetForegroundWindow();
+
+    IShellBrowser* browser = foreground_is_desktop(foreground)
+        ? desktop_browser(shell_windows)
+        : foreground_explorer_browser(shell_windows, foreground);
+
+    int count = 0;
+
+    if (browser != nullptr) {
+        count = for_each_selected_path(browser, [&](const wchar_t* path) {
+            callback(context, path);
+        });
+
+        release(browser);
+    }
+
+    release(shell_windows);
+
+    return count;
+}
+
+// Выделяет файлы из папки folder во всех окнах Проводника (и на рабочем
+// столе), которые её показывают. paths — полные пути, разделённые '\0',
+// в конце пустая строка. Возвращает число окон, где выделились все файлы.
+extern "C"
+int filehalo_select_files(const wchar_t* folder, const wchar_t* paths) {
+    if (folder == nullptr || paths == nullptr || *paths == L'\0') {
+        return 0;
+    }
+
+    ComScope com;
+
+    IShellWindows* shell_windows = create_shell_windows();
+
+    if (shell_windows == nullptr) {
+        return 0;
+    }
 
     int selected_count = 0;
 
-    if (SUCCEEDED(hr) && shell_windows != nullptr) {
-        // Все окна и вкладки Проводника, которые показывают эту папку.
-        long window_count = 0;
-
-        if (FAILED(shell_windows->get_Count(&window_count))) {
-            window_count = 0;
+    for_each_explorer_browser(shell_windows, [&](IShellBrowser* browser) {
+        if (select_in_browser(browser, folder, paths)) {
+            ++selected_count;
         }
 
-        for (long index = 0; index < window_count; ++index) {
-            VARIANT window_index;
-            VariantInit(&window_index);
+        return true;
+    });
 
-            window_index.vt = VT_I4;
-            window_index.lVal = index;
+    // Рабочий стол в списке окон не перечисляется, его ищем отдельно.
+    IShellBrowser* desktop = desktop_browser(shell_windows);
 
-            IDispatch* dispatch = nullptr;
-
-            if (FAILED(shell_windows->Item(window_index, &dispatch)) || dispatch == nullptr) {
-                continue;
-            }
-
-            IShellBrowser* browser = shell_browser_from(dispatch);
-
-            release(dispatch);
-
-            if (browser == nullptr) {
-                continue;
-            }
-
-            if (select_in_browser(browser, folder, file_name, full_path)) {
-                ++selected_count;
-            }
-
-            release(browser);
+    if (desktop != nullptr) {
+        if (select_in_browser(desktop, folder, paths)) {
+            ++selected_count;
         }
 
-        // Рабочий стол в списке окон не перечисляется, его ищем отдельно.
-        VARIANT location;
-        VariantInit(&location);
-
-        location.vt = VT_I4;
-        location.lVal = CSIDL_DESKTOP;
-
-        VARIANT empty;
-        VariantInit(&empty);
-
-        long desktop_hwnd = 0;
-
-        IDispatch* desktop = nullptr;
-
-        hr = shell_windows->FindWindowSW(
-            &location,
-            &empty,
-            SWC_DESKTOP,
-            &desktop_hwnd,
-            SWFO_NEEDDISPATCH,
-            &desktop
-        );
-
-        if (SUCCEEDED(hr) && desktop != nullptr) {
-            IShellBrowser* browser = shell_browser_from(desktop);
-
-            release(desktop);
-
-            if (browser != nullptr) {
-                if (select_in_browser(browser, folder, file_name, full_path)) {
-                    ++selected_count;
-                }
-
-                release(browser);
-            }
-        }
-
-        release(shell_windows);
+        release(desktop);
     }
 
-    if (should_uninitialize) {
-        CoUninitialize();
-    }
+    release(shell_windows);
 
     return selected_count;
 }

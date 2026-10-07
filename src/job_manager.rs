@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{
     Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use windows_sys::Win32::{
@@ -9,18 +9,21 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::{PostMessageW, WM_APP},
 };
 
-use crate::{converter, image_actions::ImageAction};
+use crate::actions::{ActionId, ActionOutcome};
 
 pub const WM_FILEHALO_JOB_DONE: u32 = WM_APP + 1;
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
+static DONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+static TOTAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 static RESULT: OnceLock<Mutex<Option<JobResult>>> = OnceLock::new();
 
-#[derive(Debug)]
-pub enum JobResult {
-    Completed(PathBuf),
-    Failed(String),
+pub struct JobResult {
+    pub action: ActionId,
+    pub outcome: ActionOutcome,
 }
 
 fn result_slot() -> &'static Mutex<Option<JobResult>> {
@@ -31,7 +34,15 @@ pub fn is_running() -> bool {
     RUNNING.load(Ordering::Acquire)
 }
 
-pub fn start_conversion(notify_window: HWND, source: PathBuf, action: ImageAction) -> bool {
+// (обработано, всего) для текущей задачи.
+pub fn progress() -> (usize, usize) {
+    (
+        DONE_COUNT.load(Ordering::Relaxed),
+        TOTAL_COUNT.load(Ordering::Relaxed),
+    )
+}
+
+pub fn start(notify_window: HWND, action: ActionId, inputs: Vec<PathBuf>) -> bool {
     if RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -43,25 +54,19 @@ pub fn start_conversion(notify_window: HWND, source: PathBuf, action: ImageActio
         *slot = None;
     }
 
+    DONE_COUNT.store(0, Ordering::Relaxed);
+
+    TOTAL_COUNT.store(inputs.len(), Ordering::Relaxed);
+
     let hwnd_value = notify_window as isize;
 
     std::thread::spawn(move || {
-        let operation = match action {
-            ImageAction::ConvertToPng => converter::to_png(&source),
-
-            ImageAction::ConvertToJpeg => converter::to_jpeg(&source),
-
-            ImageAction::ConvertToWebp => converter::to_webp(&source),
-        };
-
-        let result = match operation {
-            Ok(output) => JobResult::Completed(output),
-
-            Err(error) => JobResult::Failed(error),
-        };
+        let outcome = action.execute(&inputs, |done, _total| {
+            DONE_COUNT.store(done, Ordering::Relaxed);
+        });
 
         if let Ok(mut slot) = result_slot().lock() {
-            *slot = Some(result);
+            *slot = Some(JobResult { action, outcome });
         }
 
         RUNNING.store(false, Ordering::Release);

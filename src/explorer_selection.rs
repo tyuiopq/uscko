@@ -1,53 +1,61 @@
-use std::ffi::OsString;
-use std::ffi::OsStr;
+use std::ffi::{OsString, c_void};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+type PathCallback = unsafe extern "C" fn(context: *mut c_void, path: *const u16);
+
 unsafe extern "C" {
-    fn filehalo_get_selected_path(output: *mut u16, output_capacity: u32) -> i32;
+    fn filehalo_get_selected_paths(callback: PathCallback, context: *mut c_void) -> i32;
 
-    fn filehalo_select_file(folder: *const u16, file_name: *const u16, full_path: *const u16)
-    -> i32;
+    fn filehalo_select_files(folder: *const u16, paths: *const u16) -> i32;
 }
 
-fn to_wide(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(std::iter::once(0)).collect()
+unsafe extern "C" fn collect_path(context: *mut c_void, path: *const u16) {
+    let paths = unsafe { &mut *(context as *mut Vec<PathBuf>) };
+
+    let length = (0..).take_while(|&i| unsafe { *path.add(i) } != 0).count();
+
+    let wide = unsafe { std::slice::from_raw_parts(path, length) };
+
+    paths.push(PathBuf::from(OsString::from_wide(wide)));
 }
 
-pub fn selected_path() -> Option<PathBuf> {
-    const BUFFER_SIZE: usize = 32768;
+// Все выделенные файлы в активном окне Проводника или на рабочем столе.
+pub fn selected_paths() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
 
-    let mut buffer = vec![0u16; BUFFER_SIZE];
-
-    let success = unsafe { filehalo_get_selected_path(buffer.as_mut_ptr(), BUFFER_SIZE as u32) };
-
-    if success == 0 {
-        return None;
+    unsafe {
+        filehalo_get_selected_paths(collect_path, &mut paths as *mut Vec<PathBuf> as *mut c_void);
     }
 
-    let length = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
-
-    buffer.truncate(length);
-
-    if buffer.is_empty() {
-        return None;
-    }
-
-    let value = OsString::from_wide(&buffer);
-
-    Some(PathBuf::from(value))
+    paths
 }
 
-// Выделяет файл во всех окнах Проводника (и на рабочем столе), где открыта
-// его папка. Возвращает false, если Проводник ещё не успел увидеть файл.
-pub fn select_file(path: &Path) -> bool {
-    let (Some(folder), Some(file_name)) = (path.parent(), path.file_name()) else {
+// Выделяет файлы во всех окнах Проводника (и на рабочем столе), где открыта
+// их папка. Берутся только файлы из папки первого файла. Возвращает false,
+// если Проводник ещё не успел увидеть какой-то из них.
+pub fn select_files(paths: &[PathBuf]) -> bool {
+    let Some(folder) = paths.first().and_then(|path| path.parent()) else {
         return false;
     };
 
-    let folder = to_wide(folder.as_os_str());
-    let file_name = to_wide(file_name);
-    let full_path = to_wide(path.as_os_str());
+    let mut list: Vec<u16> = Vec::new();
 
-    unsafe { filehalo_select_file(folder.as_ptr(), file_name.as_ptr(), full_path.as_ptr()) > 0 }
+    for path in paths.iter().filter(|path| path.parent() == Some(folder)) {
+        list.extend(path.as_os_str().encode_wide());
+        list.push(0);
+    }
+
+    list.push(0);
+
+    let folder = to_wide(folder);
+
+    unsafe { filehalo_select_files(folder.as_ptr(), list.as_ptr()) > 0 }
+}
+
+fn to_wide(path: &Path) -> Vec<u16> {
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }

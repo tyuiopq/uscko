@@ -6,7 +6,7 @@ use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::image_actions::{ImageAction, ImageKind};
+use crate::actions::{ActionId, Category};
 
 // Действующие настройки: по ним работает колесо.
 static CONFIG: OnceLock<RwLock<AppConfig>> = OnceLock::new();
@@ -16,58 +16,40 @@ static DRAFT: OnceLock<RwLock<AppConfig>> = OnceLock::new();
 
 static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum TargetFormat {
-    Jpg,
-    Png,
-    Webp,
-}
+// Неизвестное действие (например, из конфига более новой версии программы)
+// превращается в пустой слот, а не в ошибку чтения всего файла.
+fn lenient_action<'de, D>(deserializer: D) -> Result<Option<ActionId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
 
-impl TargetFormat {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Jpg => "JPG",
-            Self::Png => "PNG",
-            Self::Webp => "WebP",
-        }
-    }
-
-    fn to_action(self) -> ImageAction {
-        match self {
-            Self::Jpg => ImageAction::ConvertToJpeg,
-
-            Self::Png => ImageAction::ConvertToPng,
-
-            Self::Webp => ImageAction::ConvertToWebp,
-        }
-    }
-
-    pub fn matches_source(self, source: ImageKind) -> bool {
-        matches!(
-            (self, source),
-            (Self::Jpg, ImageKind::Jpeg)
-                | (Self::Png, ImageKind::Png)
-                | (Self::Webp, ImageKind::WebP)
-        )
-    }
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SlotLayout {
-    pub n: Option<TargetFormat>,
-    pub ne: Option<TargetFormat>,
-    pub e: Option<TargetFormat>,
-    pub se: Option<TargetFormat>,
-    pub s: Option<TargetFormat>,
-    pub sw: Option<TargetFormat>,
-    pub w: Option<TargetFormat>,
-    pub nw: Option<TargetFormat>,
+    #[serde(deserialize_with = "lenient_action")]
+    pub n: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    pub ne: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    pub e: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    pub se: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    pub s: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    pub sw: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    pub w: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    pub nw: Option<ActionId>,
 }
 
 impl SlotLayout {
-    fn target_for_slot(&self, slot: i32) -> Option<TargetFormat> {
+    fn action_for_slot(&self, slot: i32) -> Option<ActionId> {
         match slot {
             0 => self.e,
             1 => self.ne,
@@ -81,30 +63,29 @@ impl SlotLayout {
         }
     }
 
-    fn set_target_for_slot(&mut self, slot: i32, target: Option<TargetFormat>) {
+    fn set_action_for_slot(&mut self, slot: i32, action: Option<ActionId>) {
         match slot {
-            0 => self.e = target,
-            1 => self.ne = target,
-            2 => self.n = target,
-            3 => self.nw = target,
-            4 => self.w = target,
-            5 => self.sw = target,
-            6 => self.s = target,
-            7 => self.se = target,
+            0 => self.e = action,
+            1 => self.ne = action,
+            2 => self.n = action,
+            3 => self.nw = action,
+            4 => self.w = action,
+            5 => self.sw = action,
+            6 => self.s = action,
+            7 => self.se = action,
             _ => {}
         }
     }
 }
 
+// Раскладка колеса для каждой категории.
 // serde(default): если в файле нет какого-то поля (например, после обновления
-// программы добавился новый тип файлов), берётся значение по умолчанию,
+// программы добавилась категория), берётся значение по умолчанию,
 // а не ошибка чтения всего конфига.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WheelConfig {
-    pub jpeg: SlotLayout,
-    pub png: SlotLayout,
-    pub webp: SlotLayout,
+    pub images: SlotLayout,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,24 +94,15 @@ pub struct AppConfig {
     pub wheel: WheelConfig,
 }
 
+// У каждого действия постоянное место, чтобы его запоминали руки.
+// Если действие к выделению неприменимо (PNG -> PNG), слот просто пустой.
 impl Default for WheelConfig {
     fn default() -> Self {
         Self {
-            jpeg: SlotLayout {
-                n: Some(TargetFormat::Png),
-                s: Some(TargetFormat::Webp),
-                ..SlotLayout::default()
-            },
-
-            png: SlotLayout {
-                e: Some(TargetFormat::Jpg),
-                s: Some(TargetFormat::Webp),
-                ..SlotLayout::default()
-            },
-
-            webp: SlotLayout {
-                n: Some(TargetFormat::Png),
-                e: Some(TargetFormat::Jpg),
+            images: SlotLayout {
+                n: Some(ActionId::ConvertToPng),
+                e: Some(ActionId::ConvertToJpeg),
+                s: Some(ActionId::ConvertToWebp),
                 ..SlotLayout::default()
             },
         }
@@ -238,23 +210,15 @@ fn load_or_create() -> Result<(AppConfig, PathBuf), String> {
     }
 }
 
-fn layout_for_kind(config: &AppConfig, kind: ImageKind) -> &SlotLayout {
-    match kind {
-        ImageKind::Jpeg => &config.wheel.jpeg,
-
-        ImageKind::Png => &config.wheel.png,
-
-        ImageKind::WebP => &config.wheel.webp,
+fn layout(config: &AppConfig, category: Category) -> &SlotLayout {
+    match category {
+        Category::Images => &config.wheel.images,
     }
 }
 
-fn layout_for_kind_mut(config: &mut AppConfig, kind: ImageKind) -> &mut SlotLayout {
-    match kind {
-        ImageKind::Jpeg => &mut config.wheel.jpeg,
-
-        ImageKind::Png => &mut config.wheel.png,
-
-        ImageKind::WebP => &mut config.wheel.webp,
+fn layout_mut(config: &mut AppConfig, category: Category) -> &mut SlotLayout {
+    match category {
+        Category::Images => &mut config.wheel.images,
     }
 }
 
@@ -276,18 +240,12 @@ pub fn initialize() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-pub fn action_for_slot(source: ImageKind, slot: i32) -> Option<ImageAction> {
+pub fn action_for_slot(category: Category, slot: i32) -> Option<ActionId> {
     let config = CONFIG.get()?;
 
     let config = config.read().ok()?;
 
-    let target = layout_for_kind(&config, source).target_for_slot(slot)?;
-
-    if target.matches_source(source) {
-        return None;
-    }
-
-    Some(target.to_action())
+    layout(&config, category).action_for_slot(slot)
 }
 
 // Начинает редактирование: черновик сбрасывается к действующим настройкам.
@@ -303,15 +261,15 @@ pub fn begin_edit() {
     *draft = config.clone();
 }
 
-pub fn draft_target_for_slot(source: ImageKind, slot: i32) -> Option<TargetFormat> {
+pub fn draft_action_for_slot(category: Category, slot: i32) -> Option<ActionId> {
     let draft = DRAFT.get()?;
 
     let draft = draft.read().ok()?;
 
-    layout_for_kind(&draft, source).target_for_slot(slot)
+    layout(&draft, category).action_for_slot(slot)
 }
 
-pub fn set_draft_target_for_slot(source: ImageKind, slot: i32, target: Option<TargetFormat>) {
+pub fn set_draft_action_for_slot(category: Category, slot: i32, action: Option<ActionId>) {
     let Some(draft) = DRAFT.get() else {
         return;
     };
@@ -320,7 +278,7 @@ pub fn set_draft_target_for_slot(source: ImageKind, slot: i32, target: Option<Ta
         return;
     };
 
-    layout_for_kind_mut(&mut draft, source).set_target_for_slot(slot, target);
+    layout_mut(&mut draft, category).set_action_for_slot(slot, action);
 }
 
 pub fn has_unsaved_changes() -> bool {

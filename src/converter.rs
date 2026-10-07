@@ -11,7 +11,7 @@ use image::{
     metadata::Orientation,
 };
 
-use crate::image_actions::{self, ImageKind};
+use crate::file_types::{self, ImageKind};
 
 const JPEG_QUALITY: u8 = 92;
 
@@ -245,7 +245,7 @@ pub fn to_webp(source: &Path) -> Result<PathBuf, String> {
 
     // JPEG уже сжат с потерями, поэтому WebP с потерями ничего заметного не теряет.
     // PNG обычно графика или скриншоты, там важна точность пикселей.
-    let lossless = image_actions::detect_kind(source) != Some(ImageKind::Jpeg);
+    let lossless = file_types::image_kind(source) != Some(ImageKind::Jpeg);
 
     let mut bytes = encode_webp(&decoded.image, lossless)?;
 

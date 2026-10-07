@@ -4,16 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ab_glyph = "0.2.32"
 crc32fast = "1"
+heic-rs = "0.1.1"
 image = {
     version = "0.25.10",
     default-features = false,
-    features = ["jpeg", "png", "webp"]
+    features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"]
 }
 libwebp-sys = "0.14.4"
 lopdf = { version = "0.45.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sevenz-rust2 = { version = "0.23.0", default-features = false, features = ["bzip2", "ppmd", "deflate"] }
+sha2 = "0.11.0"
+tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
 windows = { version = "0.62.2", features = ["Data_Pdf", "Foundation", "Storage", "Storage_Streams", "Win32_System_Com"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64"] }
 
@@ -22,9 +27,13 @@ version = "0.61.2"
 features = [
     "Win32_Foundation",
     "Win32_Globalization",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
     "Win32_System_Threading",
     "Win32_System_Time",
     "Win32_UI_HiDpi",
@@ -34,3 +43,17 @@ features = [
 
 [build-dependencies]
 cc = "1"
+
+# Зависимости (графика, картинки, PDF) собираются с оптимизацией и без
+# отладочных проверок даже в отладочной сборке: иначе кадр колеса рисуется
+# 300 мс вместо 7.
+[profile.dev.package."*"]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+
+# Свой код тоже с лёгкой оптимизацией: попиксельные циклы (вывод кадра,
+# текст) в чистой отладочной сборке в десятки раз медленнее. Отладке
+# opt-level 1 почти не мешает.
+[profile.dev]
+opt-level = 1

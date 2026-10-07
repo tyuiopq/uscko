@@ -16,6 +16,10 @@ static DRAFT: OnceLock<RwLock<AppConfig>> = OnceLock::new();
 
 static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
+pub const MIN_SECTIONS: usize = 2;
+
+pub const MAX_SECTIONS: usize = 8;
+
 // Неизвестное действие (например, из конфига более новой версии программы)
 // превращается в пустой слот, а не в ошибку чтения всего файла.
 fn lenient_action<'de, D>(deserializer: D) -> Result<Option<ActionId>, D::Error>
@@ -27,53 +31,136 @@ where
     Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SlotLayout {
-    #[serde(deserialize_with = "lenient_action")]
-    pub n: Option<ActionId>,
-    #[serde(deserialize_with = "lenient_action")]
-    pub ne: Option<ActionId>,
-    #[serde(deserialize_with = "lenient_action")]
-    pub e: Option<ActionId>,
-    #[serde(deserialize_with = "lenient_action")]
-    pub se: Option<ActionId>,
-    #[serde(deserialize_with = "lenient_action")]
-    pub s: Option<ActionId>,
-    #[serde(deserialize_with = "lenient_action")]
-    pub sw: Option<ActionId>,
-    #[serde(deserialize_with = "lenient_action")]
-    pub w: Option<ActionId>,
-    #[serde(deserialize_with = "lenient_action")]
-    pub nw: Option<ActionId>,
+fn lenient_actions<'de, D>(deserializer: D) -> Result<Option<Vec<Option<ActionId>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Option::<Vec<serde_json::Value>>::deserialize(deserializer)?;
+
+    Ok(values.map(|values| {
+        values
+            .into_iter()
+            .map(|value| serde_json::from_value(value).ok())
+            .collect()
+    }))
 }
 
-impl SlotLayout {
-    fn action_for_slot(&self, slot: i32) -> Option<ActionId> {
-        match slot {
-            0 => self.e,
-            1 => self.ne,
-            2 => self.n,
-            3 => self.nw,
-            4 => self.w,
-            5 => self.sw,
-            6 => self.s,
-            7 => self.se,
-            _ => None,
+// Раскладка в файле: текущий формат (sections + slots) или старый,
+// до версии 4 (восемь направлений компаса n, ne, ... nw).
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct LayoutFile {
+    sections: Option<usize>,
+    #[serde(deserialize_with = "lenient_actions")]
+    slots: Option<Vec<Option<ActionId>>>,
+    #[serde(deserialize_with = "lenient_action")]
+    n: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    ne: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    e: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    se: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    s: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    sw: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    w: Option<ActionId>,
+    #[serde(deserialize_with = "lenient_action")]
+    nw: Option<ActionId>,
+}
+
+impl From<LayoutFile> for Layout {
+    fn from(file: LayoutFile) -> Self {
+        let slots = match file.slots {
+            Some(slots) => slots,
+
+            // Старый формат: направления по часовой стрелке начиная с верхнего.
+            None => vec![file.n, file.ne, file.e, file.se, file.s, file.sw, file.w, file.nw],
+        };
+
+        Layout::new(file.sections.unwrap_or(MAX_SECTIONS), slots)
+    }
+}
+
+// Раскладка колеса одной категории. Слоты идут по часовой стрелке начиная
+// с верхнего. Слотов всегда MAX_SECTIONS: если секций меньше, лишние слоты
+// хранятся, чтобы вернуться, когда секций снова станет больше.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "LayoutFile")]
+pub struct Layout {
+    pub sections: usize,
+    pub slots: Vec<Option<ActionId>>,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self::new(MAX_SECTIONS, Vec::new())
+    }
+}
+
+impl Layout {
+    pub fn new(sections: usize, mut slots: Vec<Option<ActionId>>) -> Self {
+        slots.resize(MAX_SECTIONS, None);
+
+        Self {
+            sections: sections.clamp(MIN_SECTIONS, MAX_SECTIONS),
+            slots,
         }
     }
 
-    fn set_action_for_slot(&mut self, slot: i32, action: Option<ActionId>) {
-        match slot {
-            0 => self.e = action,
-            1 => self.ne = action,
-            2 => self.n = action,
-            3 => self.nw = action,
-            4 => self.w = action,
-            5 => self.sw = action,
-            6 => self.s = action,
-            7 => self.se = action,
-            _ => {}
+    pub fn action_for_slot(&self, slot: usize) -> Option<ActionId> {
+        if slot < self.sections {
+            self.slots.get(slot).copied().flatten()
+        } else {
+            None
+        }
+    }
+
+    // Не больше max секций. Действия из отрезанных слотов переезжают
+    // в свободные видимые слоты, чтобы ничего не потерялось.
+    fn fit(&mut self, max: usize) -> bool {
+        if self.sections <= max {
+            return false;
+        }
+
+        let moved: Vec<ActionId> = self.slots[max..self.sections].iter().flatten().copied().collect();
+
+        for slot in &mut self.slots[max..self.sections] {
+            *slot = None;
+        }
+
+        for action in moved {
+            if self.slots[..max].contains(&Some(action)) {
+                continue;
+            }
+
+            if let Some(free) = self.slots[..max].iter().position(Option::is_none) {
+                self.slots[free] = Some(action);
+            }
+        }
+
+        self.sections = max;
+
+        true
+    }
+
+    fn contains(&self, action: ActionId) -> bool {
+        self.slots.contains(&Some(action))
+    }
+
+    // Пустые слоты заполняются действиями из defaults, если их ещё нет
+    // в раскладке. Заполненные пользователем слоты не трогаются.
+    fn fill_empty_from(&mut self, defaults: &Layout) {
+        for slot in 0..MAX_SECTIONS {
+            let Some(action) = defaults.slots[slot] else {
+                continue;
+            };
+
+            if self.slots[slot].is_none() && !self.contains(action) {
+                self.slots[slot] = Some(action);
+            }
         }
     }
 }
@@ -85,15 +172,15 @@ impl SlotLayout {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WheelConfig {
-    pub images: SlotLayout,
-    pub pdf: SlotLayout,
-    pub archive: SlotLayout,
-    pub files: SlotLayout,
+    pub images: Layout,
+    pub pdf: Layout,
+    pub archive: Layout,
+    pub files: Layout,
 }
 
 // Версия формата конфига. Повышается, когда новым действиям нужно место
 // в уже сохранённых раскладках (см. migrate).
-const CONFIG_VERSION: u32 = 2;
+const CONFIG_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -114,23 +201,65 @@ impl Default for AppConfig {
     }
 }
 
-impl SlotLayout {
-    fn contains(&self, action: ActionId) -> bool {
-        (0..8).any(|slot| self.action_for_slot(slot) == Some(action))
+impl WheelConfig {
+    fn layouts_mut(&mut self) -> [&mut Layout; 4] {
+        [
+            &mut self.images,
+            &mut self.pdf,
+            &mut self.archive,
+            &mut self.files,
+        ]
     }
+}
 
-    // Пустые слоты заполняются действиями из defaults, если их ещё нет
-    // в раскладке. Заполненные пользователем слоты не трогаются.
-    fn fill_empty_from(&mut self, defaults: &SlotLayout) {
-        for slot in 0..8 {
-            let Some(action) = defaults.action_for_slot(slot) else {
-                continue;
-            };
+// Раскладки по умолчанию версии 3: восемь секций, слоты по направлениям.
+fn defaults_v3() -> WheelConfig {
+    use ActionId::*;
 
-            if self.action_for_slot(slot).is_none() && !self.contains(action) {
-                self.set_action_for_slot(slot, Some(action));
-            }
-        }
+    let eight = |slots: [Option<ActionId>; 8]| Layout::new(MAX_SECTIONS, slots.to_vec());
+
+    WheelConfig {
+        // n, ne, e, se, s, sw, w, nw
+        images: eight([
+            Some(ConvertToPng),
+            Some(CompressImages),
+            Some(ConvertToJpeg),
+            Some(ResizeImages),
+            Some(ConvertToWebp),
+            Some(StripMetadata),
+            Some(ImagesToPdf),
+            Some(CreateZip),
+        ]),
+        pdf: eight([
+            Some(PdfToImages),
+            None,
+            Some(MergePdfs),
+            None,
+            Some(IntoNewFolder),
+            None,
+            Some(CopyPath),
+            Some(CreateZip),
+        ]),
+        archive: eight([
+            Some(ExtractArchive),
+            None,
+            None,
+            None,
+            Some(IntoNewFolder),
+            None,
+            Some(CopyPath),
+            None,
+        ]),
+        files: eight([
+            None,
+            None,
+            Some(Sha256),
+            None,
+            Some(IntoNewFolder),
+            None,
+            Some(CopyPath),
+            Some(CreateZip),
+        ]),
     }
 }
 
@@ -140,11 +269,35 @@ fn migrate(config: &mut AppConfig) -> bool {
         return false;
     }
 
-    // Версия 2: у картинок появились PDF, сжатие, уменьшение, очистка и ZIP.
-    if config.version < 2 {
-        let defaults = WheelConfig::default();
+    let v3 = defaults_v3();
 
-        config.wheel.images.fill_empty_from(&defaults.images);
+    // Версия 2: у картинок появились PDF, сжатие, уменьшение, очистка и ZIP.
+    // Версия 3: путь, новая папка и SHA-256 в остальных категориях.
+    if config.version < 3 {
+        let mut defaults = v3.clone();
+
+        for (layout, default) in config.wheel.layouts_mut().into_iter().zip(defaults.layouts_mut()) {
+            layout.fill_empty_from(default);
+        }
+    }
+
+    // Версия 4: число секций настраивается. Раскладки, которые пользователь
+    // не менял, заменяются новыми — компактными, без пустых секций.
+    if config.version < 4 {
+        let mut old = v3;
+        let mut new = WheelConfig::default();
+
+        for ((layout, old), new) in config
+            .wheel
+            .layouts_mut()
+            .into_iter()
+            .zip(old.layouts_mut())
+            .zip(new.layouts_mut())
+        {
+            if layout == old {
+                *layout = new.clone();
+            }
+        }
     }
 
     config.version = CONFIG_VERSION;
@@ -152,39 +305,31 @@ fn migrate(config: &mut AppConfig) -> bool {
     true
 }
 
-// У каждого действия постоянное место, чтобы его запоминали руки.
-// Если действие к выделению неприменимо (PNG -> PNG), слот просто пустой.
-// ZIP во всех категориях на одном месте — северо-запад.
+// У каждого действия постоянное место, чтобы его запоминали руки: слоты
+// идут по часовой стрелке от верхнего. Если действие к выделению
+// неприменимо (PNG -> PNG), его секция приглушена, но остаётся на месте.
 impl Default for WheelConfig {
     fn default() -> Self {
-        Self {
-            images: SlotLayout {
-                n: Some(ActionId::ConvertToPng),
-                e: Some(ActionId::ConvertToJpeg),
-                s: Some(ActionId::ConvertToWebp),
-                w: Some(ActionId::ImagesToPdf),
-                ne: Some(ActionId::CompressImages),
-                se: Some(ActionId::ResizeImages),
-                sw: Some(ActionId::StripMetadata),
-                nw: Some(ActionId::CreateZip),
-            },
+        use ActionId::*;
 
-            pdf: SlotLayout {
-                n: Some(ActionId::PdfToImages),
-                e: Some(ActionId::MergePdfs),
-                nw: Some(ActionId::CreateZip),
-                ..SlotLayout::default()
-            },
+        WheelConfig {
+            images: defaults_v3().images,
 
-            archive: SlotLayout {
-                n: Some(ActionId::ExtractArchive),
-                ..SlotLayout::default()
-            },
+            // Вверх — в картинки, вправо — склеить, вниз — ZIP, влево — путь.
+            pdf: Layout::new(
+                4,
+                vec![Some(PdfToImages), Some(MergePdfs), Some(CreateZip), Some(CopyPath)],
+            ),
 
-            files: SlotLayout {
-                nw: Some(ActionId::CreateZip),
-                ..SlotLayout::default()
-            },
+            archive: Layout::new(
+                3,
+                vec![Some(ExtractArchive), Some(IntoNewFolder), Some(CopyPath)],
+            ),
+
+            files: Layout::new(
+                4,
+                vec![Some(CreateZip), Some(Sha256), Some(IntoNewFolder), Some(CopyPath)],
+            ),
         }
     }
 }
@@ -263,7 +408,8 @@ fn load_or_create() -> Result<(AppConfig, PathBuf), String> {
 
     match read_config(&path) {
         Ok(mut config) => {
-            if migrate(&mut config) {
+            // Без короткого замыкания: оба шага должны выполниться.
+            if migrate(&mut config) | fit_to_categories(&mut config) {
                 if let Err(error) = write_config(&path, &config) {
                     eprintln!("{error}");
                 }
@@ -298,7 +444,18 @@ fn load_or_create() -> Result<(AppConfig, PathBuf), String> {
     }
 }
 
-fn layout(config: &AppConfig, category: Category) -> &SlotLayout {
+// Число секций каждой категории — не больше числа её действий.
+fn fit_to_categories(config: &mut AppConfig) -> bool {
+    let mut changed = false;
+
+    for &category in Category::ALL {
+        changed |= layout_mut(config, category).fit(category.max_sections());
+    }
+
+    changed
+}
+
+fn layout(config: &AppConfig, category: Category) -> &Layout {
     match category {
         Category::Images => &config.wheel.images,
         Category::Pdf => &config.wheel.pdf,
@@ -307,7 +464,7 @@ fn layout(config: &AppConfig, category: Category) -> &SlotLayout {
     }
 }
 
-fn layout_mut(config: &mut AppConfig, category: Category) -> &mut SlotLayout {
+fn layout_mut(config: &mut AppConfig, category: Category) -> &mut Layout {
     match category {
         Category::Images => &mut config.wheel.images,
         Category::Pdf => &mut config.wheel.pdf,
@@ -334,12 +491,19 @@ pub fn initialize() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-pub fn action_for_slot(category: Category, slot: i32) -> Option<ActionId> {
+pub fn action_for_slot(category: Category, slot: usize) -> Option<ActionId> {
     let config = CONFIG.get()?;
 
     let config = config.read().ok()?;
 
     layout(&config, category).action_for_slot(slot)
+}
+
+pub fn sections(category: Category) -> usize {
+    CONFIG
+        .get()
+        .and_then(|config| config.read().ok().map(|config| layout(&config, category).sections))
+        .unwrap_or(MAX_SECTIONS)
 }
 
 // Начинает редактирование: черновик сбрасывается к действующим настройкам.
@@ -355,15 +519,15 @@ pub fn begin_edit() {
     *draft = config.clone();
 }
 
-pub fn draft_action_for_slot(category: Category, slot: i32) -> Option<ActionId> {
-    let draft = DRAFT.get()?;
-
-    let draft = draft.read().ok()?;
-
-    layout(&draft, category).action_for_slot(slot)
+// Раскладка категории в черновике окна настроек.
+pub fn draft_layout(category: Category) -> Layout {
+    DRAFT
+        .get()
+        .and_then(|draft| draft.read().ok().map(|draft| layout(&draft, category).clone()))
+        .unwrap_or_else(|| default_layout(category))
 }
 
-pub fn set_draft_action_for_slot(category: Category, slot: i32, action: Option<ActionId>) {
+pub fn set_draft_layout(category: Category, new_layout: Layout) {
     let Some(draft) = DRAFT.get() else {
         return;
     };
@@ -372,7 +536,15 @@ pub fn set_draft_action_for_slot(category: Category, slot: i32, action: Option<A
         return;
     };
 
-    layout_mut(&mut draft, category).set_action_for_slot(slot, action);
+    let mut fitted = Layout::new(new_layout.sections, new_layout.slots);
+
+    fitted.fit(category.max_sections());
+
+    *layout_mut(&mut draft, category) = fitted;
+}
+
+pub fn default_layout(category: Category) -> Layout {
+    layout(&AppConfig::default(), category).clone()
 }
 
 pub fn has_unsaved_changes() -> bool {

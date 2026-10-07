@@ -3,18 +3,19 @@ use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 
 use image::{
-    DynamicImage, ImageDecoder, ImageEncoder, ImageReader, RgbImage,
+    DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, ImageReader, RgbImage, RgbaImage,
     codecs::{
+        ico::{IcoEncoder, IcoFrame},
         jpeg::JpegEncoder,
         png::{CompressionType, FilterType as PngFilterType, PngEncoder},
     },
-    imageops::FilterType,
+    imageops::{self, FilterType},
     metadata::Orientation,
 };
 
 use crate::actions::ActionError;
 use crate::file_types::{self, ImageKind};
-use crate::output;
+use crate::{heic, metadata, output};
 
 const JPEG_QUALITY: u8 = 92;
 
@@ -24,8 +25,17 @@ const COMPRESS_JPEG_QUALITY: u8 = 80;
 
 const COMPRESS_WEBP_QUALITY: f32 = 75.0;
 
+// Поворот пересохраняет PNG/WebP/редкие JPEG: качество повыше, чтобы
+// несколько поворотов подряд не портили картинку.
+const ROTATE_JPEG_QUALITY: u8 = 95;
+
+const ROTATE_WEBP_QUALITY: f32 = 95.0;
+
 // Ограничение формата WebP.
 const WEBP_MAX_DIMENSION: u32 = 16383;
+
+// Размеры значков в .ico.
+const ICO_SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
 
 pub struct DecodedImage {
     pub image: DynamicImage,
@@ -33,6 +43,10 @@ pub struct DecodedImage {
 }
 
 pub fn decode(source: &Path) -> Result<DecodedImage, String> {
+    if file_types::image_kind(source) == Some(ImageKind::Heic) {
+        return heic::decode(source);
+    }
+
     let mut decoder = ImageReader::open(source)
         .map_err(|error| format!("Could not open source image: {error}"))?
         .with_guessed_format()
@@ -182,7 +196,7 @@ fn save_bytes(bytes: &[u8], output: &Path) -> Result<PathBuf, String> {
 // Источник сжат с потерями (JPEG или WebP с потерями).
 pub fn is_lossy_source(source: &Path) -> bool {
     match file_types::image_kind(source) {
-        Some(ImageKind::Jpeg) => true,
+        Some(ImageKind::Jpeg | ImageKind::Heic) => true,
 
         Some(ImageKind::WebP) => !webp_is_lossless(source),
 
@@ -205,11 +219,95 @@ pub fn convert(source: &Path, target: ImageKind) -> Result<PathBuf, String> {
         ImageKind::WebP => Encoding::WebP {
             quality: is_lossy_source(source).then_some(WEBP_QUALITY),
         },
+
+        other => return Err(format!("Cannot save as {other:?}")),
     };
 
     let bytes = encode(&decoded.image, decoded.icc_profile.as_deref(), encoding)?;
 
     save_bytes(&bytes, &output::next_to(source, encoding.extension())?)
+}
+
+// Значок .ico со всеми стандартными размерами. Неквадратная картинка
+// вписывается в квадрат с прозрачными полями.
+pub fn to_ico(source: &Path) -> Result<PathBuf, String> {
+    let decoded = decode(source)?;
+
+    let rgba = decoded.image.to_rgba8();
+
+    let side = rgba.width().max(rgba.height());
+
+    let mut square = RgbaImage::new(side, side);
+
+    imageops::overlay(
+        &mut square,
+        &rgba,
+        ((side - rgba.width()) / 2) as i64,
+        ((side - rgba.height()) / 2) as i64,
+    );
+
+    let mut frames = Vec::new();
+
+    for size in ICO_SIZES.into_iter().filter(|&size| size <= side.max(16)) {
+        let scaled = imageops::resize(&square, size, size, FilterType::Lanczos3);
+
+        let frame = IcoFrame::as_png(scaled.as_raw(), size, size, ExtendedColorType::Rgba8)
+            .map_err(|error| format!("ICO encoding failed: {error}"))?;
+
+        frames.push(frame);
+    }
+
+    output::write_file(&output::next_to(source, "ico")?, |writer| {
+        IcoEncoder::new(writer)
+            .encode_images(&frames)
+            .map_err(|error| format!("ICO encoding failed: {error}"))
+    })
+}
+
+// Поворот на 90° на месте (как «Повернуть» в Проводнике).
+// JPEG поворачивается без потерь: меняется только тег ориентации в EXIF.
+pub fn rotate(source: &Path, clockwise: bool) -> Result<PathBuf, ActionError> {
+    let kind = file_types::image_kind(source)
+        .filter(|kind| kind.is_editable())
+        .ok_or_else(|| ActionError::Failed("Cannot rotate this format".to_string()))?;
+
+    let original = std::fs::read(source)
+        .map_err(|error| format!("Could not read {}: {error}", source.display()))?;
+
+    if kind == ImageKind::Jpeg
+        && let Some(rotated) = metadata::rotate_jpeg_orientation(&original, clockwise)
+    {
+        return Ok(output::replace_file(source, &rotated)?);
+    }
+
+    let decoded = decode(source)?;
+
+    let image = if clockwise {
+        decoded.image.rotate90()
+    } else {
+        decoded.image.rotate270()
+    };
+
+    let encoding = match kind {
+        ImageKind::Jpeg => Encoding::Jpeg {
+            quality: ROTATE_JPEG_QUALITY,
+        },
+
+        ImageKind::WebP => Encoding::WebP {
+            quality: is_lossy_source(source).then_some(ROTATE_WEBP_QUALITY),
+        },
+
+        _ => Encoding::Png { best: false },
+    };
+
+    let mut bytes = encode(&image, decoded.icc_profile.as_deref(), encoding)?;
+
+    // Текстовые поля PNG (автор, описание) — это не пиксели, их сохраняем.
+    if kind == ImageKind::Png {
+        bytes = metadata::copy_png_text(&original, bytes);
+    }
+
+    Ok(output::replace_file(source, &bytes)?)
 }
 
 // Тот же формат, но меньше по размеру файла.

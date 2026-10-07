@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::file_types::{self, ImageKind};
-use crate::{archive, converter, metadata, pdf};
+use crate::{archive, converter, file_tools, metadata, pdf};
 
 // Уменьшение картинок: длинная сторона не больше этого значения.
 const RESIZE_MAX_SIDE: u32 = 1920;
@@ -55,12 +55,17 @@ fn is_image(path: &Path) -> bool {
     file_types::image_kind(path).is_some() && is_file(path)
 }
 
+// Картинка, которую можно пересохранить в том же формате.
+fn is_editable_image(path: &Path) -> bool {
+    file_types::image_kind(path).is_some_and(ImageKind::is_editable) && is_file(path)
+}
+
 fn is_pdf(path: &Path) -> bool {
     file_types::is_pdf(path) && is_file(path)
 }
 
-fn is_zip(path: &Path) -> bool {
-    file_types::is_zip(path) && is_file(path)
+fn is_archive(path: &Path) -> bool {
+    (file_types::is_zip(path) || file_types::is_seven_zip(path)) && is_file(path)
 }
 
 // Сравнение имён «как у людей»: "scan 2" раньше "scan 10".
@@ -135,10 +140,10 @@ impl Category {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Images => "Images",
+            Self::Images => "Картинки",
             Self::Pdf => "PDF",
-            Self::Archive => "Archive",
-            Self::Files => "Files",
+            Self::Archive => "Архивы",
+            Self::Files => "Файлы",
         }
     }
 
@@ -155,7 +160,7 @@ impl Category {
             return Some(Self::Pdf);
         }
 
-        if selection.all(is_zip) {
+        if selection.all(is_archive) {
             return Some(Self::Archive);
         }
 
@@ -167,6 +172,13 @@ impl Category {
             .iter()
             .copied()
             .filter(move |action| action.available_in(self))
+    }
+    // Больше секций, чем действий в категории, ставить незачем: лишние
+    // всё равно были бы пустыми, а колесо — мельче.
+    pub fn max_sections(self) -> usize {
+        self.actions()
+            .count()
+            .clamp(crate::config::MIN_SECTIONS, crate::config::MAX_SECTIONS)
     }
 }
 
@@ -184,6 +196,12 @@ pub enum ActionId {
     PdfToImages,
     CreateZip,
     ExtractArchive,
+    RotateLeft,
+    RotateRight,
+    ConvertToIco,
+    CopyPath,
+    Sha256,
+    IntoNewFolder,
 }
 
 // Ошибка обработки одного файла.
@@ -199,10 +217,17 @@ impl From<String> for ActionError {
     }
 }
 
+#[derive(Default)]
 pub struct ActionOutcome {
     pub outputs: Vec<PathBuf>,
     pub skipped: Vec<(PathBuf, String)>,
     pub failures: Vec<(PathBuf, String)>,
+    // Текст, который нужно положить в буфер обмена.
+    pub clipboard: Option<String>,
+    // Своё сообщение для окна статуса вместо стандартного «Готово».
+    pub message: Option<String>,
+    // Выделить результат и сразу включить переименование.
+    pub rename: bool,
 }
 
 impl ActionId {
@@ -218,21 +243,57 @@ impl ActionId {
         ActionId::PdfToImages,
         ActionId::CreateZip,
         ActionId::ExtractArchive,
+        ActionId::RotateLeft,
+        ActionId::RotateRight,
+        ActionId::ConvertToIco,
+        ActionId::CopyPath,
+        ActionId::Sha256,
+        ActionId::IntoNewFolder,
     ];
 
+    // Короткая подпись на секции колеса.
     pub fn label(self) -> &'static str {
         match self {
             Self::ConvertToPng => "PNG",
             Self::ConvertToJpeg => "JPG",
             Self::ConvertToWebp => "WebP",
             Self::ImagesToPdf => "PDF",
-            Self::CompressImages => "Compress",
-            Self::ResizeImages => "Resize",
-            Self::StripMetadata => "Clean",
-            Self::MergePdfs => "Merge",
+            Self::CompressImages => "Сжать",
+            Self::ResizeImages => "Уменьшить",
+            Self::StripMetadata => "Очистить",
+            Self::MergePdfs => "Склеить",
             Self::PdfToImages => "PNG",
             Self::CreateZip => "ZIP",
-            Self::ExtractArchive => "Extract",
+            Self::ExtractArchive => "Распаковать",
+            Self::RotateLeft => "Влево",
+            Self::RotateRight => "Вправо",
+            Self::ConvertToIco => "ICO",
+            Self::CopyPath => "Путь",
+            Self::Sha256 => "SHA-256",
+            Self::IntoNewFolder => "В папку",
+        }
+    }
+
+    // Полное название: в центре колеса при наведении и в настройках.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::ConvertToPng => "Конвертировать в PNG",
+            Self::ConvertToJpeg => "Конвертировать в JPG",
+            Self::ConvertToWebp => "Конвертировать в WebP",
+            Self::ImagesToPdf => "Собрать в PDF",
+            Self::CompressImages => "Сжать",
+            Self::ResizeImages => "Уменьшить до 1920 px",
+            Self::StripMetadata => "Удалить метаданные",
+            Self::MergePdfs => "Склеить PDF",
+            Self::PdfToImages => "Страницы в PNG",
+            Self::CreateZip => "Упаковать в ZIP",
+            Self::ExtractArchive => "Распаковать сюда",
+            Self::RotateLeft => "Повернуть влево",
+            Self::RotateRight => "Повернуть вправо",
+            Self::ConvertToIco => "Сделать значок ICO",
+            Self::CopyPath => "Копировать путь",
+            Self::Sha256 => "Копировать SHA-256",
+            Self::IntoNewFolder => "Переложить в новую папку",
         }
     }
 
@@ -244,7 +305,10 @@ impl ActionId {
             | Self::ImagesToPdf
             | Self::CompressImages
             | Self::ResizeImages
-            | Self::StripMetadata => category == Category::Images,
+            | Self::StripMetadata
+            | Self::RotateLeft
+            | Self::RotateRight
+            | Self::ConvertToIco => category == Category::Images,
 
             Self::MergePdfs | Self::PdfToImages => category == Category::Pdf,
 
@@ -252,6 +316,8 @@ impl ActionId {
 
             // Упаковать можно что угодно, кроме уже готовых архивов.
             Self::CreateZip => category != Category::Archive,
+
+            Self::CopyPath | Self::Sha256 | Self::IntoNewFolder => true,
         }
     }
 
@@ -263,9 +329,13 @@ impl ActionId {
             Self::ConvertToJpeg => convertible_images(selection, ImageKind::Jpeg),
             Self::ConvertToWebp => convertible_images(selection, ImageKind::WebP),
 
-            Self::ImagesToPdf | Self::CompressImages | Self::ResizeImages | Self::StripMetadata => {
-                selection.matching(is_image)
-            }
+            Self::ImagesToPdf | Self::ConvertToIco => selection.matching(is_image),
+
+            Self::CompressImages
+            | Self::ResizeImages
+            | Self::StripMetadata
+            | Self::RotateLeft
+            | Self::RotateRight => selection.matching(is_editable_image),
 
             // Склеивать имеет смысл от двух файлов.
             Self::MergePdfs => {
@@ -278,7 +348,11 @@ impl ActionId {
 
             Self::CreateZip => selection.matching(|_| true),
 
-            Self::ExtractArchive => selection.matching(is_zip),
+            Self::ExtractArchive => selection.matching(is_archive),
+
+            Self::CopyPath | Self::IntoNewFolder => selection.matching(|_| true),
+
+            Self::Sha256 => selection.matching(is_file),
         }
     }
 
@@ -293,11 +367,74 @@ impl ActionId {
 
         let mut report = |done: usize| progress(done, total);
 
-        let mut outcome = ActionOutcome {
-            outputs: Vec::new(),
-            skipped: Vec::new(),
-            failures: Vec::new(),
-        };
+        let mut outcome = ActionOutcome::default();
+
+        match self {
+            Self::CopyPath => {
+                outcome.clipboard = Some(file_tools::paths_text(inputs));
+
+                outcome.message = Some(match inputs.len() {
+                    1 => "✓ Путь скопирован".to_string(),
+                    count => format!("✓ Скопировано путей: {count}"),
+                });
+
+                report(total);
+
+                return outcome;
+            }
+
+            Self::Sha256 => {
+                let mut lines = Vec::new();
+
+                for (index, input) in inputs.iter().enumerate() {
+                    match file_tools::sha256(input) {
+                        // Для нескольких файлов — формат sha256sum: «хэш  имя».
+                        Ok(hash) if total == 1 => lines.push(hash),
+
+                        Ok(hash) => lines.push(format!(
+                            "{hash}  {}",
+                            input.file_name().unwrap_or_default().to_string_lossy()
+                        )),
+
+                        Err(error) => outcome.failures.push((input.clone(), error)),
+                    }
+
+                    report(index + 1);
+                }
+
+                if !lines.is_empty() {
+                    outcome.clipboard = Some(lines.join("\r\n"));
+
+                    outcome.message = Some("✓ SHA-256 скопирован".to_string());
+                }
+
+                return outcome;
+            }
+
+            Self::IntoNewFolder => {
+                match file_tools::into_new_folder(inputs) {
+                    Ok((folder, failures)) => {
+                        outcome.outputs.push(folder);
+
+                        outcome.failures = failures;
+
+                        outcome.rename = true;
+                    }
+
+                    Err(error) => {
+                        let first = inputs.first().cloned().unwrap_or_default();
+
+                        outcome.failures.push((first, error));
+                    }
+                }
+
+                report(total);
+
+                return outcome;
+            }
+
+            _ => {}
+        }
 
         // Действия «много файлов -> один результат».
         let combined = match self {
@@ -352,9 +489,17 @@ impl ActionId {
             Self::StripMetadata => metadata::strip(input),
             Self::PdfToImages => Ok(pdf::to_images(input)?),
             Self::ExtractArchive => Ok(archive::extract(input)?),
+            Self::RotateLeft => converter::rotate(input, false),
+            Self::RotateRight => converter::rotate(input, true),
+            Self::ConvertToIco => Ok(converter::to_ico(input)?),
 
-            Self::ImagesToPdf | Self::MergePdfs | Self::CreateZip => {
-                unreachable!("combined actions are handled in execute")
+            Self::ImagesToPdf
+            | Self::MergePdfs
+            | Self::CreateZip
+            | Self::CopyPath
+            | Self::Sha256
+            | Self::IntoNewFolder => {
+                unreachable!("handled in execute")
             }
         }
     }

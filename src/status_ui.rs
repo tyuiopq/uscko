@@ -1,252 +1,94 @@
-use std::mem::zeroed;
-use std::ptr::{null, null_mut};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+// Окно статуса в углу экрана: «Обработка 3 из 12», «✓ photo.png», «Ошибка».
+// Своя отрисовка с попиксельной прозрачностью: карточка с тенью, индикатор,
+// полоса прогресса, плавное появление и исчезновение.
 
+use std::cell::RefCell;
+use std::f32::consts::PI;
+use std::ptr::{null, null_mut};
+use std::time::Instant;
+
+use tiny_skia::{PathBuilder, Pixmap};
 use windows_sys::Win32::{
-    Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-    Graphics::Gdi::{
-        BeginPaint, CreateSolidBrush, DEFAULT_GUI_FONT, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
-        DT_VCENTER,
-        DeleteObject, DrawTextW, EndPaint, FillRect, GetStockObject, InvalidateRect, PAINTSTRUCT,
-        SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
-    },
+    Foundation::{HINSTANCE, HWND, POINT, RECT},
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, GetCursorPos, HWND_TOPMOST, KillTimer, LWA_ALPHA,
-        RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-        SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, WM_PAINT, WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, GetCursorPos, HWND_TOPMOST, KillTimer, RegisterClassW,
+        SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetTimer, SetWindowPos, ShowWindow, WNDCLASSW,
         WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
         WS_POPUP,
     },
 };
 
-use crate::{dpi, job_manager};
+use crate::render::{self, ACCENT, BORDER, DANGER, Rgba, SUCCESS, TEXT, TEXT_MUTED, with_alpha};
+use crate::{dpi, job_manager, text};
 
-const WIDTH: i32 = 270;
-const HEIGHT: i32 = 52;
+// Карточка и запас вокруг неё под тень.
+const CARD_WIDTH: f32 = 320.0;
+const CARD_HEIGHT: f32 = 60.0;
+const SHADOW: f32 = 20.0;
 
-// Отступы от края рабочей области (панель задач уже исключена).
-const MARGIN_RIGHT: i32 = 18;
-const MARGIN_BOTTOM: i32 = 18;
+// Отступ карточки от края рабочей области (панель задач уже исключена).
+const MARGIN: f32 = 4.0;
+
+const CARD_FILL: Rgba = [28, 31, 38, 248];
+const TRACK: Rgba = [255, 255, 255, 22];
 
 pub const TIMER_DELAY_ID: usize = 2001;
-pub const TIMER_ANIMATION_ID: usize = 2002;
+pub const TIMER_FRAME_ID: usize = 2002;
 pub const TIMER_HIDE_ID: usize = 2003;
 
+// Короткие задачи окно не показывает, чтобы не мелькать.
 const SHOW_DELAY_MS: u32 = 400;
-const ANIMATION_MS: u32 = 45;
+const FRAME_MS: u32 = 16;
+const SUCCESS_VISIBLE_MS: u32 = 1200;
+const ERROR_VISIBLE_MS: u32 = 3200;
 
-// 0 = hidden/pending
-// 1 = converting
-// 2 = success
-// 3 = error
-static MODE: AtomicI32 = AtomicI32::new(0);
-
-static PHASE: AtomicI32 = AtomicI32::new(0);
-
-static WINDOW_DPI: AtomicU32 = AtomicU32::new(dpi::BASE_DPI);
-
-// Итоговый текст (успех или ошибка), который показывает окно.
-static RESULT_TEXT: Mutex<String> = Mutex::new(String::new());
+const APPEAR_SECONDS: f32 = 0.18;
+const DISAPPEAR_SECONDS: f32 = 0.16;
 
 static CLASS_NAME: &[u16] = &[
     'F' as u16, 'i' as u16, 'l' as u16, 'e' as u16, 'H' as u16, 'a' as u16, 'l' as u16, 'o' as u16,
     'S' as u16, 't' as u16, 'a' as u16, 't' as u16, 'u' as u16, 's' as u16, 0,
 ];
 
-fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mode {
+    Working,
+    Success,
+    Error,
 }
 
-fn draw_text(hdc: *mut std::ffi::c_void, text: &str, color: COLORREF) {
-    let wide: Vec<u16> = text.encode_utf16().collect();
-
-    let mut rect = RECT {
-        left: 16,
-        top: 7,
-        right: WIDTH - 12,
-        bottom: HEIGHT - 9,
-    };
-
-    unsafe {
-        SetBkMode(hdc, TRANSPARENT as i32);
-
-        SetTextColor(hdc, color);
-
-        DrawTextW(
-            hdc,
-            wide.as_ptr(),
-            wide.len() as i32,
-            &mut rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-        );
-    }
-}
-
-unsafe fn paint(hwnd: HWND) {
-    let mut paint: PAINTSTRUCT = zeroed();
-
-    let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
-
-    if hdc.is_null() {
-        return;
-    }
-
-    unsafe {
-        dpi::apply_to_dc(hdc, WINDOW_DPI.load(Ordering::Relaxed));
-    }
-
-    let mode = MODE.load(Ordering::Relaxed);
-
-    let full_rect = RECT {
-        left: 0,
-        top: 0,
-        right: WIDTH,
-        bottom: HEIGHT,
-    };
-
-    let background = unsafe { CreateSolidBrush(rgb(32, 34, 39)) };
-
-    unsafe {
-        FillRect(hdc, &full_rect, background);
-
-        DeleteObject(background);
-    }
-
-    let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
-
-    let old_font = unsafe { SelectObject(hdc, font) };
-
-    match mode {
-        1 => {
-            let (done, total) = job_manager::progress();
-
-            let text = if total > 1 {
-                format!("Обработка {done}/{total}…")
-            } else {
-                "Обработка…".to_string()
-            };
-
-            draw_text(hdc, &text, rgb(225, 227, 232));
-
-            let track_rect = RECT {
-                left: 12,
-                top: HEIGHT - 7,
-                right: WIDTH - 12,
-                bottom: HEIGHT - 4,
-            };
-
-            let track = unsafe { CreateSolidBrush(rgb(65, 68, 75)) };
-
-            unsafe {
-                FillRect(hdc, &track_rect, track);
-
-                DeleteObject(track);
-            }
-
-            let phase = PHASE.load(Ordering::Relaxed);
-
-            let track_width = WIDTH - 24;
-
-            let segment_width = 62;
-
-            let usable = track_width + segment_width;
-
-            let offset = phase % usable;
-
-            let mut left = 12 + offset - segment_width;
-
-            let mut right = left + segment_width;
-
-            left = left.max(12);
-
-            right = right.min(WIDTH - 12);
-
-            if right > left {
-                let progress_rect = RECT {
-                    left,
-                    top: HEIGHT - 7,
-                    right,
-                    bottom: HEIGHT - 4,
-                };
-
-                let progress = unsafe { CreateSolidBrush(rgb(92, 145, 255)) };
-
-                unsafe {
-                    FillRect(hdc, &progress_rect, progress);
-
-                    DeleteObject(progress);
-                }
-            }
-        }
-
-        2 => {
-            let text = RESULT_TEXT.lock().map(|text| text.clone()).unwrap_or_default();
-
-            draw_text(hdc, &text, rgb(225, 227, 232));
-        }
-
-        3 => {
-            let text = RESULT_TEXT.lock().map(|text| text.clone()).unwrap_or_default();
-
-            draw_text(hdc, &text, rgb(235, 220, 220));
-        }
-
-        _ => {}
-    }
-
-    unsafe {
-        SelectObject(hdc, old_font);
-
-        EndPaint(hwnd, &paint);
-    }
-}
-
-unsafe extern "system" fn window_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_PAINT => {
-            unsafe {
-                paint(hwnd);
-            }
-
-            0
-        }
-
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
-    }
+struct Inner {
+    mode: Mode,
+    text: String,
+    visible: bool,
+    // 0..1 — анимация появления; при скрытии идёт обратно.
+    appear: f32,
+    hiding: bool,
+    spinner: f32,
+    // Плавная полоса прогресса.
+    progress: f32,
+    dpi: u32,
+    position: POINT,
+    last_tick: Instant,
 }
 
 pub struct StatusUi {
     hwnd: HWND,
+    inner: RefCell<Inner>,
 }
 
 impl StatusUi {
     pub unsafe fn create(instance: HINSTANCE) -> Option<Self> {
-        let background = unsafe { CreateSolidBrush(rgb(32, 34, 39)) };
-
         let class = WNDCLASSW {
             style: 0,
-
-            lpfnWndProc: Some(window_proc),
-
+            lpfnWndProc: Some(DefWindowProcW),
             cbClsExtra: 0,
             cbWndExtra: 0,
-
             hInstance: instance,
-
             hIcon: null_mut(),
-
             hCursor: null_mut(),
-
-            hbrBackground: background,
-
+            hbrBackground: null_mut(),
             lpszMenuName: null(),
-
             lpszClassName: CLASS_NAME.as_ptr(),
         };
 
@@ -266,8 +108,8 @@ impl StatusUi {
                 WS_POPUP,
                 0,
                 0,
-                WIDTH,
-                HEIGHT,
+                1,
+                1,
                 null_mut(),
                 null_mut(),
                 instance,
@@ -279,157 +121,401 @@ impl StatusUi {
             return None;
         }
 
-        unsafe {
-            SetLayeredWindowAttributes(hwnd, 0, 238, LWA_ALPHA);
-        }
-
-        Some(Self { hwnd })
+        Some(Self {
+            hwnd,
+            inner: RefCell::new(Inner {
+                mode: Mode::Working,
+                text: String::new(),
+                visible: false,
+                appear: 0.0,
+                hiding: false,
+                spinner: 0.0,
+                progress: 0.0,
+                dpi: dpi::BASE_DPI,
+                position: POINT { x: 0, y: 0 },
+                last_tick: Instant::now(),
+            }),
+        })
     }
 
     pub fn hwnd(&self) -> HWND {
         self.hwnd
     }
 
+    // Задача запущена. Окно появится, только если она не закончится за SHOW_DELAY_MS.
     pub unsafe fn begin_pending(&self) {
-        MODE.store(0, Ordering::Relaxed);
+        let mut inner = self.inner.borrow_mut();
 
-        PHASE.store(0, Ordering::Relaxed);
+        inner.mode = Mode::Working;
+        inner.progress = 0.0;
+        inner.text.clear();
 
         unsafe {
-            KillTimer(self.hwnd, TIMER_DELAY_ID);
-
-            KillTimer(self.hwnd, TIMER_ANIMATION_ID);
-
             KillTimer(self.hwnd, TIMER_HIDE_ID);
 
-            ShowWindow(self.hwnd, SW_HIDE);
+            if !inner.visible || inner.hiding {
+                SetTimer(self.hwnd, TIMER_DELAY_ID, SHOW_DELAY_MS, None);
+            }
+        }
 
-            SetTimer(self.hwnd, TIMER_DELAY_ID, SHOW_DELAY_MS, None);
+        inner.hiding = false;
+    }
+
+    // always — показать, даже если задача была быстрой (например,
+    // «Путь скопирован»: иначе не видно, что что-то произошло).
+    pub unsafe fn finish_success(&self, text: String, always: bool) {
+        unsafe {
+            KillTimer(self.hwnd, TIMER_DELAY_ID);
+        }
+
+        let visible = {
+            let mut inner = self.inner.borrow_mut();
+
+            inner.mode = Mode::Success;
+            inner.text = text;
+            inner.hiding = false;
+
+            inner.visible
+        };
+
+        // Быстрая задача: окно так и не появилось — и не нужно.
+        if !visible && !always {
+            return;
+        }
+
+        unsafe {
+            if !visible {
+                self.show();
+            }
+
+            SetTimer(self.hwnd, TIMER_HIDE_ID, SUCCESS_VISIBLE_MS, None);
         }
     }
 
-    // Показывает окно в углу того монитора, где сейчас курсор.
-    unsafe fn show_window(&self) {
+    // Об ошибке сообщаем всегда, даже если задача была быстрой.
+    pub unsafe fn finish_error(&self, text: String) {
+        unsafe {
+            KillTimer(self.hwnd, TIMER_DELAY_ID);
+        }
+
+        {
+            let mut inner = self.inner.borrow_mut();
+
+            inner.mode = Mode::Error;
+            inner.text = text;
+            inner.hiding = false;
+        }
+
+        unsafe {
+            self.show();
+
+            SetTimer(self.hwnd, TIMER_HIDE_ID, ERROR_VISIBLE_MS, None);
+        }
+    }
+
+    pub unsafe fn handle_timer(&self, timer_id: usize) {
+        match timer_id {
+            TIMER_DELAY_ID => unsafe {
+                KillTimer(self.hwnd, TIMER_DELAY_ID);
+
+                if job_manager::is_running() {
+                    self.show();
+                }
+            },
+
+            TIMER_HIDE_ID => unsafe {
+                KillTimer(self.hwnd, TIMER_HIDE_ID);
+
+                self.inner.borrow_mut().hiding = true;
+            },
+
+            TIMER_FRAME_ID => unsafe {
+                if !self.frame() {
+                    KillTimer(self.hwnd, TIMER_FRAME_ID);
+
+                    ShowWindow(self.hwnd, SW_HIDE);
+                }
+            },
+
+            _ => {}
+        }
+    }
+
+    // Показывает окно в углу монитора, где сейчас курсор.
+    unsafe fn show(&self) {
         let mut cursor = POINT { x: 0, y: 0 };
 
         unsafe {
             GetCursorPos(&mut cursor);
         }
 
-        let Some(area) = dpi::work_area_at(cursor) else {
-            return;
+        let area = dpi::work_area_at(cursor).unwrap_or(RECT {
+            left: 0,
+            top: 0,
+            right: 800,
+            bottom: 600,
+        });
+
+        let mut inner = self.inner.borrow_mut();
+
+        let was_visible = inner.visible;
+
+        inner.dpi = dpi::for_point(cursor);
+
+        let size = window_size(inner.dpi);
+
+        let margin = dpi::scale(MARGIN as i32, inner.dpi);
+
+        inner.position = POINT {
+            x: area.right - size.0 - margin,
+            y: area.bottom - size.1 - margin,
         };
 
-        let window_dpi = dpi::for_point(cursor);
+        inner.visible = true;
 
-        WINDOW_DPI.store(window_dpi, Ordering::Relaxed);
+        if !was_visible {
+            inner.appear = 0.0;
+            inner.last_tick = Instant::now();
+        }
 
-        let width = dpi::scale(WIDTH, window_dpi);
+        let position = inner.position;
 
-        let height = dpi::scale(HEIGHT, window_dpi);
-
-        let x = area.right - width - dpi::scale(MARGIN_RIGHT, window_dpi);
-
-        let y = area.bottom - height - dpi::scale(MARGIN_BOTTOM, window_dpi);
+        drop(inner);
 
         unsafe {
             SetWindowPos(
                 self.hwnd,
                 HWND_TOPMOST,
-                x,
-                y,
-                width,
-                height,
+                position.x,
+                position.y,
+                size.0,
+                size.1,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
 
-            InvalidateRect(self.hwnd, null(), 0);
+            SetTimer(self.hwnd, TIMER_FRAME_ID, FRAME_MS, None);
+        }
+
+        self.frame();
+    }
+
+    // Кадр анимации. Возвращает false, когда окно полностью скрылось.
+    fn frame(&self) -> bool {
+        let mut inner = self.inner.borrow_mut();
+
+        let now = Instant::now();
+
+        let dt = (now - inner.last_tick).as_secs_f32().min(0.1);
+
+        inner.last_tick = now;
+
+        if inner.hiding {
+            inner.appear = (inner.appear - dt / DISAPPEAR_SECONDS).max(0.0);
+
+            if inner.appear <= 0.0 {
+                inner.visible = false;
+                inner.hiding = false;
+
+                return false;
+            }
+        } else {
+            inner.appear = (inner.appear + dt / APPEAR_SECONDS).min(1.0);
+        }
+
+        inner.spinner = (inner.spinner + dt * 1.4).fract();
+
+        let (done, total) = job_manager::progress();
+
+        let target = match inner.mode {
+            Mode::Working if total > 0 => done as f32 / total as f32,
+            Mode::Working => 0.0,
+            Mode::Success | Mode::Error => 1.0,
+        };
+
+        render::approach(&mut inner.progress, target, 0.2, dt);
+
+        let size = window_size(inner.dpi);
+
+        if let Some(mut pixmap) = Pixmap::new(size.0 as u32, size.1 as u32) {
+            paint(&mut pixmap, &inner, done, total);
+
+            render::present_layered(self.hwnd, &pixmap, inner.position);
+        }
+
+        true
+    }
+}
+
+fn window_size(window_dpi: u32) -> (i32, i32) {
+    (
+        dpi::scale((CARD_WIDTH + SHADOW * 2.0) as i32, window_dpi),
+        dpi::scale((CARD_HEIGHT + SHADOW * 2.0) as i32, window_dpi),
+    )
+}
+
+// Обрезает текст с «…», чтобы он помещался в max_width.
+fn ellipsize(font: &ab_glyph::FontVec, size: f32, value: &str, max_width: f32) -> String {
+    if text::measure(font, size, value) <= max_width {
+        return value.to_string();
+    }
+
+    let mut characters: Vec<char> = value.chars().collect();
+
+    while !characters.is_empty() {
+        characters.pop();
+
+        let candidate: String = characters.iter().collect::<String>() + "…";
+
+        if text::measure(font, size, &candidate) <= max_width {
+            return candidate;
         }
     }
 
-    pub unsafe fn handle_timer(&self, timer_id: usize) {
-        match timer_id {
-            TIMER_DELAY_ID => {
-                unsafe {
-                    KillTimer(self.hwnd, TIMER_DELAY_ID);
-                }
+    "…".to_string()
+}
 
-                if !job_manager::is_running() {
-                    return;
-                }
+fn paint(pixmap: &mut Pixmap, inner: &Inner, done: usize, total: usize) {
+    let scale = inner.dpi as f32 / dpi::BASE_DPI as f32;
 
-                MODE.store(1, Ordering::Relaxed);
+    let s = |value: f32| value * scale;
 
-                unsafe {
-                    self.show_window();
-                }
+    let appear = render::ease_out_cubic(inner.appear);
 
-                unsafe {
-                    SetTimer(self.hwnd, TIMER_ANIMATION_ID, ANIMATION_MS, None);
+    // Появление: карточка выезжает снизу и проявляется.
+    let offset = (1.0 - appear) * 14.0;
+
+    let (x, y) = (SHADOW, SHADOW + offset);
+
+    render::soft_shadow(pixmap, s(x), s(y), s(CARD_WIDTH), s(CARD_HEIGHT), s(14.0), s(16.0), 0.7 * appear);
+
+    let card = render::rounded_rect(s(x), s(y), s(CARD_WIDTH), s(CARD_HEIGHT), s(14.0));
+
+    render::fill(pixmap, &card, with_alpha(CARD_FILL, appear));
+    render::stroke(pixmap, &card, with_alpha(BORDER, appear), scale);
+
+    // Значок слева.
+    let (icon_x, icon_y) = (x + 30.0, y + CARD_HEIGHT / 2.0);
+
+    let icon_radius = 11.0;
+
+    match inner.mode {
+        Mode::Working => {
+            render::stroke(
+                pixmap,
+                &render::circle(s(icon_x), s(icon_y), s(icon_radius)),
+                with_alpha(TRACK, appear),
+                s(2.5),
+            );
+
+            let start = inner.spinner * 2.0 * PI;
+
+            let mut arc = PathBuilder::new();
+
+            for index in 0..=24 {
+                let angle = start + index as f32 / 24.0 * PI * 1.3;
+
+                let (px, py) = (s(icon_x + angle.cos() * icon_radius), s(icon_y + angle.sin() * icon_radius));
+
+                if index == 0 {
+                    arc.move_to(px, py);
+                } else {
+                    arc.line_to(px, py);
                 }
             }
 
-            TIMER_ANIMATION_ID => {
-                PHASE.fetch_add(7, Ordering::Relaxed);
+            render::stroke(pixmap, &arc.finish(), with_alpha(ACCENT, appear), s(2.5));
+        }
 
-                unsafe {
-                    InvalidateRect(self.hwnd, null(), 0);
-                }
+        Mode::Success | Mode::Error => {
+            let color = if inner.mode == Mode::Success { SUCCESS } else { DANGER };
+
+            render::fill(
+                pixmap,
+                &render::circle(s(icon_x), s(icon_y), s(icon_radius + 1.0)),
+                with_alpha(color, appear),
+            );
+
+            let mut mark = PathBuilder::new();
+
+            if inner.mode == Mode::Success {
+                mark.move_to(s(icon_x - 5.0), s(icon_y));
+                mark.line_to(s(icon_x - 1.5), s(icon_y + 3.5));
+                mark.line_to(s(icon_x + 5.0), s(icon_y - 3.5));
+            } else {
+                mark.move_to(s(icon_x - 4.0), s(icon_y - 4.0));
+                mark.line_to(s(icon_x + 4.0), s(icon_y + 4.0));
+                mark.move_to(s(icon_x + 4.0), s(icon_y - 4.0));
+                mark.line_to(s(icon_x - 4.0), s(icon_y + 4.0));
             }
 
-            TIMER_HIDE_ID => {
-                unsafe {
-                    KillTimer(self.hwnd, TIMER_HIDE_ID);
-
-                    ShowWindow(self.hwnd, SW_HIDE);
-                }
-
-                MODE.store(0, Ordering::Relaxed);
-            }
-
-            _ => {}
+            render::stroke(pixmap, &mark.finish(), with_alpha([20, 22, 27, 255], appear), s(2.2));
         }
     }
 
-    pub unsafe fn finish_success(&self, text: String) {
-        if let Ok(mut result) = RESULT_TEXT.lock() {
-            *result = text;
-        }
+    // Текст.
+    let Some(fonts) = text::fonts() else {
+        return;
+    };
 
-        unsafe {
-            KillTimer(self.hwnd, TIMER_DELAY_ID);
+    let title = match inner.mode {
+        Mode::Working if total > 1 => format!("Обработка {done} из {total}"),
+        Mode::Working => "Обработка…".to_string(),
+        _ => inner.text.trim_start_matches("✓ ").to_string(),
+    };
 
-            KillTimer(self.hwnd, TIMER_ANIMATION_ID);
-        }
+    let text_x = x + 54.0;
 
-        if MODE.load(Ordering::Relaxed) == 1 {
-            MODE.store(2, Ordering::Relaxed);
+    let max_width = s(CARD_WIDTH - 54.0 - 18.0);
 
-            unsafe {
-                InvalidateRect(self.hwnd, null(), 0);
+    let title = ellipsize(&fonts.semibold, s(14.0), &title, max_width);
 
-                SetTimer(self.hwnd, TIMER_HIDE_ID, 900, None);
-            }
-        }
-    }
+    let width = text::measure(&fonts.semibold, s(14.0), &title);
 
-    pub unsafe fn finish_error(&self, text: String) {
-        if let Ok(mut result) = RESULT_TEXT.lock() {
-            *result = text;
-        }
+    // Есть вторая строка (прогресс или подсказка) — заголовок выше центра.
+    let second_line = (inner.mode == Mode::Working && total > 1) || inner.mode == Mode::Error;
 
-        unsafe {
-            KillTimer(self.hwnd, TIMER_DELAY_ID);
+    let title_y = if second_line { y + 23.0 } else { y + CARD_HEIGHT / 2.0 - 1.0 };
 
-            KillTimer(self.hwnd, TIMER_ANIMATION_ID);
-        }
+    text::draw_centered(
+        pixmap,
+        &fonts.semibold,
+        s(14.0),
+        &title,
+        s(text_x) + width / 2.0,
+        s(title_y),
+        with_alpha(TEXT, appear),
+    );
 
-        MODE.store(3, Ordering::Relaxed);
+    // Полоса прогресса для пачки файлов.
+    if inner.mode == Mode::Working && total > 1 {
+        let bar_x = text_x;
+        let bar_width = CARD_WIDTH - 54.0 - 18.0;
+        let bar_y = y + CARD_HEIGHT - 14.0;
 
-        unsafe {
-            self.show_window();
+        render::fill(
+            pixmap,
+            &render::rounded_rect(s(bar_x), s(bar_y), s(bar_width), s(3.0), s(1.5)),
+            with_alpha(TRACK, appear),
+        );
 
-            SetTimer(self.hwnd, TIMER_HIDE_ID, 2600, None);
-        }
+        render::fill(
+            pixmap,
+            &render::rounded_rect(s(bar_x), s(bar_y), s(bar_width * inner.progress.max(0.02)), s(3.0), s(1.5)),
+            with_alpha(ACCENT, appear),
+        );
+    } else if inner.mode == Mode::Error {
+        let hint = "Подробности — в консоли";
+
+        let width = text::measure(&fonts.regular, s(11.5), hint);
+
+        text::draw_centered(
+            pixmap,
+            &fonts.regular,
+            s(11.5),
+            hint,
+            s(text_x) + width / 2.0,
+            s(y + CARD_HEIGHT - 13.0),
+            with_alpha(TEXT_MUTED, appear),
+        );
     }
 }

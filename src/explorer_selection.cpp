@@ -301,7 +301,12 @@ bool view_folder_path(IShellFolder* folder, wchar_t* output, unsigned long outpu
 
 // Выделяет файлы (список строк, завершённый пустой строкой) в окне, если оно
 // показывает папку folder. Возвращает true, только если все файлы выделены.
-bool select_in_browser(IShellBrowser* browser, const wchar_t* folder, const wchar_t* paths) {
+bool select_in_browser(
+    IShellBrowser* browser,
+    const wchar_t* folder,
+    const wchar_t* paths,
+    bool edit
+) {
     IShellView* view = nullptr;
 
     if (FAILED(browser->QueryActiveShellView(&view)) || view == nullptr) {
@@ -346,6 +351,16 @@ bool select_in_browser(IShellBrowser* browser, const wchar_t* folder, const wcha
 
             if (first) {
                 flags |= SVSI_DESELECTOTHERS | SVSI_ENSUREVISIBLE | SVSI_FOCUSED;
+            }
+
+            // Переименование включаем только после того, как элемент
+            // действительно выделен, иначе SelectItem его не найдёт.
+            DWORD before = 0;
+
+            bool visible = SUCCEEDED(folder_view->GetSelectionState(child, &before));
+
+            if (first && edit && visible) {
+                flags |= SVSI_EDIT;
             }
 
             view->SelectItem(child, flags);
@@ -416,7 +431,7 @@ int filehalo_get_selected_paths(PathCallback callback, void* context) {
 // столе), которые её показывают. paths — полные пути, разделённые '\0',
 // в конце пустая строка. Возвращает число окон, где выделились все файлы.
 extern "C"
-int filehalo_select_files(const wchar_t* folder, const wchar_t* paths) {
+int filehalo_select_files(const wchar_t* folder, const wchar_t* paths, int edit) {
     if (folder == nullptr || paths == nullptr || *paths == L'\0') {
         return 0;
     }
@@ -432,7 +447,7 @@ int filehalo_select_files(const wchar_t* folder, const wchar_t* paths) {
     int selected_count = 0;
 
     for_each_explorer_browser(shell_windows, [&](IShellBrowser* browser) {
-        if (select_in_browser(browser, folder, paths)) {
+        if (select_in_browser(browser, folder, paths, edit != 0)) {
             ++selected_count;
         }
 
@@ -443,7 +458,7 @@ int filehalo_select_files(const wchar_t* folder, const wchar_t* paths) {
     IShellBrowser* desktop = desktop_browser(shell_windows);
 
     if (desktop != nullptr) {
-        if (select_in_browser(desktop, folder, paths)) {
+        if (select_in_browser(desktop, folder, paths, edit != 0)) {
             ++selected_count;
         }
 

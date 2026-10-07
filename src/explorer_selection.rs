@@ -7,7 +7,7 @@ type PathCallback = unsafe extern "C" fn(context: *mut c_void, path: *const u16)
 unsafe extern "C" {
     fn filehalo_get_selected_paths(callback: PathCallback, context: *mut c_void) -> i32;
 
-    fn filehalo_select_files(folder: *const u16, paths: *const u16) -> i32;
+    fn filehalo_select_files(folder: *const u16, paths: *const u16, edit: i32) -> i32;
 }
 
 unsafe extern "C" fn collect_path(context: *mut c_void, path: *const u16) {
@@ -32,9 +32,10 @@ pub fn selected_paths() -> Vec<PathBuf> {
 }
 
 // Выделяет файлы во всех окнах Проводника (и на рабочем столе), где открыта
-// их папка. Берутся только файлы из папки первого файла. Возвращает false,
-// если Проводник ещё не успел увидеть какой-то из них.
-pub fn select_files(paths: &[PathBuf]) -> bool {
+// их папка. Берутся только файлы из папки первого файла. rename — сразу
+// включить переименование первого. Возвращает false, если Проводник ещё
+// не успел увидеть какой-то из них.
+pub fn select_files(paths: &[PathBuf], rename: bool) -> bool {
     let Some(folder) = paths.first().and_then(|path| path.parent()) else {
         return false;
     };
@@ -50,7 +51,7 @@ pub fn select_files(paths: &[PathBuf]) -> bool {
 
     let folder = to_wide(folder);
 
-    unsafe { filehalo_select_files(folder.as_ptr(), list.as_ptr()) > 0 }
+    unsafe { filehalo_select_files(folder.as_ptr(), list.as_ptr(), rename as i32) > 0 }
 }
 
 fn to_wide(path: &Path) -> Vec<u16> {

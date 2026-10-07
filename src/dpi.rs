@@ -1,16 +1,11 @@
 // Программа объявлена Per-Monitor DPI Aware (v2): Windows не растягивает
 // её окна, а координаты курсора и окон приходят в физических пикселях.
-// Все окна рисуются в логических единицах (как при 100% масштабе), а
-// перевод в пиксели делает GDI через режим отображения MM_ANISOTROPIC.
-
-use std::ptr::null_mut;
+// Окна описываются в логических единицах (как при 100% масштабе) и
+// рисуются сразу в физических пикселях с нужным множителем.
 
 use windows_sys::Win32::{
     Foundation::{HWND, POINT, RECT},
-    Graphics::Gdi::{
-        GetMonitorInfoW, HDC, MM_ANISOTROPIC, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-        MonitorFromPoint, SetMapMode, SetViewportExtEx, SetWindowExtEx,
-    },
+    Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
     UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, GetDpiForWindow,
         MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
@@ -71,15 +66,4 @@ pub fn work_area_at(point: POINT) -> Option<RECT> {
     };
 
     (ok != 0).then_some(info.rcWork)
-}
-
-// Дальше всё рисование в этом контексте идёт в логических единицах.
-pub unsafe fn apply_to_dc(hdc: HDC, dpi: u32) {
-    unsafe {
-        SetMapMode(hdc, MM_ANISOTROPIC);
-
-        SetWindowExtEx(hdc, BASE_DPI as i32, BASE_DPI as i32, null_mut());
-
-        SetViewportExtEx(hdc, dpi as i32, dpi as i32, null_mut());
-    }
 }

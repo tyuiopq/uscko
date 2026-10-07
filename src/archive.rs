@@ -12,7 +12,7 @@ use windows_sys::Win32::{
 };
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
-use crate::output;
+use crate::{file_types, output};
 
 // Эти форматы уже сжаты: повторное сжатие только тратит время.
 const STORED_EXTENSIONS: &[&str] = &[
@@ -290,17 +290,46 @@ fn safe_relative_path(name: &str) -> Option<PathBuf> {
     (only_normal && !path.as_os_str().is_empty()).then_some(path)
 }
 
-// Распаковывает рядом с архивом. Если в архиве один файл или одна папка —
-// она кладётся прямо рядом, иначе всё содержимое — в папку с именем архива.
-pub fn extract(source: &Path) -> Result<PathBuf, String> {
+// Записывает один файл из архива во временную папку распаковки.
+fn write_entry(
+    root: &Path,
+    name: &str,
+    is_directory: bool,
+    content: &mut dyn std::io::Read,
+    modified: Option<SystemTime>,
+) -> Result<(), String> {
+    let Some(relative) = safe_relative_path(name) else {
+        eprintln!("Skipped unsafe path in archive: {name}");
+
+        return Ok(());
+    };
+
+    let target = root.join(&relative);
+
+    if is_directory {
+        return fs::create_dir_all(&target).map_err(|error| format!("{name}: {error}"));
+    }
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("{name}: {error}"))?;
+    }
+
+    let mut file = File::create(&target).map_err(|error| format!("{name}: {error}"))?;
+
+    std::io::copy(content, &mut file).map_err(|error| format!("{name}: {error}"))?;
+
+    if let Some(time) = modified {
+        let _ = file.set_modified(time);
+    }
+
+    Ok(())
+}
+
+fn extract_zip(source: &Path, root: &Path) -> Result<(), String> {
     let file = File::open(source).map_err(|error| format!("{}: {error}", source.display()))?;
 
     let mut archive = ZipArchive::new(BufReader::new(file))
         .map_err(|error| format!("{}: {error}", source.display()))?;
-
-    let folder = output::parent_of(source)?;
-
-    let temp = output::temp_dir(folder)?;
 
     for index in 0..archive.len() {
         let mut entry = archive
@@ -313,32 +342,73 @@ pub fn extract(source: &Path) -> Result<PathBuf, String> {
 
         let name = decode_entry_name(entry.name_raw());
 
-        let Some(relative) = safe_relative_path(&name) else {
-            eprintln!("Skipped unsafe path in archive: {name}");
+        let is_directory = entry.is_dir();
 
-            continue;
-        };
+        let modified = entry.last_modified().and_then(zip_to_system_time);
 
-        let target = temp.path().join(&relative);
+        write_entry(root, &name, is_directory, &mut entry, modified)?;
+    }
 
-        if entry.is_dir() {
-            fs::create_dir_all(&target).map_err(|error| format!("{name}: {error}"))?;
+    Ok(())
+}
 
-            continue;
+fn extract_seven_zip(source: &Path, root: &Path) -> Result<(), String> {
+    use sevenz_rust2::{ArchiveReader, Error, Password};
+
+    let describe = |error: Error| match error {
+        Error::PasswordRequired | Error::MaybeBadPassword(_) => {
+            format!("{} is password-protected", source.display())
         }
 
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|error| format!("{name}: {error}"))?;
-        }
+        error => format!("{}: {error}", source.display()),
+    };
 
-        let mut output_file =
-            File::create(&target).map_err(|error| format!("{name}: {error}"))?;
+    let mut archive = ArchiveReader::open(source, Password::empty()).map_err(describe)?;
 
-        std::io::copy(&mut entry, &mut output_file).map_err(|error| format!("{name}: {error}"))?;
+    let mut failure = None;
 
-        if let Some(time) = entry.last_modified().and_then(zip_to_system_time) {
-            let _ = output_file.set_modified(time);
-        }
+    archive
+        .for_each_entries(|entry, content| {
+            // Удаления из обновляемых архивов (anti-items) распаковывать нечего.
+            if entry.is_anti_item() {
+                return Ok(true);
+            }
+
+            let modified = entry
+                .has_last_modified_date
+                .then(|| SystemTime::from(entry.last_modified_date()));
+
+            match write_entry(root, entry.name(), entry.is_directory(), content, modified) {
+                Ok(()) => Ok(true),
+
+                Err(error) => {
+                    failure = Some(error);
+
+                    Ok(false)
+                }
+            }
+        })
+        .map_err(describe)?;
+
+    match failure {
+        Some(error) => Err(error),
+
+        None => Ok(()),
+    }
+}
+
+// Распаковывает рядом с архивом (ZIP или 7z). Если в архиве один файл или
+// одна папка — она кладётся прямо рядом, иначе всё содержимое — в папку
+// с именем архива.
+pub fn extract(source: &Path) -> Result<PathBuf, String> {
+    let folder = output::parent_of(source)?;
+
+    let temp = output::temp_dir(folder)?;
+
+    if file_types::is_seven_zip(source) {
+        extract_seven_zip(source, temp.path())?;
+    } else {
+        extract_zip(source, temp.path())?;
     }
 
     let top_level: Vec<PathBuf> = fs::read_dir(temp.path())

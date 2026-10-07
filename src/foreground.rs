@@ -1,6 +1,5 @@
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use std::ptr::null_mut;
 
 use windows_sys::Win32::{
     Foundation::CloseHandle,
@@ -11,8 +10,6 @@ use windows_sys::Win32::{
 };
 
 pub struct ForegroundProcess {
-    pub pid: u32,
-    pub exe_path: String,
     pub exe_name: String,
 }
 
@@ -60,11 +57,7 @@ pub fn get_foreground_process() -> Option<ForegroundProcess> {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        Some(ForegroundProcess {
-            pid,
-            exe_path,
-            exe_name,
-        })
+        Some(ForegroundProcess { exe_name })
     }
 }
 

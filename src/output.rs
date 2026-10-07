@@ -13,7 +13,9 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+use windows_sys::Win32::Storage::FileSystem::{
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -105,9 +107,7 @@ fn temp_path(folder: &Path) -> PathBuf {
     folder.join(format!(".filehalo-{pid}-{id}.tmp"))
 }
 
-// Переименование, которое не затирает существующий файл или папку:
-// если за время работы кто-то создал файл с таким именем, вернётся ошибка.
-fn rename_no_replace(from: &Path, to: &Path) -> Result<(), String> {
+fn move_file(from: &Path, to: &Path, replace: bool) -> Result<(), String> {
     let wide = |path: &Path| -> Vec<u16> {
         path.as_os_str()
             .encode_wide()
@@ -118,7 +118,13 @@ fn rename_no_replace(from: &Path, to: &Path) -> Result<(), String> {
     let from_wide = wide(from);
     let to_wide = wide(to);
 
-    let ok = unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    let mut flags = MOVEFILE_WRITE_THROUGH;
+
+    if replace {
+        flags |= MOVEFILE_REPLACE_EXISTING;
+    }
+
+    let ok = unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), flags) };
 
     if ok == 0 {
         return Err(format!(
@@ -131,9 +137,33 @@ fn rename_no_replace(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// Переименование, которое не затирает существующий файл или папку:
+// если за время работы кто-то создал файл с таким именем, вернётся ошибка.
+fn rename_no_replace(from: &Path, to: &Path) -> Result<(), String> {
+    move_file(from, to, false)
+}
+
 // Пишет файл output через временный файл в той же папке.
 pub fn write_file(
     output: &Path,
+    write: impl FnOnce(&mut BufWriter<File>) -> Result<(), String>,
+) -> Result<PathBuf, String> {
+    write_through_temp(output, false, write)
+}
+
+// Заменяет существующий файл новым содержимым. Исходник подменяется только
+// когда новый файл полностью записан: при сбое останется старая версия.
+pub fn replace_file(target: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    write_through_temp(target, true, |writer| {
+        writer
+            .write_all(bytes)
+            .map_err(|error| format!("Could not write output: {error}"))
+    })
+}
+
+fn write_through_temp(
+    output: &Path,
+    replace: bool,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<(), String>,
 ) -> Result<PathBuf, String> {
     let folder = parent_of(output)?;
@@ -174,7 +204,7 @@ pub fn write_file(
             .map_err(|error| format!("Could not write output: {error}"))?;
     }
 
-    rename_no_replace(guard.path(), output)?;
+    move_file(guard.path(), output, replace)?;
 
     guard.commit();
 

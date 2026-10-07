@@ -27,7 +27,7 @@ pub fn strip(source: &Path) -> Result<PathBuf, ActionError> {
 
         Some(ImageKind::WebP) => strip_webp(&bytes, orientation)?,
 
-        None => return Err(ActionError::Failed("Not an image".to_string())),
+        _ => return Err(ActionError::Failed("Unsupported format".to_string())),
     };
 
     if cleaned == bytes {
@@ -271,4 +271,213 @@ fn strip_webp(bytes: &[u8], orientation: u8) -> Result<Vec<u8>, String> {
     }
 
     Ok(riff_from_body(body))
+}
+
+// Ориентация после поворота на 90°. Индекс — текущее значение тега EXIF
+// (1..=8, см. спецификацию EXIF), значение — новое.
+fn next_orientation(current: u16, clockwise: bool) -> u16 {
+    const CLOCKWISE: [u16; 9] = [6, 6, 7, 8, 5, 2, 3, 4, 1];
+    const COUNTER_CLOCKWISE: [u16; 9] = [8, 8, 5, 6, 7, 4, 1, 2, 3];
+
+    let table = if clockwise { &CLOCKWISE } else { &COUNTER_CLOCKWISE };
+
+    // Мусорное значение считаем «без поворота» (индекс 0 ведёт себя как 1).
+    table[if (1..=8).contains(&current) { current as usize } else { 0 }]
+}
+
+// Смещение значения тега Orientation внутри TIFF-блока EXIF и порядок байтов.
+fn orientation_offset(tiff: &[u8]) -> Option<(usize, bool)> {
+    let little_endian = match tiff.get(0..2)? {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+
+    let read_u16 = |at: usize| -> Option<u16> {
+        let bytes = [*tiff.get(at)?, *tiff.get(at + 1)?];
+
+        Some(if little_endian {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        })
+    };
+
+    let read_u32 = |at: usize| -> Option<u32> {
+        let bytes: [u8; 4] = tiff.get(at..at + 4)?.try_into().ok()?;
+
+        Some(if little_endian {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        })
+    };
+
+    let first_ifd = read_u32(4)? as usize;
+
+    let count = read_u16(first_ifd)? as usize;
+
+    for index in 0..count {
+        let entry = first_ifd + 2 + index * 12;
+
+        if read_u16(entry)? == 0x0112 {
+            // SHORT, одно значение: хранится прямо в записи.
+            return (read_u16(entry + 2)? == 3).then_some((entry + 8, little_endian));
+        }
+    }
+
+    None
+}
+
+// Поворачивает JPEG без пересжатия: меняет тег ориентации EXIF или добавляет
+// минимальный EXIF. None — EXIF есть, но без тега ориентации: тогда нужен
+// обычный поворот с пересохранением.
+pub fn rotate_jpeg_orientation(bytes: &[u8], clockwise: bool) -> Option<Vec<u8>> {
+    const APP0: u8 = 0xE0;
+    const APP1: u8 = 0xE1;
+
+    if !bytes.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+
+    let mut position = 2;
+
+    // Куда вставить EXIF, если его нет: после SOI и APP0 (JFIF).
+    let mut insert_at = 2;
+
+    loop {
+        if bytes.get(position) != Some(&0xFF) {
+            return None;
+        }
+
+        while bytes.get(position) == Some(&0xFF) {
+            position += 1;
+        }
+
+        let marker = *bytes.get(position)?;
+
+        position += 1;
+
+        if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            continue;
+        }
+
+        // Начались данные изображения, EXIF не нашёлся.
+        if marker == 0xDA || marker == 0xD9 {
+            break;
+        }
+
+        let length = u16::from_be_bytes([*bytes.get(position)?, *bytes.get(position + 1)?]) as usize;
+
+        if length < 2 {
+            return None;
+        }
+
+        let payload = position + 2;
+        let end = position + length;
+
+        if end > bytes.len() {
+            return None;
+        }
+
+        if marker == APP0 && insert_at == position - 2 {
+            insert_at = end;
+        }
+
+        if marker == APP1 && bytes[payload..end].starts_with(b"Exif\0\0") {
+            let tiff_start = payload + 6;
+
+            let (offset, little_endian) = orientation_offset(&bytes[tiff_start..end])?;
+
+            let at = tiff_start + offset;
+
+            let current = if little_endian {
+                u16::from_le_bytes([bytes[at], bytes[at + 1]])
+            } else {
+                u16::from_be_bytes([bytes[at], bytes[at + 1]])
+            };
+
+            let next = next_orientation(current, clockwise);
+
+            let next_bytes = if little_endian {
+                next.to_le_bytes()
+            } else {
+                next.to_be_bytes()
+            };
+
+            let mut result = bytes.to_vec();
+
+            result[at..at + 2].copy_from_slice(&next_bytes);
+
+            return Some(result);
+        }
+
+        position = end;
+    }
+
+    let mut payload = b"Exif\0\0".to_vec();
+
+    payload.extend_from_slice(&orientation_exif(next_orientation(1, clockwise) as u8));
+
+    let mut result = Vec::with_capacity(bytes.len() + payload.len() + 4);
+
+    result.extend_from_slice(&bytes[..insert_at]);
+    result.extend_from_slice(&[0xFF, APP1]);
+    result.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+    result.extend_from_slice(&payload);
+    result.extend_from_slice(&bytes[insert_at..]);
+
+    Some(result)
+}
+
+// Переносит текстовые чанки PNG (tEXt, zTXt, iTXt) из original в encoded,
+// перед IEND. Если что-то не разобралось — возвращает encoded как есть.
+pub fn copy_png_text(original: &[u8], encoded: Vec<u8>) -> Vec<u8> {
+    const SIGNATURE_LENGTH: usize = 8;
+
+    let chunks = |bytes: &[u8]| -> Option<Vec<(usize, usize, [u8; 4])>> {
+        let mut found = Vec::new();
+
+        let mut position = SIGNATURE_LENGTH;
+
+        while position + 12 <= bytes.len() {
+            let length = u32::from_be_bytes(bytes[position..position + 4].try_into().ok()?) as usize;
+
+            let end = position.checked_add(12 + length).filter(|&end| end <= bytes.len())?;
+
+            let chunk_type: [u8; 4] = bytes[position + 4..position + 8].try_into().ok()?;
+
+            found.push((position, end, chunk_type));
+
+            position = end;
+        }
+
+        Some(found)
+    };
+
+    let (Some(original_chunks), Some(encoded_chunks)) = (chunks(original), chunks(&encoded)) else {
+        return encoded;
+    };
+
+    let text: Vec<u8> = original_chunks
+        .iter()
+        .filter(|(_, _, kind)| matches!(kind, b"tEXt" | b"zTXt" | b"iTXt"))
+        .flat_map(|&(start, end, _)| original[start..end].to_vec())
+        .collect();
+
+    let Some(&(iend, _, _)) = encoded_chunks.iter().find(|(_, _, kind)| kind == b"IEND") else {
+        return encoded;
+    };
+
+    if text.is_empty() {
+        return encoded;
+    }
+
+    let mut result = Vec::with_capacity(encoded.len() + text.len());
+
+    result.extend_from_slice(&encoded[..iend]);
+    result.extend_from_slice(&text);
+    result.extend_from_slice(&encoded[iend..]);
+
+    result
 }

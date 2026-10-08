@@ -52,17 +52,17 @@ const PADDING: f32 = 40.0;
 
 const CONTENT_Y: f32 = 150.0;
 const FOOTER_Y: f32 = 400.0;
-const BUTTON_Y: f32 = 414.0;
-const BUTTON_HEIGHT: f32 = 38.0;
+const BUTTON_Y: f32 = 412.0;
+const BUTTON_HEIGHT: f32 = 42.0;
 const PRIMARY_WIDTH: f32 = 150.0;
 const SECONDARY_WIDTH: f32 = 120.0;
 
-const FIELD_Y: f32 = CONTENT_Y + 30.0;
-const FIELD_HEIGHT: f32 = 38.0;
+const FIELD_Y: f32 = CONTENT_Y + 32.0;
+const FIELD_HEIGHT: f32 = 42.0;
 const BROWSE_WIDTH: f32 = 120.0;
 
 const CHECK_SIZE: f32 = 20.0;
-const CHECK_ROW: f32 = 38.0;
+const CHECK_ROW: f32 = 42.0;
 
 const TIMER_ID: usize = 1;
 
@@ -383,12 +383,12 @@ impl State {
 
         let (title, subtitle) = self.title();
 
-        draw_left(pixmap, &fonts.semibold, s(25.0), &title, s(PADDING + 84.0), s(60.0), TEXT);
+        draw_left(pixmap, &fonts.semibold, s(27.0), &title, s(PADDING + 84.0), s(60.0), TEXT);
 
-        draw_left(pixmap, &fonts.regular, s(14.5), &subtitle, s(PADDING + 84.0), s(90.0), TEXT_MUTED);
+        draw_left(pixmap, &fonts.regular, s(16.5), &subtitle, s(PADDING + 84.0), s(90.0), TEXT_MUTED);
 
         match &self.page {
-            Page::Welcome => self.paint_welcome(pixmap, scale, fonts),
+            Page::Welcome => {}
             Page::Options => self.paint_options(pixmap, scale, fonts),
             Page::Working => self.paint_progress(pixmap, scale, fonts),
             Page::Done => self.paint_done(pixmap, scale, fonts),
@@ -422,7 +422,7 @@ impl State {
             render::fill(pixmap, &path, mix(CARD, CARD_HOVER, self.hover_of(Target::Secondary)));
             render::stroke(pixmap, &path, BORDER, scale);
 
-            text::draw_centered(pixmap, &fonts.semibold, s(15.0), label, s(area.x + area.width / 2.0), s(area.y + area.height / 2.0), TEXT);
+            text::draw_centered(pixmap, &fonts.semibold, s(16.5), label, s(area.x + area.width / 2.0), s(area.y + area.height / 2.0), TEXT);
         }
 
         if let Some(label) = primary {
@@ -434,7 +434,7 @@ impl State {
 
             render::fill(pixmap, &path, mix(base, lit, self.hover_of(Target::Primary)));
 
-            text::draw_centered(pixmap, &fonts.semibold, s(15.0), label, s(area.x + area.width / 2.0), s(area.y + area.height / 2.0), TEXT);
+            text::draw_centered(pixmap, &fonts.semibold, s(16.5), label, s(area.x + area.width / 2.0), s(area.y + area.height / 2.0), TEXT);
         }
     }
 
@@ -444,38 +444,15 @@ impl State {
         let mut y = CONTENT_Y + 10.0;
 
         for paragraph in paragraphs {
-            let (lines, size) = text::fit_lines(&fonts.regular, paragraph, s(WIDTH - PADDING * 2.0), 3, s(15.0));
+            let (lines, size) = text::fit_lines(&fonts.regular, paragraph, s(WIDTH - PADDING * 2.0), 3, s(16.5));
 
             for line in lines {
                 draw_left(pixmap, &fonts.regular, size, &line, s(PADDING), s(y), TEXT);
 
-                y += 22.0;
+                y += 25.0;
             }
 
             y += 12.0;
-        }
-    }
-
-    fn paint_welcome(&self, pixmap: &mut Pixmap, scale: f32, fonts: &text::Fonts) {
-        let s = |value: f32| value * scale;
-
-        let points = [
-            "Колесо действий с файлами: конвертация картинок, PDF, архивы, видео и звук",
-            "Зажмите Ctrl + Alt + Пробел над выделенными файлами — и выберите действие",
-            "Работает в Проводнике и в окнах «Открыть» и «Сохранить» любых программ",
-            "Всё делается на компьютере — файлы никуда не отправляются",
-        ];
-
-        for (index, point) in points.iter().enumerate() {
-            let y = CONTENT_Y + 6.0 + index as f32 * 52.0;
-
-            render::fill(pixmap, &render::circle(s(PADDING + 6.0), s(y + 11.0), s(4.0)), ACCENT);
-
-            let (lines, size) = text::fit_lines(&fonts.regular, point, s(WIDTH - PADDING * 2.0 - 26.0), 2, s(15.0));
-
-            for (line_index, line) in lines.iter().enumerate() {
-                draw_left(pixmap, &fonts.regular, size, line, s(PADDING + 24.0), s(y + 11.0) + line_index as f32 * size * 1.3, TEXT);
-            }
         }
     }
 
@@ -505,19 +482,19 @@ impl State {
 
         let text_x = area.x + CHECK_SIZE + 12.0;
 
-        draw_left(pixmap, &fonts.regular, s(15.0), label, s(text_x), s(area.y + area.height / 2.0), TEXT);
+        draw_left(pixmap, &fonts.regular, s(16.5), label, s(text_x), s(area.y + area.height / 2.0), TEXT);
 
         if !hint.is_empty() {
-            let width = text::measure(&fonts.regular, s(15.0), label) / scale;
+            let width = text::measure(&fonts.regular, s(16.5), label) / scale;
 
-            draw_left(pixmap, &fonts.regular, s(13.5), hint, s(text_x + width + 10.0), s(area.y + area.height / 2.0), TEXT_FAINT);
+            draw_left(pixmap, &fonts.regular, s(15.0), hint, s(text_x + width + 10.0), s(area.y + area.height / 2.0), TEXT_FAINT);
         }
     }
 
     fn paint_options(&self, pixmap: &mut Pixmap, scale: f32, fonts: &text::Fonts) {
         let s = |value: f32| value * scale;
 
-        draw_left(pixmap, &fonts.semibold, s(14.5), "Папка установки", s(PADDING), s(CONTENT_Y + 12.0), TEXT_MUTED);
+        draw_left(pixmap, &fonts.semibold, s(16.0), "Папка установки", s(PADDING), s(CONTENT_Y + 12.0), TEXT_MUTED);
 
         let field = field_area();
 
@@ -526,9 +503,9 @@ impl State {
         render::fill(pixmap, &path, CARD);
         render::stroke(pixmap, &path, BORDER, scale);
 
-        let shown = ellipsize_start(&fonts.regular, s(14.5), &self.folder.display().to_string(), s(field.width - 28.0));
+        let shown = ellipsize_start(&fonts.regular, s(16.0), &self.folder.display().to_string(), s(field.width - 28.0));
 
-        draw_left(pixmap, &fonts.regular, s(14.5), &shown, s(field.x + 14.0), s(field.y + field.height / 2.0), TEXT);
+        draw_left(pixmap, &fonts.regular, s(16.0), &shown, s(field.x + 14.0), s(field.y + field.height / 2.0), TEXT);
 
         let browse = browse_area();
 
@@ -537,21 +514,11 @@ impl State {
         render::fill(pixmap, &path, mix(CARD, CARD_HOVER, self.hover_of(Target::Browse)));
         render::stroke(pixmap, &path, BORDER, scale);
 
-        text::draw_centered(pixmap, &fonts.semibold, s(14.5), "Изменить…", s(browse.x + browse.width / 2.0), s(browse.y + browse.height / 2.0), TEXT);
+        text::draw_centered(pixmap, &fonts.semibold, s(16.0), "Изменить…", s(browse.x + browse.width / 2.0), s(browse.y + browse.height / 2.0), TEXT);
 
         self.paint_check(pixmap, scale, fonts, check_area(0, OPTIONS_CHECKS_Y), self.autostart, "Запускать вместе с Windows", "рекомендуем", Target::Autostart);
 
         self.paint_check(pixmap, scale, fonts, check_area(1, OPTIONS_CHECKS_Y), self.desktop, "Ярлык на рабочем столе", "", Target::Desktop);
-
-        draw_left(
-            pixmap,
-            &fonts.regular,
-            s(13.5),
-            "Ярлык в меню «Пуск» появится в любом случае",
-            s(PADDING),
-            s(OPTIONS_CHECKS_Y + CHECK_ROW * 2.0 + 14.0),
-            TEXT_FAINT,
-        );
     }
 
     fn paint_progress(&self, pixmap: &mut Pixmap, scale: f32, fonts: &text::Fonts) {
@@ -559,7 +526,7 @@ impl State {
 
         let label = if self.uninstall { "Удаляем файлы и ярлыки…" } else { "Копируем файлы, создаём ярлыки…" };
 
-        draw_left(pixmap, &fonts.regular, s(15.0), label, s(PADDING), s(CONTENT_Y + 40.0), TEXT_MUTED);
+        draw_left(pixmap, &fonts.regular, s(16.5), label, s(PADDING), s(CONTENT_Y + 40.0), TEXT_MUTED);
 
         let width = WIDTH - PADDING * 2.0;
 
@@ -576,14 +543,14 @@ impl State {
         let s = |value: f32| value * scale;
 
         let lines = [
-            "Выделите файлы и зажмите Ctrl + Alt + Пробел — появится колесо.",
+            "Как пользоваться — покажем сразу после запуска.",
             "Значок uskko — в трее возле часов: там настройки и подсказка.",
         ];
 
         for (index, line) in lines.iter().enumerate() {
-            render::fill(pixmap, &render::circle(s(PADDING + 6.0), s(CONTENT_Y + 18.0 + index as f32 * 34.0), s(4.0)), SUCCESS);
+            render::fill(pixmap, &render::circle(s(PADDING + 6.0), s(CONTENT_Y + 18.0 + index as f32 * 38.0), s(4.0)), SUCCESS);
 
-            draw_left(pixmap, &fonts.regular, s(15.0), line, s(PADDING + 24.0), s(CONTENT_Y + 18.0 + index as f32 * 34.0), TEXT);
+            draw_left(pixmap, &fonts.regular, s(16.5), line, s(PADDING + 24.0), s(CONTENT_Y + 18.0 + index as f32 * 38.0), TEXT);
         }
 
         self.paint_check(pixmap, scale, fonts, check_area(0, DONE_CHECK_Y), self.launch, "Запустить uskko", "", Target::Launch);
@@ -592,7 +559,7 @@ impl State {
     fn paint_failed(&self, pixmap: &mut Pixmap, scale: f32, fonts: &text::Fonts, error: &str) {
         let s = |value: f32| value * scale;
 
-        let (lines, size) = text::fit_lines(&fonts.regular, error, s(WIDTH - PADDING * 2.0), 4, s(15.0));
+        let (lines, size) = text::fit_lines(&fonts.regular, error, s(WIDTH - PADDING * 2.0), 4, s(16.5));
 
         for (index, line) in lines.iter().enumerate() {
             draw_left(pixmap, &fonts.regular, size, line, s(PADDING), s(CONTENT_Y + 16.0) + index as f32 * size * 1.35, DANGER);
@@ -605,7 +572,7 @@ impl State {
         draw_left(
             pixmap,
             &fonts.regular,
-            s(15.0),
+            s(16.5),
             "Программа, её ярлыки и автозапуск будут удалены с этого компьютера.",
             s(PADDING),
             s(CONTENT_Y + 16.0),

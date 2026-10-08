@@ -518,6 +518,10 @@ fn main() {
                         && !outcome.outputs.is_empty()
                     {
                         selection::deliver_to_dialog(dialog, outcome.outputs.clone());
+                    } else if let Source::Window(window) = source
+                        && !outcome.outputs.is_empty()
+                    {
+                        selection::deliver_to_window(window, outcome.outputs.clone());
                     } else if !outcome.outputs.is_empty() {
                         if explorer_selection::select_files(&outcome.outputs, outcome.rename) {
                             pending_select = None;
@@ -707,6 +711,17 @@ fn main() {
                 }
 
                 continue;
+            }
+
+            // Отпущенный после сочетания Alt не должен открыть меню активного окна.
+            if message.message == WM_HOTKEY {
+                let hotkeys = config::hotkeys();
+
+                hotkeys::suppress_menu(if message.wParam == Slot::Settings.id() as usize {
+                    hotkeys.settings
+                } else {
+                    hotkeys.wheel
+                });
             }
 
             if message.message == WM_HOTKEY && message.wParam == Slot::Settings.id() as usize {

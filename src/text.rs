@@ -16,6 +16,25 @@ pub struct Fonts {
 
 static FONTS: OnceLock<Option<Fonts>> = OnceLock::new();
 
+// Запасной шрифт для знаков, которых нет в Segoe UI (✓ и т. п.).
+static SYMBOLS: OnceLock<Option<FontVec>> = OnceLock::new();
+
+fn symbols() -> Option<&'static FontVec> {
+    SYMBOLS.get_or_init(|| load(&["seguisym.ttf"])).as_ref()
+}
+
+// Шрифт, в котором есть знак: основной, а если в нём нет — запасной.
+fn font_for(font: &FontVec, character: char) -> &FontVec {
+    if font.glyph_id(character).0 != 0 || character.is_whitespace() {
+        return font;
+    }
+
+    match symbols() {
+        Some(fallback) if fallback.glyph_id(character).0 != 0 => fallback,
+        _ => font,
+    }
+}
+
 fn load(names: &[&str]) -> Option<FontVec> {
     let folder = std::env::var_os("WINDIR")
         .map(std::path::PathBuf::from)
@@ -44,22 +63,27 @@ pub fn fonts() -> Option<&'static Fonts> {
 }
 
 pub fn measure(font: &FontVec, size: f32, text: &str) -> f32 {
-    let scaled = font.as_scaled(PxScale::from(size));
-
     let mut width = 0.0;
 
     let mut previous = None;
 
     for character in text.chars() {
+        let used = font_for(font, character);
+
+        let scaled = used.as_scaled(PxScale::from(size));
+
         let glyph = scaled.glyph_id(character);
 
-        if let Some(previous) = previous {
+        // Кернинг — только между знаками одного шрифта.
+        if let Some(previous) = previous
+            && std::ptr::eq(used, font)
+        {
             width += scaled.kern(previous, glyph);
         }
 
         width += scaled.h_advance(glyph);
 
-        previous = Some(glyph);
+        previous = std::ptr::eq(used, font).then_some(glyph);
     }
 
     width
@@ -85,8 +109,6 @@ thread_local! {
 }
 
 fn rasterize(font: &FontVec, size: f32, text: &str) -> Raster {
-    let scaled = font.as_scaled(PxScale::from(size));
-
     let mut outlines = Vec::new();
 
     let mut caret = 0.0;
@@ -94,9 +116,15 @@ fn rasterize(font: &FontVec, size: f32, text: &str) -> Raster {
     let mut previous = None;
 
     for character in text.chars() {
+        let used = font_for(font, character);
+
+        let scaled = used.as_scaled(PxScale::from(size));
+
         let glyph_id = scaled.glyph_id(character);
 
-        if let Some(previous) = previous {
+        if let Some(previous) = previous
+            && std::ptr::eq(used, font)
+        {
             caret += scaled.kern(previous, glyph_id);
         }
 
@@ -104,9 +132,9 @@ fn rasterize(font: &FontVec, size: f32, text: &str) -> Raster {
 
         caret += scaled.h_advance(glyph_id);
 
-        previous = Some(glyph_id);
+        previous = std::ptr::eq(used, font).then_some(glyph_id);
 
-        if let Some(outline) = font.outline_glyph(glyph) {
+        if let Some(outline) = used.outline_glyph(glyph) {
             outlines.push(outline);
         }
     }
@@ -326,5 +354,24 @@ pub fn fit_lines(
         }
 
         size -= 0.5;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Знаки, которых нет в Segoe UI, берутся из запасного шрифта и видны.
+    #[test]
+    fn check_mark_is_drawn() {
+        let fonts = super::fonts().expect("шрифты Windows");
+
+        assert!(super::measure(&fonts.regular, 16.0, "✓") > 4.0);
+
+        let raster = super::rasterize(&fonts.regular, 16.0, "✓ Сохранено");
+
+        assert!(raster.coverage.iter().filter(|&&value| value > 128).count() > 20);
+
+        let check_only = super::rasterize(&fonts.regular, 16.0, "✓");
+
+        assert!(check_only.width > 3, "галочка не нарисована");
     }
 }

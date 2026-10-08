@@ -1,7 +1,9 @@
 // Горячие клавиши: колесо и настройки.
 //
 // Сочетание — модификаторы (Ctrl, Alt, Shift) и одна обычная клавиша.
-// Обязателен Ctrl или Alt: иначе сочетание мешало бы печатать текст.
+// Нужен Ctrl или Alt: иначе буква, цифра или Пробел перестали бы печататься
+// во всех программах. Без них можно только клавиши, которыми не печатают:
+// F1–F24, Pause, Scroll Lock, Insert.
 // Win не используется: почти все сочетания с ним заняты самой Windows.
 
 use serde::{Deserialize, Serialize};
@@ -14,8 +16,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 const VK_SHIFT: u32 = 0x10;
 const VK_CONTROL: u32 = 0x11;
 const VK_MENU: u32 = 0x12;
-const VK_SPACE: u32 = 0x20;
 const VK_F12: u32 = 0x7B;
+const VK_Q: u32 = 0x51;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hotkey {
@@ -35,14 +37,14 @@ pub struct Hotkeys {
 impl Default for Hotkeys {
     fn default() -> Self {
         Self {
+            // Две клавиши под левой рукой. Только Alt, без Ctrl: на раскладках
+            // с AltGr (польская и др.) Ctrl+Alt+буква печатает символ.
             wheel: Hotkey {
-                modifiers: MOD_CONTROL | MOD_ALT,
-                key: VK_SPACE,
+                modifiers: MOD_ALT,
+                key: VK_Q,
             },
-            // Не буква: на раскладках с AltGr (польская и др.) Ctrl+Alt+буква
-            // печатает символ, и глобальная клавиша мешала бы набору текста.
             settings: Hotkey {
-                modifiers: MOD_CONTROL | MOD_ALT,
+                modifiers: MOD_ALT,
                 key: VK_F12,
             },
         }
@@ -111,6 +113,36 @@ impl Hotkeys {
     }
 }
 
+// Клавиши, которыми не печатают: их можно занять и без Ctrl или Alt.
+fn is_standalone(key: u32) -> bool {
+    // F1–F24, Pause, Scroll Lock, Insert.
+    matches!(key, 0x70..=0x87 | 0x13 | 0x91 | 0x2D)
+}
+
+// После сочетания с Alt (без Ctrl) отпущенный Alt открыл бы меню в активном
+// окне: Windows видит «Alt нажат и отпущен», ведь вторую клавишу забрало
+// сочетание. Неназначенная клавиша 0xE8 между ними это отменяет.
+pub fn suppress_menu(hotkey: Hotkey) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput};
+
+    if hotkey.modifiers & MOD_ALT == 0 || hotkey.modifiers & MOD_CONTROL != 0 {
+        return;
+    }
+
+    let key = |flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: 0xE8, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+        },
+    };
+
+    let inputs = [key(0), key(KEYEVENTF_KEYUP)];
+
+    unsafe {
+        SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32);
+    }
+}
+
 pub fn is_modifier(key: u32) -> bool {
     // Shift, Ctrl, Alt (общие, левые и правые) и Win.
     matches!(key, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C)
@@ -120,11 +152,11 @@ impl Hotkey {
     // Чем сочетание не годится; None — годится.
     pub fn problem(&self) -> Option<&'static str> {
         if is_modifier(self.key) || self.key == 0 || self.key > 0xFE {
-            return Some("Нужна обычная клавиша вместе с Ctrl или Alt");
+            return Some("Нужна обычная клавиша, не только Ctrl, Alt или Shift");
         }
 
-        if self.modifiers & (MOD_CONTROL | MOD_ALT) == 0 {
-            return Some("Добавьте Ctrl или Alt, иначе клавиша будет мешать печатать");
+        if self.modifiers & (MOD_CONTROL | MOD_ALT) == 0 && !is_standalone(self.key) {
+            return Some("Добавьте Ctrl или Alt — без них подойдут только F1–F24, Pause, Scroll Lock, Insert");
         }
 
         None
@@ -250,8 +282,8 @@ mod tests {
 
         assert!(!hotkeys.sanitize());
 
-        assert_eq!(hotkeys.wheel.label(), "Ctrl + Alt + Пробел");
-        assert_eq!(hotkeys.settings.label(), "Ctrl + Alt + F12");
+        assert_eq!(hotkeys.wheel.label(), "Alt + Q");
+        assert_eq!(hotkeys.settings.label(), "Alt + F12");
     }
 
     #[test]
@@ -277,6 +309,19 @@ mod tests {
         let only_modifiers = Hotkey { modifiers: MOD_CONTROL, key: VK_MENU };
 
         assert!(only_modifiers.problem().is_some());
+
+        let letter_alone = Hotkey { modifiers: 0, key: 0x41 };
+
+        assert!(letter_alone.problem().is_some());
+
+        let space_alone = Hotkey { modifiers: 0, key: 0x20 };
+
+        assert!(space_alone.problem().is_some());
+
+        // Клавиши, которыми не печатают, годятся и сами по себе.
+        for key in [0x71, 0x87, 0x13, 0x91, 0x2D] {
+            assert!(Hotkey { modifiers: 0, key }.problem().is_none(), "{key:#x}");
+        }
 
         let mut same = Hotkeys::default();
 

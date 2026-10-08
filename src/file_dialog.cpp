@@ -419,7 +419,9 @@ int filehalo_is_file_dialog(HWND window) {
 // нескольким файлам (скрыты расширения), какой выделен — не понять.
 extern "C"
 int filehalo_dialog_selection(HWND dialog, PathCallback callback, void* context) {
-    if (callback == nullptr || !filehalo_is_file_dialog(dialog)) {
+    // Годится любое окно со списком файлов: диалог или окно Проводника,
+    // которого нет в списке окон Проводника (IShellWindows).
+    if (callback == nullptr || dialog == nullptr || find_descendant(dialog, L"SHELLDLL_DefView") == nullptr) {
         return 0;
     }
 
@@ -537,7 +539,7 @@ int filehalo_dialog_is_open(HWND dialog) {
 // 0 — файлов ещё нет в списке (диалог не обновился); -1 — диалога больше нет.
 extern "C"
 int filehalo_dialog_show_files(HWND dialog, const wchar_t* paths, int select) {
-    if (!IsWindow(dialog) || !filehalo_is_file_dialog(dialog)) {
+    if (!IsWindow(dialog) || find_descendant(dialog, L"SHELLDLL_DefView") == nullptr) {
         return -1;
     }
 

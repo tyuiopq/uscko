@@ -30,22 +30,22 @@ use crate::wheel::{self, SlotView, WheelPicture};
 use crate::{app, config, dpi, text};
 
 const WIDTH: f32 = 820.0;
-const HEIGHT: f32 = 540.0;
+const HEIGHT: f32 = 560.0;
 const PADDING: f32 = 36.0;
 
-const WHEEL_CENTER: (f32, f32) = (PADDING + 165.0, 285.0);
+const WHEEL_CENTER: (f32, f32) = (PADDING + 165.0, 295.0);
 const WHEEL_RADIUS: f32 = 150.0;
 
 const STEPS_X: f32 = 400.0;
-const STEP_Y: f32 = 120.0;
-const STEP_HEIGHT: f32 = 96.0;
+const STEP_Y: f32 = 124.0;
+const STEP_HEIGHT: f32 = 104.0;
 const STEP_GAP: f32 = 12.0;
 
-const FOOTER_Y: f32 = 470.0;
-const BUTTON_Y: f32 = 482.0;
-const BUTTON_HEIGHT: f32 = 38.0;
+const FOOTER_Y: f32 = 486.0;
+const BUTTON_Y: f32 = 498.0;
+const BUTTON_HEIGHT: f32 = 42.0;
 const START_WIDTH: f32 = 150.0;
-const SETTINGS_WIDTH: f32 = 200.0;
+const SETTINGS_WIDTH: f32 = 220.0;
 
 const TIMER_ID: usize = 1;
 const FRAME_MS: u32 = 16;
@@ -179,15 +179,15 @@ impl State {
 
         let hotkeys = config::hotkeys();
 
-        draw_left(pixmap, &fonts.semibold, s(26.0), &format!("Добро пожаловать в {}", app::NAME), s(PADDING), s(46.0), TEXT);
+        draw_left(pixmap, &fonts.semibold, s(29.0), &format!("Как пользоваться {}", app::NAME), s(PADDING), s(48.0), TEXT);
 
         draw_left(
             pixmap,
             &fonts.regular,
-            s(15.0),
+            s(17.0),
             "Действия с файлами — в одно движение, без лишних окон",
             s(PADDING),
-            s(78.0),
+            s(84.0),
             TEXT_MUTED,
         );
 
@@ -212,12 +212,12 @@ impl State {
 
         // Шаги.
         let steps = [
-            ("Выделите файлы", "В Проводнике, на рабочем столе или в окне «Открыть» любой программы".to_string()),
+            ("Выделите файлы", "В Проводнике или на рабочем столе".to_string()),
             (
                 "Зажмите сочетание",
                 format!("{} — появится колесо. Не отпуская, ведите мышь к действию", hotkeys.wheel.label()),
             ),
-            ("Отпустите клавиши", "Готово — результат рядом и уже выделен. Передумали — «Отменить»".to_string()),
+            ("Отпустите клавиши", "Готово — результат появится рядом и сразу будет выделен".to_string()),
         ];
 
         let step_width = WIDTH - PADDING - STEPS_X;
@@ -239,12 +239,12 @@ impl State {
 
             let text_x = STEPS_X + 66.0;
 
-            draw_left(pixmap, &fonts.semibold, s(16.5), title, s(text_x), s(y + 28.0), TEXT);
+            draw_left(pixmap, &fonts.semibold, s(19.0), title, s(text_x), s(y + 30.0), TEXT);
 
-            let (lines, size) = text::fit_lines(&fonts.regular, hint, s(step_width - 66.0 - 18.0), 2, s(14.0));
+            let (lines, size) = text::fit_lines(&fonts.regular, hint, s(step_width - 66.0 - 18.0), 2, s(16.0));
 
             for (line_index, line) in lines.iter().enumerate() {
-                draw_left(pixmap, &fonts.regular, size, line, s(text_x), s(y + 54.0) + line_index as f32 * size * 1.25, TEXT_MUTED);
+                draw_left(pixmap, &fonts.regular, size, line, s(text_x), s(y + 60.0) + line_index as f32 * size * 1.25, TEXT_MUTED);
             }
         }
 
@@ -254,7 +254,7 @@ impl State {
         draw_left(
             pixmap,
             &fonts.regular,
-            s(14.0),
+            s(16.0),
             &format!("Настройки — {} или значок {} в трее", hotkeys.settings.label(), app::NAME),
             s(PADDING),
             s(BUTTON_Y + BUTTON_HEIGHT / 2.0),
@@ -271,7 +271,7 @@ impl State {
         text::draw_centered(
             pixmap,
             &fonts.semibold,
-            s(15.0),
+            s(16.5),
             "Открыть настройки",
             s(settings.x + settings.width / 2.0),
             s(settings.y + settings.height / 2.0),
@@ -287,8 +287,8 @@ impl State {
         text::draw_centered(
             pixmap,
             &fonts.semibold,
-            s(15.0),
-            "Начать",
+            s(16.5),
+            "Понятно",
             s(start.x + start.width / 2.0),
             s(start.y + start.height / 2.0),
             TEXT,

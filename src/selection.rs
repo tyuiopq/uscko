@@ -45,6 +45,9 @@ pub enum Source {
     Explorer,
     // Окно «Открыть»/«Сохранить».
     Dialog(isize),
+    // Окно Проводника, которого нет в списке окон Проводника (так бывает,
+    // например, после его перезапуска): читаем и показываем, как в диалогах.
+    Window(isize),
 }
 
 pub enum Reading {
@@ -64,20 +67,7 @@ pub fn read(foreground_window: isize) -> Reading {
     let window = foreground_window as HWND;
 
     if unsafe { filehalo_is_file_dialog(window) } != 0 {
-        let mut paths: Vec<PathBuf> = Vec::new();
-
-        let count = unsafe {
-            filehalo_dialog_selection(window, collect_path, &mut paths as *mut Vec<PathBuf> as *mut c_void)
-        };
-
-        let source = Source::Dialog(foreground_window);
-
-        return match count {
-            -2 => Reading::Ambiguous,
-            ..0 => Reading::UnknownFolder,
-            0 => Reading::NothingSelected,
-            _ => Reading::Files(dedup(paths), source),
-        };
+        return read_view(foreground_window, Source::Dialog(foreground_window));
     }
 
     if !foreground::is_explorer_window(window) {
@@ -89,14 +79,35 @@ pub fn read(foreground_window: isize) -> Reading {
 
         Ok(paths) => Reading::Files(paths, Source::Explorer),
 
-        Err(code) => {
-            crate::journal::write(&format!(
-                "Проводник не отдал выделение: код {code}, окно класса «{}»",
-                window_class(window)
-            ));
+        // Окна нет в списке Проводника — читаем его, как окно «Открыть».
+        Err(code) => match read_view(foreground_window, Source::Window(foreground_window)) {
+            Reading::UnknownFolder => {
+                crate::journal::write(&format!(
+                    "Проводник не отдал выделение: код {code}, окно класса «{}»",
+                    window_class(window)
+                ));
 
-            Reading::ExplorerFailed
-        }
+                Reading::ExplorerFailed
+            }
+
+            reading => reading,
+        },
+    }
+}
+
+// Выделение в окне со списком файлов — по адресной строке и UI Automation.
+fn read_view(window: isize, source: Source) -> Reading {
+    let mut paths: Vec<PathBuf> = Vec::new();
+
+    let count = unsafe {
+        filehalo_dialog_selection(window as HWND, collect_path, &mut paths as *mut Vec<PathBuf> as *mut c_void)
+    };
+
+    match count {
+        -2 => Reading::Ambiguous,
+        ..0 => Reading::UnknownFolder,
+        0 => Reading::NothingSelected,
+        _ => Reading::Files(dedup(paths), source),
     }
 }
 
@@ -165,7 +176,19 @@ pub fn put_into_dialog(dialog: isize, outputs: &[PathBuf]) -> bool {
 // нашего, поэтому через полсекунды после выделения выделяем ещё раз. Не
 // дождались — в «Открыть» в поле «Имя файла» всё равно будет полный путь.
 // Всё в фоновом потоке: зависшая чужая программа не должна подвесить uskko.
+// Окно Проводника, которого нет в его списке: новые файлы выделяются и
+// прокручиваются в нём так же, как в окне «Открыть» (без поля «Имя файла»).
+pub fn deliver_to_window(window: isize, outputs: Vec<PathBuf>) -> std::thread::JoinHandle<()> {
+    deliver(window, outputs, Some(true))
+}
+
 pub fn deliver_to_dialog(dialog: isize, outputs: Vec<PathBuf>) -> std::thread::JoinHandle<()> {
+    deliver(dialog, outputs, None)
+}
+
+// select: Some — выделять или нет; None — как в диалоге (в «Открыть» да,
+// в «Сохранить» нет, и в «Открыть» ещё заполнить «Имя файла»).
+fn deliver(dialog: isize, outputs: Vec<PathBuf>, select: Option<bool>) -> std::thread::JoinHandle<()> {
     const ATTEMPTS: u32 = 60;
     const REFRESH_AT: u32 = 30;
     const SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -178,7 +201,9 @@ pub fn deliver_to_dialog(dialog: isize, outputs: Vec<PathBuf>) -> std::thread::J
 
         let window = dialog as HWND;
 
-        let open = unsafe { filehalo_dialog_is_open(window) } != 0;
+        let is_open_dialog = select.is_none() && unsafe { filehalo_dialog_is_open(window) } != 0;
+
+        let open = select.unwrap_or(is_open_dialog);
 
         let mut list: Vec<u16> = Vec::new();
 
@@ -225,7 +250,7 @@ pub fn deliver_to_dialog(dialog: isize, outputs: Vec<PathBuf>) -> std::thread::J
 
         // Выделенный файл окно само вписало в поле «Имя файла» (а запись в
         // поле сняла бы выделение). Не получилось выделить — пишем путь.
-        if open && !shown {
+        if is_open_dialog && !shown {
             put_into_dialog(dialog, &outputs);
         }
     })

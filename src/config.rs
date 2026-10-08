@@ -183,7 +183,7 @@ pub struct WheelConfig {
 
 // Версия формата конфига. Повышается, когда новым действиям нужно место
 // в уже сохранённых раскладках (см. migrate).
-const CONFIG_VERSION: u32 = 6;
+const CONFIG_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -391,6 +391,22 @@ fn migrate(config: &mut AppConfig) -> bool {
 
         if config.wheel.archive == old {
             config.wheel.archive = default_archive();
+        }
+    }
+
+    // Версия 7: сочетания по умолчанию короче — две клавиши вместо трёх.
+    // Свои сочетания пользователя не трогаем.
+    if config.version < 7 {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL};
+
+        let new = Hotkeys::default();
+
+        if config.hotkeys.wheel == (Hotkey { modifiers: MOD_CONTROL | MOD_ALT, key: 0x20 }) {
+            config.hotkeys.wheel = new.wheel;
+        }
+
+        if config.hotkeys.settings == (Hotkey { modifiers: MOD_CONTROL | MOD_ALT, key: 0x7B }) {
+            config.hotkeys.settings = new.settings;
         }
     }
 
@@ -773,4 +789,32 @@ pub fn save() -> Result<(), String> {
     *config = draft;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL};
+
+    use super::{AppConfig, Hotkey, Hotkeys, migrate};
+
+    #[test]
+    fn old_default_hotkeys_become_shorter() {
+        let mut config = AppConfig { version: 6, ..AppConfig::default() };
+
+        config.hotkeys.wheel = Hotkey { modifiers: MOD_CONTROL | MOD_ALT, key: 0x20 };
+        config.hotkeys.settings = Hotkey { modifiers: MOD_CONTROL | MOD_ALT, key: 0x7B };
+
+        assert!(migrate(&mut config));
+        assert_eq!(config.hotkeys, Hotkeys::default());
+
+        // Своё сочетание пользователя остаётся.
+        let own = Hotkey { modifiers: MOD_CONTROL | MOD_ALT, key: 0x57 };
+
+        let mut config = AppConfig { version: 6, ..AppConfig::default() };
+
+        config.hotkeys.wheel = own;
+
+        assert!(migrate(&mut config));
+        assert_eq!(config.hotkeys.wheel, own);
+    }
 }

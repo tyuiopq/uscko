@@ -12,7 +12,7 @@ use windows_sys::Win32::{
 };
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
-use crate::{file_types, output};
+use crate::{file_types, job_manager, output};
 
 // Эти форматы уже сжаты: повторное сжатие только тратит время.
 const STORED_EXTENSIONS: &[&str] = &[
@@ -109,6 +109,8 @@ fn add_to_zip<W: Write + std::io::Seek>(
     path: &Path,
     base: &Path,
 ) -> Result<(), String> {
+    job_manager::check_cancelled()?;
+
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("{}: {error}", path.display()))?;
 
@@ -332,6 +334,8 @@ fn extract_zip(source: &Path, root: &Path) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", source.display()))?;
 
     for index in 0..archive.len() {
+        job_manager::check_cancelled()?;
+
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("{}: {error}", source.display()))?;
@@ -369,6 +373,12 @@ fn extract_seven_zip(source: &Path, root: &Path) -> Result<(), String> {
 
     archive
         .for_each_entries(|entry, content| {
+            if job_manager::is_cancelled() {
+                failure = Some(job_manager::CANCELLED.to_string());
+
+                return Ok(false);
+            }
+
             // Удаления из обновляемых архивов (anti-items) распаковывать нечего.
             if entry.is_anti_item() {
                 return Ok(true);

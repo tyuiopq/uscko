@@ -234,7 +234,14 @@ int for_each_selected_path(IShellBrowser* browser, Visit visit) {
 
     IShellItemArray* items = nullptr;
 
-    hr = folder_view->GetSelection(FALSE, &items);
+    // В том порядке, в каком файлы показаны в папке (по имени, дате или как
+    // отсортировал пользователь): от него зависят страницы PDF и склейка.
+    // Порядок кликов при выделении Проводник не хранит.
+    hr = folder_view->Items(SVGIO_SELECTION | SVGIO_FLAG_VIEWORDER, IID_PPV_ARGS(&items));
+
+    if (FAILED(hr) || items == nullptr) {
+        hr = folder_view->GetSelection(FALSE, &items);
+    }
 
     release(folder_view);
 

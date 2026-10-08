@@ -19,7 +19,21 @@ serde_json = "1"
 sevenz-rust2 = { version = "0.23.0", default-features = false, features = ["bzip2", "ppmd", "deflate"] }
 sha2 = "0.11.0"
 tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
-windows = { version = "0.62.2", features = ["Data_Pdf", "Foundation", "Storage", "Storage_Streams", "Win32_System_Com"] }
+windows = { version = "0.62.2", features = [
+    "Data_Pdf",
+    "Foundation",
+    "Foundation_Collections",
+    "Graphics_Imaging",
+    "Media_Editing",
+    "Media_MediaProperties",
+    "Media_Transcoding",
+    "Storage",
+    "Storage_FileProperties",
+    "Storage_Streams",
+    "UI",
+    "Win32_System_Com",
+] }
+windows-future = "0.3.2"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64"] }
 
 [dependencies.windows-sys]
@@ -38,6 +52,7 @@ features = [
     "Win32_System_Time",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]
 

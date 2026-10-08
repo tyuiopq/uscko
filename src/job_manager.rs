@@ -1,7 +1,14 @@
+// Фоновое выполнение действий: очередь задач, прогресс и отмена.
+//
+// Задачи выполняются по одной в рабочем потоке. Новая задача, пока идёт
+// предыдущая, встаёт в очередь. Результат каждой задачи кладётся в список
+// результатов, а окну уходит WM_FILEHALO_JOB_DONE.
+
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{
-    Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Mutex,
+    atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
 };
 
 use windows_sys::Win32::{
@@ -13,25 +20,45 @@ use crate::actions::{ActionId, ActionOutcome};
 
 pub const WM_FILEHALO_JOB_DONE: u32 = WM_APP + 1;
 
-static RUNNING: AtomicBool = AtomicBool::new(false);
+// Текст ошибки, которым долгие операции сообщают об отмене.
+pub const CANCELLED: &str = "Отменено";
 
-static DONE_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-static TOTAL_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-static RESULT: OnceLock<Mutex<Option<JobResult>>> = OnceLock::new();
+struct Job {
+    action: ActionId,
+    inputs: Vec<PathBuf>,
+}
 
 pub struct JobResult {
     pub action: ActionId,
     pub outcome: ActionOutcome,
 }
 
-fn result_slot() -> &'static Mutex<Option<JobResult>> {
-    RESULT.get_or_init(|| Mutex::new(None))
-}
+// Рабочий поток запущен (есть текущая задача).
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+static CANCEL: AtomicBool = AtomicBool::new(false);
+
+static NOTIFY_WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+static DONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+static TOTAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// Прогресс внутри текущего файла в тысячных (для долгих операций вроде
+// перекодирования видео).
+static FILE_PROGRESS: AtomicUsize = AtomicUsize::new(0);
+
+static QUEUE: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
+
+static RESULTS: Mutex<VecDeque<JobResult>> = Mutex::new(VecDeque::new());
 
 pub fn is_running() -> bool {
     RUNNING.load(Ordering::Acquire)
+}
+
+// Сколько задач ждёт своей очереди (без текущей).
+pub fn queued() -> usize {
+    QUEUE.lock().map(|queue| queue.len()).unwrap_or(0)
 }
 
 // (обработано, всего) для текущей задачи.
@@ -42,45 +69,125 @@ pub fn progress() -> (usize, usize) {
     )
 }
 
-pub fn start(notify_window: HWND, action: ActionId, inputs: Vec<PathBuf>) -> bool {
-    if RUNNING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return false;
+// Доля текущего файла, 0..1.
+pub fn file_progress() -> f32 {
+    FILE_PROGRESS.load(Ordering::Relaxed) as f32 / 1000.0
+}
+
+pub fn set_file_progress(fraction: f64) {
+    FILE_PROGRESS.store((fraction.clamp(0.0, 1.0) * 1000.0) as usize, Ordering::Relaxed);
+}
+
+// Отменяет текущую задачу и очищает очередь. Текущая задача заметит отмену
+// между файлами или по ходу долгой операции.
+pub fn cancel() {
+    if let Ok(mut queue) = QUEUE.lock() {
+        queue.clear();
     }
 
-    if let Ok(mut slot) = result_slot().lock() {
-        *slot = None;
+    if is_running() {
+        CANCEL.store(true, Ordering::Release);
+    }
+}
+
+pub fn is_cancelled() -> bool {
+    CANCEL.load(Ordering::Acquire)
+}
+
+// Для циклов внутри действий: прервать работу, если нажали «Отменить».
+pub fn check_cancelled() -> Result<(), String> {
+    if is_cancelled() { Err(CANCELLED.to_string()) } else { Ok(()) }
+}
+
+// Ставит задачу в очередь. Возвращает 0, если она начнётся сразу, иначе —
+// сколько задач (с текущей) примерно впереди.
+pub fn enqueue(notify_window: HWND, action: ActionId, inputs: Vec<PathBuf>) -> usize {
+    NOTIFY_WINDOW.store(notify_window as isize, Ordering::Relaxed);
+
+    let Ok(mut queue) = QUEUE.lock() else {
+        return 0;
+    };
+
+    queue.push_back(Job { action, inputs });
+
+    // Решения «запустить поток» и «поток закончил работу» принимаются под
+    // одной блокировкой очереди, поэтому задача не может потеряться.
+    if RUNNING.load(Ordering::Acquire) {
+        return queue.len();
     }
 
-    DONE_COUNT.store(0, Ordering::Relaxed);
+    RUNNING.store(true, Ordering::Release);
 
-    TOTAL_COUNT.store(inputs.len(), Ordering::Relaxed);
+    drop(queue);
 
-    let hwnd_value = notify_window as isize;
+    std::thread::spawn(worker);
 
-    std::thread::spawn(move || {
-        let outcome = action.execute(&inputs, |done, _total| {
-            DONE_COUNT.store(done, Ordering::Relaxed);
-        });
+    0
+}
 
-        if let Ok(mut slot) = result_slot().lock() {
-            *slot = Some(JobResult { action, outcome });
+fn worker() {
+    loop {
+        let job = {
+            let Ok(mut queue) = QUEUE.lock() else {
+                RUNNING.store(false, Ordering::Release);
+
+                return;
+            };
+
+            match queue.pop_front() {
+                Some(job) => job,
+
+                None => {
+                    RUNNING.store(false, Ordering::Release);
+
+                    return;
+                }
+            }
+        };
+
+        CANCEL.store(false, Ordering::Release);
+
+        let outcome = run(&job);
+
+        // Отмена относилась к этой задаче — дальше флаг не нужен.
+        CANCEL.store(false, Ordering::Release);
+
+        if let Ok(mut results) = RESULTS.lock() {
+            results.push_back(JobResult {
+                action: job.action,
+                outcome,
+            });
         }
 
-        RUNNING.store(false, Ordering::Release);
-
-        let hwnd = hwnd_value as HWND;
+        let hwnd = NOTIFY_WINDOW.load(Ordering::Relaxed) as HWND;
 
         unsafe {
             PostMessageW(hwnd, WM_FILEHALO_JOB_DONE, 0, 0);
         }
-    });
+    }
+}
 
-    true
+fn run(job: &Job) -> ActionOutcome {
+    // Результат «много в один» — это один файл: прогресс идёт долей внутри него.
+    let combined = job.action.is_combined();
+
+    DONE_COUNT.store(0, Ordering::Relaxed);
+
+    FILE_PROGRESS.store(0, Ordering::Relaxed);
+
+    TOTAL_COUNT.store(if combined { 1 } else { job.inputs.len() }, Ordering::Relaxed);
+
+    job.action.execute(&job.inputs, |done, total| {
+        if combined {
+            set_file_progress(done as f64 / total.max(1) as f64);
+        } else {
+            DONE_COUNT.store(done, Ordering::Relaxed);
+
+            FILE_PROGRESS.store(0, Ordering::Relaxed);
+        }
+    })
 }
 
 pub fn take_result() -> Option<JobResult> {
-    result_slot().lock().ok().and_then(|mut slot| slot.take())
+    RESULTS.lock().ok().and_then(|mut results| results.pop_front())
 }

@@ -6,7 +6,8 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream, dictionary};
 
 use crate::converter::{self, Encoding};
 use crate::file_types::{self, ImageKind};
-use crate::output;
+use crate::{job_manager, output};
+use crate::winrt::{self, winrt_error};
 
 // Страница PDF из картинки: 96 пикселей на дюйм, как на экране при 100%.
 const IMAGE_DPI: f32 = 96.0;
@@ -190,6 +191,8 @@ pub fn images_to_pdf(
     let mut kids = Vec::new();
 
     for (index, path) in images.iter().enumerate() {
+        job_manager::check_cancelled()?;
+
         let (image_id, width, height) = image_object(&mut document, path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
 
@@ -298,6 +301,8 @@ pub fn merge(files: &[PathBuf], mut progress: impl FnMut(usize)) -> Result<PathB
     let mut kids = Vec::new();
 
     for (index, path) in files.iter().enumerate() {
+        job_manager::check_cancelled()?;
+
         let mut document = Document::load(path)
             .map_err(|error| pdf_error(&path.display().to_string(), error))?;
 
@@ -350,7 +355,7 @@ pub fn merge(files: &[PathBuf], mut progress: impl FnMut(usize)) -> Result<PathB
 
     save_document(
         &mut merged,
-        &output::next_to_with_suffix(first, "merged", "pdf")?,
+        &output::next_to_with_suffix(first, "склеено", "pdf")?,
     )
 }
 
@@ -358,45 +363,9 @@ pub fn merge(files: &[PathBuf], mut progress: impl FnMut(usize)) -> Result<PathB
 // PDF -> картинки (встроенный в Windows 10/11 движок Windows.Data.Pdf)
 // ---------------------------------------------------------------------------
 
-fn winrt_error(context: &str, error: windows::core::Error) -> String {
-    let message = error.message();
-
-    if message.trim().is_empty() {
-        format!("{context}: error 0x{:08X}", error.code().0)
-    } else {
-        format!("{context}: {}", message.trim())
-    }
-}
-
-// COM/WinRT на время работы с PDF. Только STA: если рендерить в MTA,
-// процесс падает с нарушением доступа при завершении (проверено).
-struct ComScope {
-    initialized: bool,
-}
-
-impl ComScope {
-    fn new() -> Self {
-        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
-
-        let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-
-        Self {
-            initialized: result.is_ok(),
-        }
-    }
-}
-
-impl Drop for ComScope {
-    fn drop(&mut self) {
-        if self.initialized {
-            unsafe { windows::Win32::System::Com::CoUninitialize() };
-        }
-    }
-}
-
 fn render_page(page: &windows::Data::Pdf::PdfPage) -> Result<Vec<u8>, String> {
     use windows::Data::Pdf::PdfPageRenderOptions;
-    use windows::Storage::Streams::{DataReader, InMemoryRandomAccessStream};
+    use windows::Storage::Streams::InMemoryRandomAccessStream;
 
     let size = page.Size().map_err(|error| winrt_error("Page size", error))?;
 
@@ -419,31 +388,13 @@ fn render_page(page: &windows::Data::Pdf::PdfPage) -> Result<Vec<u8>, String> {
         .and_then(|operation| operation.join())
         .map_err(|error| winrt_error("Render", error))?;
 
-    let length = stream.Size().map_err(|error| winrt_error("Render", error))?;
-
-    let reader = stream
-        .GetInputStreamAt(0)
-        .and_then(|input| DataReader::CreateDataReader(&input))
-        .map_err(|error| winrt_error("Render", error))?;
-
-    reader
-        .LoadAsync(length as u32)
-        .and_then(|operation| operation.join())
-        .map_err(|error| winrt_error("Render", error))?;
-
-    let mut bytes = vec![0u8; length as usize];
-
-    reader
-        .ReadBytes(&mut bytes)
-        .map_err(|error| winrt_error("Render", error))?;
-
-    Ok(bytes)
+    winrt::read_stream(&stream)
 }
 
 // Одностраничный PDF -> "doc.png" рядом. Многостраничный -> папка "doc"
 // со страницами "doc 01.png", "doc 02.png", ...
 pub fn to_images(source: &Path) -> Result<PathBuf, String> {
-    let _com = ComScope::new();
+    let _com = winrt::ComScope::new();
 
     // Все объекты WinRT живут внутри render_document и освобождаются
     // до того, как _com завершит COM.
@@ -452,15 +403,10 @@ pub fn to_images(source: &Path) -> Result<PathBuf, String> {
 
 fn render_document(source: &Path) -> Result<PathBuf, String> {
     use windows::Data::Pdf::PdfDocument;
-    use windows::Storage::StorageFile;
-    use windows::core::HSTRING;
 
-    let absolute = std::path::absolute(source)
-        .map_err(|error| format!("{}: {error}", source.display()))?;
+    let file = winrt::storage_file(source)?;
 
-    let document = StorageFile::GetFileFromPathAsync(&HSTRING::from(absolute.as_os_str()))
-        .and_then(|operation| operation.join())
-        .and_then(|file| PdfDocument::LoadFromFileAsync(&file))
+    let document = PdfDocument::LoadFromFileAsync(&file)
         .and_then(|operation| operation.join())
         .map_err(|error| winrt_error(&format!("Could not open {}", source.display()), error))?;
 
@@ -501,6 +447,8 @@ fn render_document(source: &Path) -> Result<PathBuf, String> {
     let digits = page_count.to_string().len().max(2);
 
     for index in 0..page_count {
+        job_manager::check_cancelled()?;
+
         let bytes = page(index)?;
 
         let mut name = stem.to_os_string();

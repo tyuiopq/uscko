@@ -175,12 +175,14 @@ pub struct WheelConfig {
     pub images: Layout,
     pub pdf: Layout,
     pub archive: Layout,
+    pub video: Layout,
+    pub audio: Layout,
     pub files: Layout,
 }
 
 // Версия формата конфига. Повышается, когда новым действиям нужно место
 // в уже сохранённых раскладках (см. migrate).
-const CONFIG_VERSION: u32 = 4;
+const CONFIG_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -202,11 +204,13 @@ impl Default for AppConfig {
 }
 
 impl WheelConfig {
-    fn layouts_mut(&mut self) -> [&mut Layout; 4] {
+    fn layouts_mut(&mut self) -> [&mut Layout; 6] {
         [
             &mut self.images,
             &mut self.pdf,
             &mut self.archive,
+            &mut self.video,
+            &mut self.audio,
             &mut self.files,
         ]
     }
@@ -260,7 +264,40 @@ fn defaults_v3() -> WheelConfig {
             Some(CopyPath),
             Some(CreateZip),
         ]),
+        // Видео и аудио появились позже версии 3 — у них сразу новые раскладки.
+        video: default_video(),
+        audio: default_audio(),
     }
+}
+
+fn default_video() -> Layout {
+    use ActionId::*;
+
+    Layout::new(
+        5,
+        vec![
+            Some(ConvertToMp4),
+            Some(CompressVideo),
+            Some(VideoTo720p),
+            Some(ExtractAudio),
+            Some(ConvertToWmv),
+        ],
+    )
+}
+
+fn default_audio() -> Layout {
+    use ActionId::*;
+
+    Layout::new(
+        5,
+        vec![
+            Some(ConvertToMp3),
+            Some(ConvertToM4a),
+            Some(ConvertToWav),
+            Some(ConvertToFlac),
+            Some(MergeAudio),
+        ],
+    )
 }
 
 // Приводит конфиг старой версии к текущей. Возвращает true, если что-то поменялось.
@@ -300,6 +337,24 @@ fn migrate(config: &mut AppConfig) -> bool {
         }
     }
 
+    // Версия 5: из видео убраны «Кадр» и «GIF». Их слоты читаются пустыми;
+    // нетронутая раскладка видео меняется на новую — без пустых секций.
+    if config.version < 5 {
+        let old = Layout::new(
+            6,
+            vec![
+                Some(ActionId::ConvertToMp4),
+                Some(ActionId::CompressVideo),
+                Some(ActionId::VideoTo720p),
+                Some(ActionId::ExtractAudio),
+            ],
+        );
+
+        if config.wheel.video == old {
+            config.wheel.video = default_video();
+        }
+    }
+
     config.version = CONFIG_VERSION;
 
     true
@@ -325,6 +380,10 @@ impl Default for WheelConfig {
                 3,
                 vec![Some(ExtractArchive), Some(IntoNewFolder), Some(CopyPath)],
             ),
+
+            video: default_video(),
+
+            audio: default_audio(),
 
             files: Layout::new(
                 4,
@@ -460,6 +519,8 @@ fn layout(config: &AppConfig, category: Category) -> &Layout {
         Category::Images => &config.wheel.images,
         Category::Pdf => &config.wheel.pdf,
         Category::Archive => &config.wheel.archive,
+        Category::Video => &config.wheel.video,
+        Category::Audio => &config.wheel.audio,
         Category::Files => &config.wheel.files,
     }
 }
@@ -469,6 +530,8 @@ fn layout_mut(config: &mut AppConfig, category: Category) -> &mut Layout {
         Category::Images => &mut config.wheel.images,
         Category::Pdf => &mut config.wheel.pdf,
         Category::Archive => &mut config.wheel.archive,
+        Category::Video => &mut config.wheel.video,
+        Category::Audio => &mut config.wheel.audio,
         Category::Files => &mut config.wheel.files,
     }
 }

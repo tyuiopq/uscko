@@ -341,7 +341,7 @@ pub fn compress(source: &Path) -> Result<PathBuf, ActionError> {
 
     Ok(save_bytes(
         &bytes,
-        &output::next_to_with_suffix(source, "compressed", encoding.extension())?,
+        &output::next_to_with_suffix(source, "сжато", encoding.extension())?,
     )?)
 }
 

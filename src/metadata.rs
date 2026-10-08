@@ -39,7 +39,7 @@ pub fn strip(source: &Path) -> Result<PathBuf, ActionError> {
         .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
 
-    let target = output::next_to_with_suffix(source, "clean", &extension)?;
+    let target = output::next_to_with_suffix(source, "без метаданных", &extension)?;
 
     Ok(output::write_file(&target, |writer| {
         use std::io::Write;

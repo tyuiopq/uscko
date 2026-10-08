@@ -9,13 +9,13 @@
 // Чтобы добавить категорию: новый вариант Category, правило в Category::of
 // и поле раскладки в config::WheelConfig.
 
-use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::file_types::{self, ImageKind};
-use crate::{archive, converter, file_tools, metadata, pdf};
+use crate::media::{self, AudioFormat, VideoFormat};
+use crate::{archive, converter, file_tools, job_manager, metadata, pdf};
 
 // Уменьшение картинок: длинная сторона не больше этого значения.
 const RESIZE_MAX_SIDE: u32 = 1920;
@@ -33,17 +33,14 @@ impl Selection {
         !self.files.is_empty() && self.files.iter().all(|file| predicate(file))
     }
 
+    // Файлы в том порядке, в каком они показаны в папке Проводника:
+    // так пользователь управляет порядком страниц PDF и склейки.
     fn matching(&self, predicate: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
-        let mut files: Vec<PathBuf> = self
-            .files
+        self.files
             .iter()
             .filter(|file| predicate(file))
             .cloned()
-            .collect();
-
-        files.sort_by(|left, right| natural_cmp(left, right));
-
-        files
+            .collect()
     }
 }
 
@@ -64,62 +61,16 @@ fn is_pdf(path: &Path) -> bool {
     file_types::is_pdf(path) && is_file(path)
 }
 
-fn is_archive(path: &Path) -> bool {
-    (file_types::is_zip(path) || file_types::is_seven_zip(path)) && is_file(path)
+fn is_video(path: &Path) -> bool {
+    file_types::is_video(path) && is_file(path)
 }
 
-// Сравнение имён «как у людей»: "scan 2" раньше "scan 10".
-// Порядок важен для страниц PDF.
-fn natural_cmp(left: &Path, right: &Path) -> Ordering {
-    let left = left.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-    let right = right.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+fn is_audio(path: &Path) -> bool {
+    file_types::is_audio(path) && is_file(path)
+}
 
-    let mut left_chars = left.chars().peekable();
-    let mut right_chars = right.chars().peekable();
-
-    let take_number = |chars: &mut std::iter::Peekable<std::str::Chars>| {
-        let mut digits = String::new();
-
-        while let Some(&digit) = chars.peek().filter(|c| c.is_ascii_digit()) {
-            digits.push(digit);
-            chars.next();
-        }
-
-        digits.trim_start_matches('0').to_string()
-    };
-
-    loop {
-        match (left_chars.peek().copied(), right_chars.peek().copied()) {
-            (None, None) => return Ordering::Equal,
-
-            (None, Some(_)) => return Ordering::Less,
-
-            (Some(_), None) => return Ordering::Greater,
-
-            (Some(a), Some(b)) if a.is_ascii_digit() && b.is_ascii_digit() => {
-                let a_number = take_number(&mut left_chars);
-                let b_number = take_number(&mut right_chars);
-
-                let order = a_number
-                    .len()
-                    .cmp(&b_number.len())
-                    .then_with(|| a_number.cmp(&b_number));
-
-                if order != Ordering::Equal {
-                    return order;
-                }
-            }
-
-            (Some(a), Some(b)) => {
-                if a != b {
-                    return a.cmp(&b);
-                }
-
-                left_chars.next();
-                right_chars.next();
-            }
-        }
-    }
+fn is_archive(path: &Path) -> bool {
+    (file_types::is_zip(path) || file_types::is_seven_zip(path)) && is_file(path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +78,8 @@ pub enum Category {
     Images,
     Pdf,
     Archive,
+    Video,
+    Audio,
     Files,
 }
 
@@ -135,6 +88,8 @@ impl Category {
         Category::Images,
         Category::Pdf,
         Category::Archive,
+        Category::Video,
+        Category::Audio,
         Category::Files,
     ];
 
@@ -143,6 +98,8 @@ impl Category {
             Self::Images => "Картинки",
             Self::Pdf => "PDF",
             Self::Archive => "Архивы",
+            Self::Video => "Видео",
+            Self::Audio => "Аудио",
             Self::Files => "Файлы",
         }
     }
@@ -162,6 +119,14 @@ impl Category {
 
         if selection.all(is_archive) {
             return Some(Self::Archive);
+        }
+
+        if selection.all(is_video) {
+            return Some(Self::Video);
+        }
+
+        if selection.all(is_audio) {
+            return Some(Self::Audio);
         }
 
         Some(Self::Files)
@@ -202,6 +167,17 @@ pub enum ActionId {
     CopyPath,
     Sha256,
     IntoNewFolder,
+    ConvertToMp4,
+    ConvertToWmv,
+    CompressVideo,
+    VideoTo720p,
+    ExtractAudio,
+    MergeVideos,
+    ConvertToMp3,
+    ConvertToM4a,
+    ConvertToWav,
+    ConvertToFlac,
+    MergeAudio,
 }
 
 // Ошибка обработки одного файла.
@@ -228,6 +204,8 @@ pub struct ActionOutcome {
     pub message: Option<String>,
     // Выделить результат и сразу включить переименование.
     pub rename: bool,
+    // Пользователь нажал «Отменить»: готовое до этого момента остаётся.
+    pub cancelled: bool,
 }
 
 impl ActionId {
@@ -249,6 +227,17 @@ impl ActionId {
         ActionId::CopyPath,
         ActionId::Sha256,
         ActionId::IntoNewFolder,
+        ActionId::ConvertToMp4,
+        ActionId::ConvertToWmv,
+        ActionId::CompressVideo,
+        ActionId::VideoTo720p,
+        ActionId::ExtractAudio,
+        ActionId::MergeVideos,
+        ActionId::ConvertToMp3,
+        ActionId::ConvertToM4a,
+        ActionId::ConvertToWav,
+        ActionId::ConvertToFlac,
+        ActionId::MergeAudio,
     ];
 
     // Короткая подпись на секции колеса.
@@ -271,6 +260,16 @@ impl ActionId {
             Self::CopyPath => "Путь",
             Self::Sha256 => "SHA-256",
             Self::IntoNewFolder => "В папку",
+            Self::ConvertToMp4 => "MP4",
+            Self::ConvertToWmv => "WMV",
+            Self::CompressVideo => "Сжать",
+            Self::VideoTo720p => "720p",
+            Self::ExtractAudio => "Звук",
+            Self::MergeVideos | Self::MergeAudio => "Склеить",
+            Self::ConvertToMp3 => "MP3",
+            Self::ConvertToM4a => "M4A",
+            Self::ConvertToWav => "WAV",
+            Self::ConvertToFlac => "FLAC",
         }
     }
 
@@ -294,7 +293,26 @@ impl ActionId {
             Self::CopyPath => "Копировать путь",
             Self::Sha256 => "Копировать SHA-256",
             Self::IntoNewFolder => "Переложить в новую папку",
+            Self::ConvertToMp4 => "Конвертировать в MP4",
+            Self::ConvertToWmv => "Конвертировать в WMV",
+            Self::CompressVideo => "Сжать видео",
+            Self::VideoTo720p => "Уменьшить до 720p",
+            Self::ExtractAudio => "Извлечь звук в MP3",
+            Self::MergeVideos => "Склеить видео",
+            Self::ConvertToMp3 => "Конвертировать в MP3",
+            Self::ConvertToM4a => "Конвертировать в M4A",
+            Self::ConvertToWav => "Конвертировать в WAV",
+            Self::ConvertToFlac => "Конвертировать в FLAC",
+            Self::MergeAudio => "Склеить аудио",
         }
+    }
+
+    // Действие «много файлов -> один результат» (склейка, PDF, архив).
+    pub fn is_combined(self) -> bool {
+        matches!(
+            self,
+            Self::ImagesToPdf | Self::MergePdfs | Self::CreateZip | Self::MergeVideos | Self::MergeAudio
+        )
     }
 
     pub fn available_in(self, category: Category) -> bool {
@@ -313,6 +331,19 @@ impl ActionId {
             Self::MergePdfs | Self::PdfToImages => category == Category::Pdf,
 
             Self::ExtractArchive => category == Category::Archive,
+
+            Self::ConvertToMp4
+            | Self::ConvertToWmv
+            | Self::CompressVideo
+            | Self::VideoTo720p
+            | Self::ExtractAudio
+            | Self::MergeVideos => category == Category::Video,
+
+            Self::ConvertToMp3
+            | Self::ConvertToM4a
+            | Self::ConvertToWav
+            | Self::ConvertToFlac
+            | Self::MergeAudio => category == Category::Audio,
 
             // Упаковать можно что угодно, кроме уже готовых архивов.
             Self::CreateZip => category != Category::Archive,
@@ -353,6 +384,23 @@ impl ActionId {
             Self::CopyPath | Self::IntoNewFolder => selection.matching(|_| true),
 
             Self::Sha256 => selection.matching(is_file),
+
+            Self::ConvertToMp4 => convertible_video(selection, VideoFormat::Mp4),
+
+            Self::ConvertToWmv => convertible_video(selection, VideoFormat::Wmv),
+
+            Self::CompressVideo
+            | Self::VideoTo720p
+            | Self::ExtractAudio => selection.matching(is_video),
+
+            Self::MergeVideos => at_least_two(selection.matching(is_video)),
+
+            Self::ConvertToMp3 => convertible_audio(selection, AudioFormat::Mp3),
+            Self::ConvertToM4a => convertible_audio(selection, AudioFormat::M4a),
+            Self::ConvertToWav => convertible_audio(selection, AudioFormat::Wav),
+            Self::ConvertToFlac => convertible_audio(selection, AudioFormat::Flac),
+
+            Self::MergeAudio => at_least_two(selection.matching(is_audio)),
         }
     }
 
@@ -444,12 +492,18 @@ impl ActionId {
 
             Self::CreateZip => Some(archive::create(inputs, &mut report)),
 
+            Self::MergeVideos => Some(media::merge_videos(inputs)),
+
+            Self::MergeAudio => Some(media::merge_audio(inputs)),
+
             _ => None,
         };
 
         if let Some(result) = combined {
             match result {
                 Ok(output) => outcome.outputs.push(output),
+
+                Err(error) if error == job_manager::CANCELLED => outcome.cancelled = true,
 
                 Err(error) => {
                     let first = inputs.first().cloned().unwrap_or_default();
@@ -461,13 +515,26 @@ impl ActionId {
             return outcome;
         }
 
-        // Действия «каждый файл отдельно».
+        // Действия «каждый файл отдельно». Отмена проверяется перед каждым
+        // файлом; долгие операции (видео) прерываются и посередине.
         for (index, input) in inputs.iter().enumerate() {
+            if job_manager::is_cancelled() {
+                outcome.cancelled = true;
+
+                break;
+            }
+
             match self.process_one(input) {
                 Ok(output) => outcome.outputs.push(output),
 
                 Err(ActionError::Skipped(reason)) => {
                     outcome.skipped.push((input.clone(), reason))
+                }
+
+                Err(ActionError::Failed(error)) if error == job_manager::CANCELLED => {
+                    outcome.cancelled = true;
+
+                    break;
                 }
 
                 Err(ActionError::Failed(error)) => outcome.failures.push((input.clone(), error)),
@@ -492,17 +559,43 @@ impl ActionId {
             Self::RotateLeft => converter::rotate(input, false),
             Self::RotateRight => converter::rotate(input, true),
             Self::ConvertToIco => Ok(converter::to_ico(input)?),
+            Self::ConvertToMp4 => Ok(media::convert_video(input, VideoFormat::Mp4)?),
+            Self::ConvertToWmv => Ok(media::convert_video(input, VideoFormat::Wmv)?),
+            Self::CompressVideo => media::compress_video(input),
+            Self::VideoTo720p => media::video_to_720p(input),
+            Self::ExtractAudio => Ok(media::extract_audio(input)?),
+            Self::ConvertToMp3 => Ok(media::convert_audio(input, AudioFormat::Mp3)?),
+            Self::ConvertToM4a => Ok(media::convert_audio(input, AudioFormat::M4a)?),
+            Self::ConvertToWav => Ok(media::convert_audio(input, AudioFormat::Wav)?),
+            Self::ConvertToFlac => Ok(media::convert_audio(input, AudioFormat::Flac)?),
 
             Self::ImagesToPdf
             | Self::MergePdfs
             | Self::CreateZip
             | Self::CopyPath
             | Self::Sha256
-            | Self::IntoNewFolder => {
+            | Self::IntoNewFolder
+            | Self::MergeVideos
+            | Self::MergeAudio => {
                 unreachable!("handled in execute")
             }
         }
     }
+}
+
+// Склеивать имеет смысл от двух файлов.
+fn at_least_two(files: Vec<PathBuf>) -> Vec<PathBuf> {
+    if files.len() >= 2 { files } else { Vec::new() }
+}
+
+// Видео, которое ещё не в нужном формате.
+fn convertible_video(selection: &Selection, target: VideoFormat) -> Vec<PathBuf> {
+    selection.matching(|file| is_video(file) && !file_types::has_extension(file, target.extension()))
+}
+
+// Аудио, которое ещё не в нужном формате.
+fn convertible_audio(selection: &Selection, target: AudioFormat) -> Vec<PathBuf> {
+    selection.matching(|file| is_audio(file) && !file_types::has_extension(file, target.extension()))
 }
 
 // Конвертировать в тот же формат бессмысленно, такие файлы пропускаются.

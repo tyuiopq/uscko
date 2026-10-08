@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Win32::Storage::FileSystem::{
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    MoveFileExW, SetFileAttributesW,
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -99,6 +100,24 @@ pub fn next_to_with_suffix(source: &Path, suffix: &str, extension: &str) -> Resu
     available_path(parent_of(source)?, &stem, Some(extension))
 }
 
+fn wide(path: &Path) -> Vec<u16> {
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+// Временные файлы скрыты, чтобы не мелькать в папке пользователя. Перед
+// переименованием в результат атрибут снимается, иначе скрытым останется
+// и сам результат.
+fn set_hidden(path: &Path, hidden: bool) {
+    let attributes = if hidden { FILE_ATTRIBUTE_HIDDEN } else { FILE_ATTRIBUTE_NORMAL };
+
+    unsafe {
+        SetFileAttributesW(wide(path).as_ptr(), attributes);
+    }
+}
+
 fn temp_path(folder: &Path) -> PathBuf {
     let pid = std::process::id();
 
@@ -108,12 +127,7 @@ fn temp_path(folder: &Path) -> PathBuf {
 }
 
 fn move_file(from: &Path, to: &Path, replace: bool) -> Result<(), String> {
-    let wide = |path: &Path| -> Vec<u16> {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    };
+    set_hidden(from, false);
 
     let from_wide = wide(from);
     let to_wide = wide(to);
@@ -174,7 +188,11 @@ fn write_through_temp(
         let path = temp_path(folder);
 
         match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => break (path, file),
+            Ok(file) => {
+                set_hidden(&path, true);
+
+                break (path, file);
+            }
 
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 100 => {
                 attempts += 1;
@@ -211,6 +229,22 @@ fn write_through_temp(
     Ok(output.to_path_buf())
 }
 
+// Результат, который пишет не наш код, а движок Windows: produce получает
+// путь к пустому файлу и заполняет его, затем файл переносится в output.
+// Скрытой делается временная папка, а не сам файл: в скрытый файл движок
+// Windows писать отказывается («элемент помечен как скрытый»).
+pub fn produce_file(output: &Path, produce: impl FnOnce(&Path) -> Result<(), String>) -> Result<PathBuf, String> {
+    let temp = temp_dir(parent_of(output)?)?;
+
+    let file = temp.path().join(output.file_name().unwrap_or(OsStr::new("output")));
+
+    File::create(&file).map_err(|error| format!("Could not create temporary file: {error}"))?;
+
+    produce(&file)?;
+
+    finish_temp(temp, Some(&file), output)
+}
+
 // Временная папка рядом с будущим результатом. Заполняется через
 // guard.path(), а finish_dir переносит её на место.
 pub fn temp_dir(folder: &Path) -> Result<TempGuard, String> {
@@ -219,6 +253,8 @@ pub fn temp_dir(folder: &Path) -> Result<TempGuard, String> {
 
         match fs::create_dir(&path) {
             Ok(()) => {
+                set_hidden(&path, true);
+
                 return Ok(TempGuard {
                     path,
                     committed: false,

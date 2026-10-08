@@ -55,3 +55,23 @@ pub fn is_zip(path: &Path) -> bool {
 pub fn is_seven_zip(path: &Path) -> bool {
     extension(path).as_deref() == Some("7z")
 }
+
+// Видео и аудио, которые умеет открыть встроенный в Windows медиадвижок
+// (для части форматов нужны расширения из Microsoft Store).
+pub fn is_video(path: &Path) -> bool {
+    matches!(
+        extension(path).as_deref(),
+        Some("mp4" | "m4v" | "mov" | "avi" | "wmv" | "mkv" | "webm" | "3gp" | "mpg" | "mpeg" | "ts" | "mts" | "m2ts")
+    )
+}
+
+pub fn is_audio(path: &Path) -> bool {
+    matches!(
+        extension(path).as_deref(),
+        Some("mp3" | "m4a" | "aac" | "wav" | "flac" | "wma" | "ogg" | "opus")
+    )
+}
+
+pub fn has_extension(path: &Path, expected: &str) -> bool {
+    extension(path).as_deref() == Some(expected)
+}

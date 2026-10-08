@@ -2,27 +2,34 @@
 // Своя отрисовка с попиксельной прозрачностью: карточка с тенью, индикатор,
 // полоса прогресса, плавное появление и исчезновение.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::f32::consts::PI;
 use std::ptr::{null, null_mut};
 use std::time::Instant;
 
 use tiny_skia::{PathBuilder, Pixmap};
 use windows_sys::Win32::{
-    Foundation::{HINSTANCE, HWND, POINT, RECT},
-    UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, GetCursorPos, HWND_TOPMOST, KillTimer, RegisterClassW,
-        SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetTimer, SetWindowPos, ShowWindow, WNDCLASSW,
-        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-        WS_POPUP,
+    Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+    UI::{
+        Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
+        WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, GetCursorPos, HWND_TOPMOST, IDC_ARROW, IDC_HAND,
+            KillTimer, LoadCursorW, MA_NOACTIVATE, PostMessageW, RegisterClassW, SW_HIDE,
+            SWP_NOACTIVATE, SWP_SHOWWINDOW, SetCursor, SetTimer, SetWindowPos, ShowWindow, WM_APP,
+            WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        },
     },
 };
 
-use crate::render::{self, ACCENT, BORDER, DANGER, Rgba, SUCCESS, TEXT, TEXT_MUTED, with_alpha};
+use crate::render::{
+    self, ACCENT, ACCENT_DARK, BORDER, DANGER, Rgba, SUCCESS, TEXT, TEXT_MUTED, WARNING, mix,
+    with_alpha,
+};
 use crate::{dpi, job_manager, text};
 
 // Карточка и запас вокруг неё под тень.
-const CARD_WIDTH: f32 = 320.0;
+const CARD_WIDTH: f32 = 360.0;
 const CARD_HEIGHT: f32 = 60.0;
 const SHADOW: f32 = 20.0;
 
@@ -32,6 +39,14 @@ const MARGIN: f32 = 4.0;
 const CARD_FILL: Rgba = [28, 31, 38, 248];
 const TRACK: Rgba = [255, 255, 255, 22];
 
+// Нажата кнопка в окне статуса; wParam — какая (Button).
+pub const WM_STATUS_BUTTON: u32 = WM_APP + 2;
+
+// Мышь ушла из окна (приходит после TrackMouseEvent с TME_LEAVE).
+const WM_MOUSELEAVE: u32 = 0x02A3;
+
+const BUTTON_HEIGHT: f32 = 28.0;
+
 pub const TIMER_DELAY_ID: usize = 2001;
 pub const TIMER_FRAME_ID: usize = 2002;
 pub const TIMER_HIDE_ID: usize = 2003;
@@ -39,8 +54,13 @@ pub const TIMER_HIDE_ID: usize = 2003;
 // Короткие задачи окно не показывает, чтобы не мелькать.
 const SHOW_DELAY_MS: u32 = 400;
 const FRAME_MS: u32 = 16;
+// Сколько держать итог на экране: с пояснением — дольше, чтобы успеть прочитать.
 const SUCCESS_VISIBLE_MS: u32 = 1200;
-const ERROR_VISIBLE_MS: u32 = 3200;
+const DETAIL_VISIBLE_MS: u32 = 3000;
+const ERROR_VISIBLE_MS: u32 = 4500;
+const ACTION_VISIBLE_MS: u32 = 10_000;
+// Пока мышь над окном, оно не исчезает: проверяем снова через это время.
+const HOVER_RECHECK_MS: u32 = 800;
 
 const APPEAR_SECONDS: f32 = 0.18;
 const DISAPPEAR_SECONDS: f32 = 0.16;
@@ -54,12 +74,60 @@ static CLASS_NAME: &[u16] = &[
 enum Mode {
     Working,
     Success,
+    // Ничего не сломалось, но часть файлов (или все) не обработаны:
+    // «уже сжато», «уже не больше 720p» и т. п.
+    Skipped,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Button {
+    Cancel = 1,
+    OpenStore = 2,
+}
+
+impl Button {
+    pub fn from_code(code: usize) -> Option<Self> {
+        match code {
+            1 => Some(Self::Cancel),
+            2 => Some(Self::OpenStore),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cancel => "Отменить",
+            Self::OpenStore => "Открыть Store",
+        }
+    }
+}
+
+thread_local! {
+    // Где нарисована кнопка (пиксели окна) — для попадания мышью.
+    static BUTTON_AREA: Cell<Option<(Button, f32, f32, f32, f32)>> = const { Cell::new(None) };
+
+    static MOUSE_OVER_CARD: Cell<bool> = const { Cell::new(false) };
+
+    static MOUSE_OVER_BUTTON: Cell<bool> = const { Cell::new(false) };
+}
+
+// Итог задачи для окна статуса.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Success,
+    Skipped,
     Error,
 }
 
 struct Inner {
     mode: Mode,
     text: String,
+    // Вторая строка: причина пропуска или ошибки.
+    detail: Option<String>,
+    button: Option<Button>,
+    // Нажали «Отменить», ждём, пока задача остановится.
+    cancelling: bool,
     visible: bool,
     // 0..1 — анимация появления; при скрытии идёт обратно.
     appear: f32,
@@ -81,7 +149,7 @@ impl StatusUi {
     pub unsafe fn create(instance: HINSTANCE) -> Option<Self> {
         let class = WNDCLASSW {
             style: 0,
-            lpfnWndProc: Some(DefWindowProcW),
+            lpfnWndProc: Some(window_proc),
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
@@ -98,11 +166,9 @@ impl StatusUi {
 
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOPMOST
-                    | WS_EX_TOOLWINDOW
-                    | WS_EX_NOACTIVATE
-                    | WS_EX_LAYERED
-                    | WS_EX_TRANSPARENT,
+                // Без WS_EX_TRANSPARENT: на окне есть кнопки. Фокус оно всё
+                // равно не забирает (WS_EX_NOACTIVATE).
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
                 CLASS_NAME.as_ptr(),
                 null(),
                 WS_POPUP,
@@ -126,6 +192,9 @@ impl StatusUi {
             inner: RefCell::new(Inner {
                 mode: Mode::Working,
                 text: String::new(),
+                detail: None,
+                button: None,
+                cancelling: false,
                 visible: false,
                 appear: 0.0,
                 hiding: false,
@@ -149,6 +218,9 @@ impl StatusUi {
         inner.mode = Mode::Working;
         inner.progress = 0.0;
         inner.text.clear();
+        inner.detail = None;
+        inner.button = Some(Button::Cancel);
+        inner.cancelling = false;
 
         unsafe {
             KillTimer(self.hwnd, TIMER_HIDE_ID);
@@ -161,55 +233,88 @@ impl StatusUi {
         inner.hiding = false;
     }
 
-    // always — показать, даже если задача была быстрой (например,
-    // «Путь скопирован»: иначе не видно, что что-то произошло).
-    pub unsafe fn finish_success(&self, text: String, always: bool) {
+    // Итог задачи. always — показать, даже если задача была быстрой и окно
+    // ещё не появлялось. Пропуски и ошибки показываются всегда: иначе
+    // кажется, что ничего не произошло.
+    // offer_store — показать кнопку «Открыть Store» (не хватает расширения).
+    pub unsafe fn finish(
+        &self,
+        outcome: Outcome,
+        text: String,
+        detail: Option<String>,
+        always: bool,
+        offer_store: bool,
+    ) {
         unsafe {
             KillTimer(self.hwnd, TIMER_DELAY_ID);
         }
 
+        let has_detail = detail.is_some();
+
         let visible = {
             let mut inner = self.inner.borrow_mut();
 
-            inner.mode = Mode::Success;
+            inner.mode = match outcome {
+                Outcome::Success => Mode::Success,
+                Outcome::Skipped => Mode::Skipped,
+                Outcome::Error => Mode::Error,
+            };
             inner.text = text;
+            inner.detail = detail;
+            inner.button = offer_store.then_some(Button::OpenStore);
+            inner.cancelling = false;
             inner.hiding = false;
 
             inner.visible
         };
 
-        // Быстрая задача: окно так и не появилось — и не нужно.
+        let always = always || outcome != Outcome::Success;
+
+        // Быстрая задача без новостей: окно так и не появилось — и не нужно.
         if !visible && !always {
             return;
         }
+
+        let duration = match outcome {
+            _ if offer_store => ACTION_VISIBLE_MS,
+            Outcome::Error => ERROR_VISIBLE_MS,
+            _ if has_detail => DETAIL_VISIBLE_MS,
+            _ => SUCCESS_VISIBLE_MS,
+        };
 
         unsafe {
             if !visible {
                 self.show();
             }
 
-            SetTimer(self.hwnd, TIMER_HIDE_ID, SUCCESS_VISIBLE_MS, None);
+            SetTimer(self.hwnd, TIMER_HIDE_ID, duration, None);
         }
     }
 
-    // Об ошибке сообщаем всегда, даже если задача была быстрой.
-    pub unsafe fn finish_error(&self, text: String) {
-        unsafe {
-            KillTimer(self.hwnd, TIMER_DELAY_ID);
-        }
+    // Нажали «Отменить»: показываем, что отмена идёт, до итога задачи.
+    pub fn set_cancelling(&self) {
+        let mut inner = self.inner.borrow_mut();
 
+        inner.cancelling = true;
+        inner.button = None;
+    }
+
+    // Открыли Microsoft Store — объясняем зачем и что делать дальше.
+    pub unsafe fn show_store_hint(&self) {
         {
             let mut inner = self.inner.borrow_mut();
 
-            inner.mode = Mode::Error;
-            inner.text = text;
+            inner.mode = Mode::Skipped;
+            inner.text = "Открыли Microsoft Store".to_string();
+            inner.detail = Some("Установите «HEVC Video Extensions» и повторите действие".to_string());
+            inner.button = None;
             inner.hiding = false;
         }
 
         unsafe {
             self.show();
 
-            SetTimer(self.hwnd, TIMER_HIDE_ID, ERROR_VISIBLE_MS, None);
+            SetTimer(self.hwnd, TIMER_HIDE_ID, ACTION_VISIBLE_MS, None);
         }
     }
 
@@ -226,7 +331,26 @@ impl StatusUi {
             TIMER_HIDE_ID => unsafe {
                 KillTimer(self.hwnd, TIMER_HIDE_ID);
 
-                self.inner.borrow_mut().hiding = true;
+                // Пока на окно навели мышь (читают или тянутся к кнопке) — не прячем.
+                if MOUSE_OVER_CARD.get() {
+                    SetTimer(self.hwnd, TIMER_HIDE_ID, HOVER_RECHECK_MS, None);
+
+                    return;
+                }
+
+                let mut inner = self.inner.borrow_mut();
+
+                // Итог показан, а в очереди уже следующая задача — снова «Обработка».
+                if job_manager::is_running() {
+                    inner.mode = Mode::Working;
+                    inner.detail = None;
+                    inner.button = Some(Button::Cancel);
+                    inner.cancelling = false;
+
+                    return;
+                }
+
+                inner.hiding = true;
             },
 
             TIMER_FRAME_ID => unsafe {
@@ -327,9 +451,11 @@ impl StatusUi {
         let (done, total) = job_manager::progress();
 
         let target = match inner.mode {
-            Mode::Working if total > 0 => done as f32 / total as f32,
+            Mode::Working if total > 0 => {
+                ((done as f32 + job_manager::file_progress()) / total as f32).min(1.0)
+            }
             Mode::Working => 0.0,
-            Mode::Success | Mode::Error => 1.0,
+            Mode::Success | Mode::Skipped | Mode::Error => 1.0,
         };
 
         render::approach(&mut inner.progress, target, 0.2, dt);
@@ -426,8 +552,12 @@ fn paint(pixmap: &mut Pixmap, inner: &Inner, done: usize, total: usize) {
             render::stroke(pixmap, &arc.finish(), with_alpha(ACCENT, appear), s(2.5));
         }
 
-        Mode::Success | Mode::Error => {
-            let color = if inner.mode == Mode::Success { SUCCESS } else { DANGER };
+        Mode::Success | Mode::Skipped | Mode::Error => {
+            let color = match inner.mode {
+                Mode::Success => SUCCESS,
+                Mode::Skipped => WARNING,
+                _ => DANGER,
+            };
 
             render::fill(
                 pixmap,
@@ -437,15 +567,29 @@ fn paint(pixmap: &mut Pixmap, inner: &Inner, done: usize, total: usize) {
 
             let mut mark = PathBuilder::new();
 
-            if inner.mode == Mode::Success {
-                mark.move_to(s(icon_x - 5.0), s(icon_y));
-                mark.line_to(s(icon_x - 1.5), s(icon_y + 3.5));
-                mark.line_to(s(icon_x + 5.0), s(icon_y - 3.5));
-            } else {
-                mark.move_to(s(icon_x - 4.0), s(icon_y - 4.0));
-                mark.line_to(s(icon_x + 4.0), s(icon_y + 4.0));
-                mark.move_to(s(icon_x + 4.0), s(icon_y - 4.0));
-                mark.line_to(s(icon_x - 4.0), s(icon_y + 4.0));
+            match inner.mode {
+                // Галочка.
+                Mode::Success => {
+                    mark.move_to(s(icon_x - 5.0), s(icon_y));
+                    mark.line_to(s(icon_x - 1.5), s(icon_y + 3.5));
+                    mark.line_to(s(icon_x + 5.0), s(icon_y - 3.5));
+                }
+
+                // Восклицательный знак: черта и точка.
+                Mode::Skipped => {
+                    mark.move_to(s(icon_x), s(icon_y - 5.5));
+                    mark.line_to(s(icon_x), s(icon_y + 1.5));
+                    mark.move_to(s(icon_x), s(icon_y + 4.5));
+                    mark.line_to(s(icon_x), s(icon_y + 5.0));
+                }
+
+                // Крестик.
+                _ => {
+                    mark.move_to(s(icon_x - 4.0), s(icon_y - 4.0));
+                    mark.line_to(s(icon_x + 4.0), s(icon_y + 4.0));
+                    mark.move_to(s(icon_x + 4.0), s(icon_y - 4.0));
+                    mark.line_to(s(icon_x - 4.0), s(icon_y + 4.0));
+                }
             }
 
             render::stroke(pixmap, &mark.finish(), with_alpha([20, 22, 27, 255], appear), s(2.2));
@@ -457,22 +601,79 @@ fn paint(pixmap: &mut Pixmap, inner: &Inner, done: usize, total: usize) {
         return;
     };
 
+    // Прогресс внутри файла (перекодирование видео) — в процентах.
+    let percent = (job_manager::file_progress() * 100.0).round() as u32;
+
+    let queued = job_manager::queued();
+
     let title = match inner.mode {
+        Mode::Working if inner.cancelling => "Отмена…".to_string(),
+        Mode::Working if queued > 0 && total > 1 => format!("Обработка {done} из {total} · ещё {queued}"),
+        Mode::Working if queued > 0 => format!("Обработка… · ещё {queued} в очереди"),
+        Mode::Working if total > 1 && percent > 0 => {
+            format!("Обработка {} из {total} · {percent}%", (done + 1).min(total))
+        }
         Mode::Working if total > 1 => format!("Обработка {done} из {total}"),
+        Mode::Working if percent > 0 => format!("Обработка… {percent}%"),
         Mode::Working => "Обработка…".to_string(),
         _ => inner.text.trim_start_matches("✓ ").to_string(),
     };
 
     let text_x = x + 54.0;
 
-    let max_width = s(CARD_WIDTH - 54.0 - 18.0);
+    // Кнопка справа («Отменить», «Открыть Store»); текст — до неё.
+    let button_width = inner
+        .button
+        .map(|button| text::measure(&fonts.semibold, s(12.5), button.label()) / scale + 24.0)
+        .unwrap_or(0.0);
+
+    let text_width = CARD_WIDTH - 54.0 - 18.0 - if button_width > 0.0 { button_width + 12.0 } else { 0.0 };
+
+    let max_width = s(text_width);
+
+    match inner.button {
+        Some(button) => {
+            let (bx, by) = (x + CARD_WIDTH - 16.0 - button_width, y + (CARD_HEIGHT - BUTTON_HEIGHT) / 2.0);
+
+            BUTTON_AREA.set(Some((button, s(bx), s(by), s(button_width), s(BUTTON_HEIGHT))));
+
+            let hover = if MOUSE_OVER_BUTTON.get() { 1.0 } else { 0.0 };
+
+            let fill = match button {
+                Button::Cancel => mix([45, 49, 59, 255], [60, 65, 78, 255], hover),
+                Button::OpenStore => mix(ACCENT_DARK, ACCENT, hover),
+            };
+
+            render::fill(
+                pixmap,
+                &render::rounded_rect(s(bx), s(by), s(button_width), s(BUTTON_HEIGHT), s(8.0)),
+                with_alpha(fill, appear),
+            );
+
+            text::draw_centered(
+                pixmap,
+                &fonts.semibold,
+                s(12.5),
+                button.label(),
+                s(bx + button_width / 2.0),
+                s(by + BUTTON_HEIGHT / 2.0),
+                with_alpha(TEXT, appear),
+            );
+        }
+
+        None => BUTTON_AREA.set(None),
+    }
 
     let title = ellipsize(&fonts.semibold, s(14.0), &title, max_width);
 
     let width = text::measure(&fonts.semibold, s(14.0), &title);
 
     // Есть вторая строка (прогресс или подсказка) — заголовок выше центра.
-    let second_line = (inner.mode == Mode::Working && total > 1) || inner.mode == Mode::Error;
+    let show_bar = inner.mode == Mode::Working && (total > 1 || percent > 0);
+
+    let detail = if inner.mode == Mode::Working { None } else { inner.detail.as_deref() };
+
+    let second_line = show_bar || detail.is_some();
 
     let title_y = if second_line { y + 23.0 } else { y + CARD_HEIGHT / 2.0 - 1.0 };
 
@@ -487,9 +688,9 @@ fn paint(pixmap: &mut Pixmap, inner: &Inner, done: usize, total: usize) {
     );
 
     // Полоса прогресса для пачки файлов.
-    if inner.mode == Mode::Working && total > 1 {
+    if show_bar {
         let bar_x = text_x;
-        let bar_width = CARD_WIDTH - 54.0 - 18.0;
+        let bar_width = text_width;
         let bar_y = y + CARD_HEIGHT - 14.0;
 
         render::fill(
@@ -503,19 +704,94 @@ fn paint(pixmap: &mut Pixmap, inner: &Inner, done: usize, total: usize) {
             &render::rounded_rect(s(bar_x), s(bar_y), s(bar_width * inner.progress.max(0.02)), s(3.0), s(1.5)),
             with_alpha(ACCENT, appear),
         );
-    } else if inner.mode == Mode::Error {
-        let hint = "Подробности — в консоли";
+    } else if let Some(detail) = detail {
+        let detail = ellipsize(&fonts.regular, s(12.5), detail, max_width);
 
-        let width = text::measure(&fonts.regular, s(11.5), hint);
+        let width = text::measure(&fonts.regular, s(12.5), &detail);
 
         text::draw_centered(
             pixmap,
             &fonts.regular,
-            s(11.5),
-            hint,
+            s(12.5),
+            &detail,
             s(text_x) + width / 2.0,
-            s(y + CARD_HEIGHT - 13.0),
+            s(y + CARD_HEIGHT - 16.0),
             with_alpha(TEXT_MUTED, appear),
         );
+    }
+}
+
+fn button_at(x: f32, y: f32) -> Option<Button> {
+    BUTTON_AREA.get().and_then(|(button, bx, by, width, height)| {
+        (x >= bx && x < bx + width && y >= by && y < by + height).then_some(button)
+    })
+}
+
+fn mouse_point(lparam: LPARAM) -> (f32, f32) {
+    (
+        (lparam as u32 & 0xFFFF) as i16 as f32,
+        ((lparam as u32 >> 16) & 0xFFFF) as i16 as f32,
+    )
+}
+
+unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        // Клик по окну не должен забирать фокус у Проводника.
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+
+        WM_MOUSEMOVE => {
+            if !MOUSE_OVER_CARD.get() {
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+
+                unsafe {
+                    TrackMouseEvent(&mut track);
+                }
+            }
+
+            MOUSE_OVER_CARD.set(true);
+
+            let (x, y) = mouse_point(lparam);
+
+            MOUSE_OVER_BUTTON.set(button_at(x, y).is_some());
+
+            0
+        }
+
+        WM_MOUSELEAVE => {
+            MOUSE_OVER_CARD.set(false);
+            MOUSE_OVER_BUTTON.set(false);
+
+            0
+        }
+
+        WM_SETCURSOR => {
+            let cursor = if MOUSE_OVER_BUTTON.get() { IDC_HAND } else { IDC_ARROW };
+
+            unsafe {
+                SetCursor(LoadCursorW(null_mut(), cursor));
+            }
+
+            1
+        }
+
+        // Само действие выполняет главный цикл: окно только сообщает о нажатии.
+        WM_LBUTTONDOWN => {
+            let (x, y) = mouse_point(lparam);
+
+            if let Some(button) = button_at(x, y) {
+                unsafe {
+                    PostMessageW(hwnd, WM_STATUS_BUTTON, button as usize, 0);
+                }
+            }
+
+            0
+        }
+
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }

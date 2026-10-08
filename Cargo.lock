@@ -343,6 +343,7 @@ dependencies = [
  "sha2",
  "tiny-skia",
  "windows",
+ "windows-future",
  "windows-sys",
  "zip",
 ]

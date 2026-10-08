@@ -48,7 +48,7 @@ const HEIGHT: f32 = 640.0;
 const PADDING: f32 = 32.0;
 
 const TABS_Y: f32 = 88.0;
-const TAB_WIDTH: f32 = 128.0;
+const TAB_WIDTH: f32 = 124.0;
 const TAB_HEIGHT: f32 = 38.0;
 
 const CARD_X: f32 = PADDING;

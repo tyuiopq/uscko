@@ -25,7 +25,6 @@ unsafe extern "C" {
 
     fn filehalo_dialog_show_files(dialog: HWND, paths: *const u16, select: i32) -> i32;
 
-    fn filehalo_dialog_refresh(dialog: HWND);
 }
 
 unsafe extern "C" fn collect_path(context: *mut c_void, path: *const u16) {
@@ -138,12 +137,13 @@ pub fn put_into_dialog(dialog: isize, outputs: &[PathBuf]) -> bool {
 // они выделяются и попадают в поле «Имя файла». В «Сохранить» ничего не
 // выделяется: имя попало бы в поле и при сохранении перезаписало бы результат.
 //
-// Окно замечает новые файлы не сразу, поэтому пробуем несколько раз; если
-// само не обновилось — просим обновиться (как F5). Всё в фоновом потоке:
-// зависшая чужая программа не должна подвесить FileHalo.
+// Окно замечает новые файлы само, но не сразу (под нагрузкой — секунды),
+// поэтому пробуем несколько раз. Обновлять его принудительно (F5) нельзя:
+// обновление сбрасывает выделение, в том числе только что сделанное. Не
+// дождались — в «Открыть» в поле «Имя файла» всё равно будет полный путь.
+// Всё в фоновом потоке: зависшая чужая программа не должна подвесить FileHalo.
 pub fn deliver_to_dialog(dialog: isize, outputs: Vec<PathBuf>) -> std::thread::JoinHandle<()> {
-    const ATTEMPTS: u32 = 40;
-    const REFRESH_AT: u32 = 12;
+    const ATTEMPTS: u32 = 50;
     const PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 
     std::thread::spawn(move || {
@@ -182,11 +182,9 @@ pub fn deliver_to_dialog(dialog: isize, outputs: Vec<PathBuf>) -> std::thread::J
                 _ => {}
             }
 
-            if attempt == REFRESH_AT {
-                unsafe { filehalo_dialog_refresh(window) };
+            if attempt + 1 < ATTEMPTS {
+                std::thread::sleep(PAUSE);
             }
-
-            std::thread::sleep(PAUSE);
         }
 
         // Выделенный файл окно само вписало в поле «Имя файла» (а запись в

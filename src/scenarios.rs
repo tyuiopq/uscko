@@ -1265,24 +1265,39 @@ mod dialogs {
         (window as isize, thread)
     }
 
+    // UI Automation — в отдельном свежем потоке: потоки тестов переиспользуются,
+    // и COM в них мог остаться настроенным другим тестом.
+    fn in_fresh_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::spawn(work).join().unwrap()
+    }
+
     // Выделяет в списке файлов диалога элементы, имена которых начинаются с stems.
     fn select(window: isize, stems: &[&str]) {
+        let stems: Vec<String> = stems.iter().map(|stem| stem.to_string()).collect();
+
+        in_fresh_thread(move || select_now(window, &stems));
+    }
+
+    fn select_now(window: isize, stems: &[String]) {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
-            let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).unwrap();
-
-            let condition = automation.CreateTrueCondition().unwrap();
-
             let started = std::time::Instant::now();
 
-            // Окно и список создаются и заполняются не сразу.
+            // Окно и список создаются и заполняются не сразу. UI Automation в
+            // одном процессе с окном (только в этом тесте) иногда отвечает
+            // «неопознанной ошибкой» — тогда просто пробуем ещё раз.
             let items = loop {
                 assert!(started.elapsed().as_secs() < 10, "файлы в диалоге не появились");
 
-                let Ok(items) = automation
-                    .ElementFromHandle(WinHwnd(file_view(window) as _))
-                    .and_then(|root| root.FindAll(TreeScope_Descendants, &condition))
+                let Ok(items) = CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+                    .and_then(|automation| {
+                        let condition = automation.CreateTrueCondition()?;
+
+                        automation
+                            .ElementFromHandle(WinHwnd(file_view(window) as _))?
+                            .FindAll(TreeScope_Descendants, &condition)
+                    })
                 else {
                     std::thread::sleep(std::time::Duration::from_millis(50));
 
@@ -1422,6 +1437,10 @@ mod dialogs {
 
     // Имена выделенных элементов в списке файлов диалога.
     fn selected_in_list(window: isize) -> Vec<String> {
+        in_fresh_thread(move || selected_in_list_now(window))
+    }
+
+    fn selected_in_list_now(window: isize) -> Vec<String> {
         use windows::Win32::UI::Accessibility::{IUIAutomationSelectionPattern, UIA_ListControlTypeId, UIA_SelectionPatternId};
 
         unsafe {

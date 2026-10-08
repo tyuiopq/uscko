@@ -16,7 +16,7 @@ use crate::output;
 
 pub fn strip(source: &Path) -> Result<PathBuf, ActionError> {
     let bytes = std::fs::read(source)
-        .map_err(|error| format!("Could not read {}: {error}", source.display()))?;
+        .map_err(|error| crate::errors::io("Не удалось прочитать файл", &error))?;
 
     let orientation = read_orientation(source);
 
@@ -27,7 +27,7 @@ pub fn strip(source: &Path) -> Result<PathBuf, ActionError> {
 
         Some(ImageKind::WebP) => strip_webp(&bytes, orientation)?,
 
-        _ => return Err(ActionError::Failed("Unsupported format".to_string())),
+        _ => return Err(ActionError::Failed("Этот формат не поддерживается".to_string())),
     };
 
     if cleaned == bytes {
@@ -46,7 +46,7 @@ pub fn strip(source: &Path) -> Result<PathBuf, ActionError> {
 
         writer
             .write_all(&cleaned)
-            .map_err(|error| format!("Could not write output: {error}"))
+            .map_err(|error| crate::errors::io("Не удалось записать результат", &error))
     })?)
 }
 
@@ -85,7 +85,7 @@ fn strip_jpeg(bytes: &[u8], orientation: u8) -> Result<Vec<u8>, String> {
     const SOS: u8 = 0xDA;
     const EOI: u8 = 0xD9;
 
-    let invalid = || "Unexpected JPEG structure".to_string();
+    let invalid = || "Файл JPG повреждён".to_string();
 
     if !bytes.starts_with(&[0xFF, 0xD8]) {
         return Err(invalid());
@@ -178,7 +178,7 @@ fn strip_jpeg(bytes: &[u8], orientation: u8) -> Result<Vec<u8>, String> {
 fn strip_png(bytes: &[u8], orientation: u8) -> Result<Vec<u8>, String> {
     const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
-    let invalid = || "Unexpected PNG structure".to_string();
+    let invalid = || "Файл PNG повреждён".to_string();
 
     if !bytes.starts_with(SIGNATURE) {
         return Err(invalid());

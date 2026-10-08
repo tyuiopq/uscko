@@ -9,7 +9,7 @@ use image::{DynamicImage, RgbImage, RgbaImage};
 use crate::converter::DecodedImage;
 
 pub fn decode(path: &Path) -> Result<DecodedImage, String> {
-    let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|error| crate::errors::io("Не удалось прочитать файл", &error))?;
 
     let has_alpha = heic_rs::probe(&bytes)
         .map(|info| info.has_alpha)
@@ -28,7 +28,7 @@ pub fn decode(path: &Path) -> Result<DecodedImage, String> {
         .with_alpha(has_alpha);
 
     let decoded = heic_rs::decode(&bytes, &options)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+        .map_err(|error| crate::errors::fail("Фото HEIC повреждено или не поддерживается", error))?;
 
     let image = if has_alpha {
         RgbaImage::from_raw(decoded.width, decoded.height, decoded.data)
@@ -37,7 +37,7 @@ pub fn decode(path: &Path) -> Result<DecodedImage, String> {
         RgbImage::from_raw(decoded.width, decoded.height, decoded.data)
             .map(DynamicImage::ImageRgb8)
     }
-    .ok_or_else(|| format!("{}: unexpected pixel data size", path.display()))?;
+    .ok_or_else(|| "Фото HEIC повреждено или не поддерживается".to_string())?;
 
     // iPhone снимает в Display P3: без профиля цвета были бы блёклыми.
     let icc_profile = Context::open(&bytes).ok().and_then(|context| {

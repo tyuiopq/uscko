@@ -17,8 +17,8 @@ use windows_sys::Win32::{
 };
 
 use crate::actions::{ActionId, ActionOutcome};
-use crate::config;
 use crate::params::Params;
+use crate::{config, journal};
 
 pub const WM_FILEHALO_JOB_DONE: u32 = WM_APP + 1;
 
@@ -156,7 +156,11 @@ fn worker() {
 
         CANCEL.store(false, Ordering::Release);
 
+        log_start(&job);
+
         let outcome = run(&job);
+
+        log_outcome(&job, &outcome);
 
         // Отмена относилась к этой задаче — дальше флаг не нужен.
         CANCEL.store(false, Ordering::Release);
@@ -195,6 +199,84 @@ fn run(job: &Job) -> ActionOutcome {
             FILE_PROGRESS.store(0, Ordering::Relaxed);
         }
     })
+}
+
+// «jpg ×2, png» — что выделено, без имён файлов.
+fn extensions_summary(inputs: &[PathBuf]) -> String {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+
+    for input in inputs {
+        let extension = match input.extension() {
+            Some(extension) => extension.to_string_lossy().to_lowercase(),
+            None if input.is_dir() => "папка".to_string(),
+            None => "без расширения".to_string(),
+        };
+
+        match counts.iter_mut().find(|(known, _)| *known == extension) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((extension, 1)),
+        }
+    }
+
+    counts
+        .iter()
+        .map(|(extension, count)| if *count > 1 { format!("{extension} ×{count}") } else { extension.clone() })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn log_start(job: &Job) {
+    let detailed = job.params.log_paths();
+
+    let mut text = format!(
+        "▶ {} — {}: {}",
+        job.action.title(&job.params),
+        job.inputs.len(),
+        extensions_summary(&job.inputs)
+    );
+
+    if detailed {
+        for input in &job.inputs {
+            text.push_str(&format!("\n    · {}", input.display()));
+        }
+    }
+
+    journal::write(&text);
+}
+
+fn log_outcome(job: &Job, outcome: &ActionOutcome) {
+    let detailed = job.params.log_paths();
+
+    // Номер файла в выделении — чтобы по журналу было понятно, какой это был.
+    let label = |path: &PathBuf| {
+        let index = job.inputs.iter().position(|input| input == path).unwrap_or(0);
+
+        journal::file_label(path, index, detailed)
+    };
+
+    let mut text = format!(
+        "  итог: готово {}, пропущено {}, ошибок {}{}",
+        outcome.outputs.len(),
+        outcome.skipped.len(),
+        outcome.failures.len(),
+        if outcome.cancelled { ", отменено" } else { "" }
+    );
+
+    for (path, reason) in &outcome.skipped {
+        text.push_str(&format!("\n    пропущен {}: {reason}", label(path)));
+    }
+
+    for (path, error) in &outcome.failures {
+        text.push_str(&format!("\n    ошибка {}: {error}", label(path)));
+    }
+
+    if detailed {
+        for output in &outcome.outputs {
+            text.push_str(&format!("\n    → {}", output.display()));
+        }
+    }
+
+    journal::write(&text);
 }
 
 pub fn take_result() -> Option<JobResult> {

@@ -53,12 +53,12 @@ impl Drop for TempGuard {
 pub fn parent_of(path: &Path) -> Result<&Path, String> {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| format!("{} has no parent folder", path.display()))
+        .ok_or_else(|| "Не удалось определить папку файла".to_string())
 }
 
 pub fn stem_of(path: &Path) -> Result<&OsStr, String> {
     path.file_stem()
-        .ok_or_else(|| format!("{} has no file name", path.display()))
+        .ok_or_else(|| "Не удалось определить имя файла".to_string())
 }
 
 // Свободное имя в папке folder: "stem.ext", "stem (1).ext", ...
@@ -83,7 +83,7 @@ pub fn available_path(folder: &Path, stem: &OsStr, extension: Option<&str>) -> R
         }
     }
 
-    Err("Could not find an available output name".to_string())
+    Err("Не удалось подобрать свободное имя для результата".to_string())
 }
 
 // Результат рядом с исходником: "photo.jpg" -> "photo.png".
@@ -141,10 +141,9 @@ fn move_file(from: &Path, to: &Path, replace: bool) -> Result<(), String> {
     let ok = unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), flags) };
 
     if ok == 0 {
-        return Err(format!(
-            "Could not create {}: {}",
-            to.display(),
-            std::io::Error::last_os_error()
+        return Err(crate::errors::io(
+            "Не удалось сохранить результат",
+            &std::io::Error::last_os_error(),
         ));
     }
 
@@ -171,7 +170,7 @@ pub fn replace_file(target: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     write_through_temp(target, true, |writer| {
         writer
             .write_all(bytes)
-            .map_err(|error| format!("Could not write output: {error}"))
+            .map_err(|error| crate::errors::io("Не удалось записать результат", &error))
     })
 }
 
@@ -198,7 +197,7 @@ fn write_through_temp(
                 attempts += 1;
             }
 
-            Err(error) => return Err(format!("Could not create temporary file: {error}")),
+            Err(error) => return Err(crate::errors::io("Не удалось создать файл рядом с исходным", &error)),
         }
     };
 
@@ -214,12 +213,12 @@ fn write_through_temp(
 
         writer
             .flush()
-            .map_err(|error| format!("Could not write output: {error}"))?;
+            .map_err(|error| crate::errors::io("Не удалось записать результат", &error))?;
 
         writer
             .get_ref()
             .sync_all()
-            .map_err(|error| format!("Could not write output: {error}"))?;
+            .map_err(|error| crate::errors::io("Не удалось записать результат", &error))?;
     }
 
     move_file(guard.path(), output, replace)?;
@@ -238,7 +237,7 @@ pub fn produce_file(output: &Path, produce: impl FnOnce(&Path) -> Result<(), Str
 
     let file = temp.path().join(output.file_name().unwrap_or(OsStr::new("output")));
 
-    File::create(&file).map_err(|error| format!("Could not create temporary file: {error}"))?;
+    File::create(&file).map_err(|error| crate::errors::io("Не удалось создать файл рядом с исходным", &error))?;
 
     produce(&file)?;
 
@@ -263,11 +262,11 @@ pub fn temp_dir(folder: &Path) -> Result<TempGuard, String> {
 
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
 
-            Err(error) => return Err(format!("Could not create temporary folder: {error}")),
+            Err(error) => return Err(crate::errors::io("Не удалось создать папку рядом с исходным", &error)),
         }
     }
 
-    Err("Could not create temporary folder".to_string())
+    Err("Не удалось создать папку рядом с исходным".to_string())
 }
 
 // Переносит готовую временную папку (или файл внутри неё) на место target.

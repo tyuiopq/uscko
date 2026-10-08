@@ -151,14 +151,14 @@ fn report_progress(percent: f64) {
 fn transcode(source: &StorageFile, destination: &Path, profile: &MediaEncodingProfile) -> Result<(), String> {
     let destination = winrt::storage_file(destination)?;
 
-    let transcoder = MediaTranscoder::new().map_err(|error| winrt_error("Transcoder", error))?;
+    let transcoder = MediaTranscoder::new().map_err(|error| winrt_error("Не удалось перекодировать", error))?;
 
     let _ = transcoder.SetHardwareAccelerationEnabled(true);
 
     let prepared = transcoder
         .PrepareFileTranscodeAsync(source, &destination, profile)
         .and_then(|operation| operation.join())
-        .map_err(|error| winrt_error("Transcoder", error))?;
+        .map_err(|error| winrt_error("Не удалось перекодировать", error))?;
 
     if !prepared.CanTranscode().unwrap_or(false) {
         let reason = prepared
@@ -174,7 +174,7 @@ fn transcode(source: &StorageFile, destination: &Path, profile: &MediaEncodingPr
 
     let operation = prepared
         .TranscodeAsync()
-        .map_err(|error| winrt_error("Transcode", error))?;
+        .map_err(|error| winrt_error("Не удалось перекодировать", error))?;
 
     let _ = operation.SetProgress(&AsyncActionProgressHandler::<f64>::new(|_, percent| {
         if let Ok(percent) = percent.ok() {
@@ -190,7 +190,7 @@ fn transcode(source: &StorageFile, destination: &Path, profile: &MediaEncodingPr
 
     operation
         .GetResults()
-        .map_err(|error| winrt_error("Transcode", error))
+        .map_err(|error| winrt_error("Не удалось перекодировать", error))
 }
 
 // Ожидание долгой операции Windows с поддержкой «Отменить».
@@ -216,7 +216,7 @@ fn wait_for(
             // Готово или ошибка: подробности отдаст GetResults().
             Ok(_) => return Ok(()),
 
-            Err(error) => return Err(winrt_error("Operation", error)),
+            Err(error) => return Err(winrt_error("Не удалось перекодировать", error)),
         }
 
         if job_manager::is_cancelled() {
@@ -249,7 +249,7 @@ struct VideoInfo {
 fn video_info(file: &StorageFile) -> Result<VideoInfo, String> {
     let profile = MediaEncodingProfile::CreateFromFileAsync(file)
         .and_then(|operation| operation.join())
-        .map_err(|error| winrt_error("Could not read video", error))?;
+        .map_err(|error| winrt_error("Не удалось прочитать видео", error))?;
 
     let video = profile
         .Video()
@@ -304,9 +304,9 @@ fn video_profile(
     size: (u32, u32),
     bits_per_pixel: f64,
 ) -> Result<MediaEncodingProfile, String> {
-    let profile = format.profile().map_err(|error| winrt_error("Profile", error))?;
+    let profile = format.profile().map_err(|error| winrt_error("Не удалось подобрать параметры кодирования", error))?;
 
-    let video = profile.Video().map_err(|error| winrt_error("Profile", error))?;
+    let video = profile.Video().map_err(|error| winrt_error("Не удалось подобрать параметры кодирования", error))?;
 
     let bitrate = video_bitrate(info, size, bits_per_pixel);
 
@@ -320,12 +320,12 @@ fn video_profile(
             rate.SetDenominator(info.fps.1)
         });
 
-    configured.map_err(|error| winrt_error("Profile", error))?;
+    configured.map_err(|error| winrt_error("Не удалось подобрать параметры кодирования", error))?;
 
     if !info.has_audio {
         profile
             .SetAudio(None::<&AudioEncodingProperties>)
-            .map_err(|error| winrt_error("Profile", error))?;
+            .map_err(|error| winrt_error("Не удалось подобрать параметры кодирования", error))?;
     }
 
     Ok(profile)
@@ -366,7 +366,7 @@ pub fn compress_video(source: &Path, params: &Params) -> Result<PathBuf, ActionE
     let bits_per_pixel = params.video_bits_per_pixel();
 
     let original = std::fs::metadata(source)
-        .map_err(|error| format!("{}: {error}", source.display()))?
+        .map_err(|error| crate::errors::io("Не удалось прочитать файл", &error))?
         .len();
 
     // Сначала сравниваем битрейт исходника с тем, к которому сожмём: если
@@ -447,7 +447,7 @@ pub fn extract_audio(source: &Path, params: &Params) -> Result<PathBuf, String> 
 
     let profile = AudioFormat::Mp3
         .profile(params)
-        .map_err(|error| winrt_error("Profile", error))?;
+        .map_err(|error| winrt_error("Не удалось подобрать параметры кодирования", error))?;
 
     output::produce_file(&output::next_to(source, "mp3")?, |temp| transcode(&file, temp, &profile))
 }
@@ -457,7 +457,7 @@ pub fn convert_audio(source: &Path, format: AudioFormat, params: &Params) -> Res
 
     let file = winrt::storage_file(source)?;
 
-    let profile = format.profile(params).map_err(|error| winrt_error("Profile", error))?;
+    let profile = format.profile(params).map_err(|error| winrt_error("Не удалось подобрать параметры кодирования", error))?;
 
     output::produce_file(&output::next_to(source, format.extension())?, |temp| {
         transcode(&file, temp, &profile)
@@ -470,7 +470,7 @@ fn render(composition: &MediaComposition, destination: &Path, profile: &MediaEnc
 
     let operation = composition
         .RenderToFileWithProfileAsync(&destination, MediaTrimmingPreference::Precise, profile)
-        .map_err(|error| winrt_error("Render", error))?;
+        .map_err(|error| winrt_error("Не удалось склеить", error))?;
 
     let _ = operation.SetProgress(&AsyncOperationProgressHandler::<TranscodeFailureReason, f64>::new(
         |_, percent| {
@@ -488,7 +488,7 @@ fn render(composition: &MediaComposition, destination: &Path, profile: &MediaEnc
 
     let reason = operation
         .GetResults()
-        .map_err(|error| winrt_error("Render", error))?;
+        .map_err(|error| winrt_error("Не удалось склеить", error))?;
 
     if reason == TranscodeFailureReason::None {
         Ok(())
@@ -500,20 +500,20 @@ fn render(composition: &MediaComposition, destination: &Path, profile: &MediaEnc
 // Склеивает ролики по порядку в один MP4 с параметрами первого.
 // Прогресс — по рендерингу: ролики добавляются мгновенно.
 pub fn merge_videos(files: &[PathBuf]) -> Result<PathBuf, String> {
-    let first = files.first().ok_or("No videos")?;
+    let first = files.first().ok_or("Нет видео")?;
 
     let _com = winrt::ComScope::new();
 
-    let composition = MediaComposition::new().map_err(|error| winrt_error("Composition", error))?;
+    let composition = MediaComposition::new().map_err(|error| winrt_error("Не удалось склеить", error))?;
 
-    let clips = composition.Clips().map_err(|error| winrt_error("Composition", error))?;
+    let clips = composition.Clips().map_err(|error| winrt_error("Не удалось склеить", error))?;
 
     for path in files {
         let clip = MediaClip::CreateFromFileAsync(&winrt::storage_file(path)?)
             .and_then(|operation| operation.join())
-            .map_err(|error| winrt_error(&format!("Could not open {}", path.display()), error))?;
+            .map_err(|error| winrt_error("Не удалось открыть файл", error))?;
 
-        clips.Append(&clip).map_err(|error| winrt_error("Composition", error))?;
+        clips.Append(&clip).map_err(|error| winrt_error("Не удалось склеить", error))?;
     }
 
     let info = video_info(&winrt::storage_file(first)?)?;
@@ -529,7 +529,7 @@ pub fn merge_videos(files: &[PathBuf]) -> Result<PathBuf, String> {
 // поэтому под звук подкладывается пустой клип нужной длины, а в файл
 // пишется только звук.
 pub fn merge_audio(files: &[PathBuf], params: &Params) -> Result<PathBuf, String> {
-    let first = files.first().ok_or("No audio files")?;
+    let first = files.first().ok_or("Нет аудио")?;
 
     let format = if crate::file_types::has_extension(first, "m4a") {
         AudioFormat::M4a
@@ -539,39 +539,39 @@ pub fn merge_audio(files: &[PathBuf], params: &Params) -> Result<PathBuf, String
 
     let _com = winrt::ComScope::new();
 
-    let composition = MediaComposition::new().map_err(|error| winrt_error("Composition", error))?;
+    let composition = MediaComposition::new().map_err(|error| winrt_error("Не удалось склеить", error))?;
 
     let tracks = composition
         .BackgroundAudioTracks()
-        .map_err(|error| winrt_error("Composition", error))?;
+        .map_err(|error| winrt_error("Не удалось склеить", error))?;
 
     let mut offset = 0.0;
 
     for path in files {
         let track = BackgroundAudioTrack::CreateFromFileAsync(&winrt::storage_file(path)?)
             .and_then(|operation| operation.join())
-            .map_err(|error| winrt_error(&format!("Could not open {}", path.display()), error))?;
+            .map_err(|error| winrt_error("Не удалось открыть файл", error))?;
 
-        let duration = seconds(track.OriginalDuration().map_err(|error| winrt_error("Duration", error))?);
+        let duration = seconds(track.OriginalDuration().map_err(|error| winrt_error("Не удалось определить длительность", error))?);
 
         track
             .SetDelay(span(offset))
             .and_then(|_| tracks.Append(&track))
-            .map_err(|error| winrt_error("Composition", error))?;
+            .map_err(|error| winrt_error("Не удалось склеить", error))?;
 
         offset += duration;
     }
 
     let black = windows::UI::Color { A: 255, R: 0, G: 0, B: 0 };
 
-    let clip = MediaClip::CreateFromColor(black, span(offset)).map_err(|error| winrt_error("Composition", error))?;
+    let clip = MediaClip::CreateFromColor(black, span(offset)).map_err(|error| winrt_error("Не удалось склеить", error))?;
 
     composition
         .Clips()
         .and_then(|clips| clips.Append(&clip))
-        .map_err(|error| winrt_error("Composition", error))?;
+        .map_err(|error| winrt_error("Не удалось склеить", error))?;
 
-    let profile = format.profile(params).map_err(|error| winrt_error("Profile", error))?;
+    let profile = format.profile(params).map_err(|error| winrt_error("Не удалось подобрать параметры кодирования", error))?;
 
     output::produce_file(&output::next_to_with_suffix(first, "склеено", format.extension())?, |temp| {
         render(&composition, temp, &profile)

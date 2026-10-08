@@ -14,8 +14,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::file_types::{self, ImageKind};
+use crate::icons::Icon;
 use crate::media::{self, AudioFormat, VideoFormat};
 use crate::params::Params;
+use crate::undo::{self, Step};
 use crate::{archive, converter, file_tools, job_manager, metadata, pdf};
 
 pub struct Selection {
@@ -204,6 +206,8 @@ pub struct ActionOutcome {
     pub rename: bool,
     // Пользователь нажал «Отменить»: готовое до этого момента остаётся.
     pub cancelled: bool,
+    // Как отменить сделанное (кнопка «Отменить» в окне «Готово»).
+    pub undo: Vec<Step>,
 }
 
 impl ActionId {
@@ -320,6 +324,35 @@ impl ActionId {
             Self::ConvertToFlac => "Конвертировать в FLAC",
             Self::MergeAudio => "Склеить аудио",
         }
+    }
+
+    // Иконка на секции колеса. Конвертации в разные форматы делят одну
+    // иконку по типу результата — различает их подпись.
+    pub fn icon(self) -> Icon {
+        match self {
+            Self::ConvertToPng | Self::ConvertToJpeg | Self::ConvertToWebp | Self::PdfToImages => Icon::Picture,
+            Self::ImagesToPdf => Icon::Document,
+            Self::CompressImages | Self::CompressVideo => Icon::Compress,
+            Self::ResizeImages | Self::VideoTo720p => Icon::Resize,
+            Self::StripMetadata => Icon::NoLocation,
+            Self::MergePdfs | Self::MergeVideos | Self::MergeAudio => Icon::Merge,
+            Self::CreateZip => Icon::Archive,
+            Self::ExtractArchive => Icon::Extract,
+            Self::RotateLeft => Icon::RotateLeft,
+            Self::RotateRight => Icon::RotateRight,
+            Self::ConvertToIco => Icon::AppIcon,
+            Self::CopyPath => Icon::Copy,
+            Self::Sha256 => Icon::Hash,
+            Self::IntoNewFolder => Icon::NewFolder,
+            Self::ConvertToMp4 | Self::ConvertToWmv => Icon::Film,
+            Self::ExtractAudio => Icon::Sound,
+            Self::ConvertToMp3 | Self::ConvertToM4a | Self::ConvertToWav | Self::ConvertToFlac => Icon::Music,
+        }
+    }
+
+    // Действие перезаписывает исходный файл, а не создаёт новый.
+    fn modifies_in_place(self) -> bool {
+        matches!(self, Self::RotateLeft | Self::RotateRight)
     }
 
     // Действие «много файлов -> один результат» (склейка, PDF, архив).
@@ -478,6 +511,22 @@ impl ActionId {
             Self::IntoNewFolder => {
                 match file_tools::into_new_folder(inputs) {
                     Ok((folder, failures)) => {
+                        outcome.undo.push(Step::Created(folder.clone()));
+
+                        // Отменять можно только то, что действительно переехало.
+                        for input in inputs {
+                            if failures.iter().any(|(failed, _)| failed == input) {
+                                continue;
+                            }
+
+                            if let Some(name) = input.file_name() {
+                                outcome.undo.push(Step::Moved {
+                                    from: input.clone(),
+                                    to: folder.join(name),
+                                });
+                            }
+                        }
+
                         outcome.outputs.push(folder);
 
                         outcome.failures = failures;
@@ -517,7 +566,11 @@ impl ActionId {
 
         if let Some(result) = combined {
             match result {
-                Ok(output) => outcome.outputs.push(output),
+                Ok(output) => {
+                    outcome.undo.push(Step::Created(output.clone()));
+
+                    outcome.outputs.push(output);
+                }
 
                 Err(error) if error == job_manager::CANCELLED => outcome.cancelled = true,
 
@@ -540,8 +593,45 @@ impl ActionId {
                 break;
             }
 
-            match self.process_one(input, params) {
-                Ok(output) => outcome.outputs.push(output),
+            // Действие меняет сам файл — сначала копия для «Отменить».
+            let backup = if self.modifies_in_place() {
+                match undo::backup(input) {
+                    Ok(backup) => Some(backup),
+
+                    Err(error) => {
+                        outcome.failures.push((input.clone(), error));
+
+                        report(index + 1);
+
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let result = self.process_one(input, params);
+
+            if result.is_err()
+                && let Some(backup) = &backup
+            {
+                let _ = std::fs::remove_file(backup);
+            }
+
+            match result {
+                Ok(output) => {
+                    outcome.undo.push(match backup {
+                        Some(backup) => Step::Replaced {
+                            target: output.clone(),
+                            backup,
+                            stamp: undo::stamp(&output),
+                        },
+
+                        None => Step::Created(output.clone()),
+                    });
+
+                    outcome.outputs.push(output);
+                }
 
                 Err(ActionError::Skipped(reason)) => {
                     outcome.skipped.push((input.clone(), reason))

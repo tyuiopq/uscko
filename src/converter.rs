@@ -16,7 +16,7 @@ use image::{
 use crate::actions::ActionError;
 use crate::file_types::{self, ImageKind};
 use crate::params::Params;
-use crate::{heic, metadata, output};
+use crate::{errors, heic, metadata, output};
 
 // Поворот пересохраняет PNG/WebP/редкие JPEG: качество повыше, чтобы
 // несколько поворотов подряд не портили картинку.
@@ -41,11 +41,11 @@ pub fn decode(source: &Path) -> Result<DecodedImage, String> {
     }
 
     let mut decoder = ImageReader::open(source)
-        .map_err(|error| format!("Could not open source image: {error}"))?
+        .map_err(|error| errors::io("Не удалось открыть картинку", &error))?
         .with_guessed_format()
-        .map_err(|error| format!("Could not detect image format: {error}"))?
+        .map_err(|error| errors::io("Не удалось открыть картинку", &error))?
         .into_decoder()
-        .map_err(|error| format!("Could not read image header: {error}"))?;
+        .map_err(|error| errors::fail("Картинка повреждена или формат не поддерживается", error))?;
 
     // Фото с телефонов хранят поворот в EXIF, а не в пикселях.
     let orientation = decoder
@@ -56,7 +56,7 @@ pub fn decode(source: &Path) -> Result<DecodedImage, String> {
     let icc_profile = decoder.icc_profile().ok().flatten();
 
     let mut image = DynamicImage::from_decoder(decoder)
-        .map_err(|error| format!("Could not decode image: {error}"))?;
+        .map_err(|error| errors::fail("Картинка повреждена или формат не поддерживается", error))?;
 
     image.apply_orientation(orientation);
 
@@ -147,7 +147,7 @@ pub fn encode(
 
             image
                 .write_with_encoder(encoder)
-                .map_err(|error| format!("PNG encoding failed: {error}"))?;
+                .map_err(|error| errors::fail("Не удалось сохранить PNG", error))?;
         }
 
         Encoding::Jpeg { quality } => {
@@ -163,7 +163,7 @@ pub fn encode(
                 .as_ref()
                 .unwrap_or(image)
                 .write_with_encoder(encoder)
-                .map_err(|error| format!("JPEG encoding failed: {error}"))?;
+                .map_err(|error| errors::fail("Не удалось сохранить JPG", error))?;
         }
 
         Encoding::WebP { quality } => {
@@ -182,7 +182,7 @@ fn save_bytes(bytes: &[u8], output: &Path) -> Result<PathBuf, String> {
     output::write_file(output, |writer| {
         writer
             .write_all(bytes)
-            .map_err(|error| format!("Could not write output: {error}"))
+            .map_err(|error| errors::io("Не удалось записать результат", &error))
     })
 }
 
@@ -217,7 +217,7 @@ pub fn convert(source: &Path, target: ImageKind, params: &Params) -> Result<Path
             quality: webp_quality(source, params),
         },
 
-        other => return Err(format!("Cannot save as {other:?}")),
+        _ => return Err("В этот формат сохранять нельзя".to_string()),
     };
 
     let bytes = encode(&decoded.image, decoded.icc_profile.as_deref(), encoding)?;
@@ -249,7 +249,7 @@ pub fn to_ico(source: &Path) -> Result<PathBuf, String> {
         let scaled = imageops::resize(&square, size, size, FilterType::Lanczos3);
 
         let frame = IcoFrame::as_png(scaled.as_raw(), size, size, ExtendedColorType::Rgba8)
-            .map_err(|error| format!("ICO encoding failed: {error}"))?;
+            .map_err(|error| errors::fail("Не удалось сохранить значок", error))?;
 
         frames.push(frame);
     }
@@ -257,7 +257,7 @@ pub fn to_ico(source: &Path) -> Result<PathBuf, String> {
     output::write_file(&output::next_to(source, "ico")?, |writer| {
         IcoEncoder::new(writer)
             .encode_images(&frames)
-            .map_err(|error| format!("ICO encoding failed: {error}"))
+            .map_err(|error| errors::fail("Не удалось сохранить значок", error))
     })
 }
 
@@ -266,10 +266,10 @@ pub fn to_ico(source: &Path) -> Result<PathBuf, String> {
 pub fn rotate(source: &Path, clockwise: bool) -> Result<PathBuf, ActionError> {
     let kind = file_types::image_kind(source)
         .filter(|kind| kind.is_editable())
-        .ok_or_else(|| ActionError::Failed("Cannot rotate this format".to_string()))?;
+        .ok_or_else(|| ActionError::Failed("Этот формат повернуть нельзя".to_string()))?;
 
     let original = std::fs::read(source)
-        .map_err(|error| format!("Could not read {}: {error}", source.display()))?;
+        .map_err(|error| errors::io("Не удалось прочитать файл", &error))?;
 
     if kind == ImageKind::Jpeg
         && let Some(rotated) = metadata::rotate_jpeg_orientation(&original, clockwise)
@@ -310,7 +310,7 @@ pub fn rotate(source: &Path, clockwise: bool) -> Result<PathBuf, ActionError> {
 // Тот же формат, но меньше по размеру файла.
 pub fn compress(source: &Path, params: &Params) -> Result<PathBuf, ActionError> {
     let original_size = std::fs::metadata(source)
-        .map_err(|error| format!("Could not read {}: {error}", source.display()))?
+        .map_err(|error| errors::io("Не удалось прочитать файл", &error))?
         .len();
 
     let decoded = decode(source)?;
@@ -426,7 +426,7 @@ fn encode_webp(image: &DynamicImage, quality: Option<f32>) -> Result<Vec<u8>, St
     };
 
     if size == 0 || output.is_null() {
-        return Err("WebP encoding failed".to_string());
+        return Err("Не удалось сохранить WebP".to_string());
     }
 
     let bytes = unsafe { std::slice::from_raw_parts(output, size) }.to_vec();
@@ -498,7 +498,7 @@ fn embed_webp_icc_profile(
             }
         }
 
-        None => return Err("Unexpected WebP structure".to_string()),
+        None => return Err("Файл WebP повреждён".to_string()),
     }
 
     Ok(riff_from_body(body))
@@ -516,7 +516,7 @@ pub fn riff_from_body(body: Vec<u8>) -> Vec<u8> {
 
 // Чанки файла WebP (RIFF): (тип, содержимое).
 pub fn webp_chunks(webp: &[u8]) -> Result<Vec<([u8; 4], &[u8])>, String> {
-    let invalid = || "Unexpected WebP structure".to_string();
+    let invalid = || "Файл WebP повреждён".to_string();
 
     if webp.len() < 12 || &webp[0..4] != b"RIFF" || &webp[8..12] != b"WEBP" {
         return Err(invalid());

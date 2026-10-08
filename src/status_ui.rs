@@ -1,4 +1,5 @@
 // Окно статуса в углу экрана: «Обработка 3 из 12», «✓ photo.png», «Ошибка».
+// Подсказки («Ничего не выделено») — рядом с курсором.
 // Своя отрисовка с попиксельной прозрачностью: карточка с тенью, индикатор,
 // полоса прогресса, плавное появление и исчезновение.
 
@@ -29,7 +30,7 @@ use crate::render::{
 use crate::{dpi, job_manager, text};
 
 // Карточка и запас вокруг неё под тень.
-const CARD_WIDTH: f32 = 360.0;
+const CARD_WIDTH: f32 = 400.0;
 const CARD_HEIGHT: f32 = 60.0;
 const SHADOW: f32 = 20.0;
 
@@ -59,6 +60,12 @@ const SUCCESS_VISIBLE_MS: u32 = 1200;
 const DETAIL_VISIBLE_MS: u32 = 3000;
 const ERROR_VISIBLE_MS: u32 = 4500;
 const ACTION_VISIBLE_MS: u32 = 10_000;
+// Итог с кнопкой «Отменить» — чтобы успеть передумать.
+const UNDO_VISIBLE_MS: u32 = 5000;
+const HINT_VISIBLE_MS: u32 = 2500;
+
+// Подсказка у курсора: смещение карточки от него.
+const HINT_OFFSET: f32 = 18.0;
 // Пока мышь над окном, оно не исчезает: проверяем снова через это время.
 const HOVER_RECHECK_MS: u32 = 800;
 
@@ -78,12 +85,16 @@ enum Mode {
     // «уже сжато», «уже не больше 720p» и т. п.
     Skipped,
     Error,
+    // Подсказка: ничего не сломалось, просто нужно сделать иначе.
+    Info,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
     Cancel = 1,
     OpenStore = 2,
+    Undo = 3,
+    OpenLog = 4,
 }
 
 impl Button {
@@ -91,6 +102,8 @@ impl Button {
         match code {
             1 => Some(Self::Cancel),
             2 => Some(Self::OpenStore),
+            3 => Some(Self::Undo),
+            4 => Some(Self::OpenLog),
             _ => None,
         }
     }
@@ -99,6 +112,8 @@ impl Button {
         match self {
             Self::Cancel => "Отменить",
             Self::OpenStore => "Открыть Store",
+            Self::Undo => "Отменить",
+            Self::OpenLog => "Подробнее",
         }
     }
 }
@@ -236,14 +251,14 @@ impl StatusUi {
     // Итог задачи. always — показать, даже если задача была быстрой и окно
     // ещё не появлялось. Пропуски и ошибки показываются всегда: иначе
     // кажется, что ничего не произошло.
-    // offer_store — показать кнопку «Открыть Store» (не хватает расширения).
+    // button — кнопка на карточке: «Открыть Store», «Отменить», «Подробнее».
     pub unsafe fn finish(
         &self,
         outcome: Outcome,
         text: String,
         detail: Option<String>,
         always: bool,
-        offer_store: bool,
+        button: Option<Button>,
     ) {
         unsafe {
             KillTimer(self.hwnd, TIMER_DELAY_ID);
@@ -254,14 +269,10 @@ impl StatusUi {
         let visible = {
             let mut inner = self.inner.borrow_mut();
 
-            inner.mode = match outcome {
-                Outcome::Success => Mode::Success,
-                Outcome::Skipped => Mode::Skipped,
-                Outcome::Error => Mode::Error,
-            };
+            inner.mode = mode_of(outcome);
             inner.text = text;
             inner.detail = detail;
-            inner.button = offer_store.then_some(Button::OpenStore);
+            inner.button = button;
             inner.cancelling = false;
             inner.hiding = false;
 
@@ -276,7 +287,8 @@ impl StatusUi {
         }
 
         let duration = match outcome {
-            _ if offer_store => ACTION_VISIBLE_MS,
+            _ if button == Some(Button::OpenStore) => ACTION_VISIBLE_MS,
+            _ if button == Some(Button::Undo) => UNDO_VISIBLE_MS,
             Outcome::Error => ERROR_VISIBLE_MS,
             _ if has_detail => DETAIL_VISIBLE_MS,
             _ => SUCCESS_VISIBLE_MS,
@@ -284,10 +296,37 @@ impl StatusUi {
 
         unsafe {
             if !visible {
-                self.show();
+                self.show(false);
             }
 
             SetTimer(self.hwnd, TIMER_HIDE_ID, duration, None);
+        }
+    }
+
+    // Подсказка у курсора: «Ничего не выделено» и что сделать. Если окно уже
+    // показано (идёт задача) — на его месте, чтобы не прыгало.
+    pub unsafe fn hint(&self, text: &str, detail: &str) {
+        let visible = {
+            let mut inner = self.inner.borrow_mut();
+
+            inner.mode = Mode::Info;
+            inner.text = text.to_string();
+            inner.detail = Some(detail.to_string());
+            inner.button = None;
+            inner.cancelling = false;
+            inner.hiding = false;
+
+            inner.visible
+        };
+
+        unsafe {
+            KillTimer(self.hwnd, TIMER_DELAY_ID);
+
+            if !visible {
+                self.show(true);
+            }
+
+            SetTimer(self.hwnd, TIMER_HIDE_ID, HINT_VISIBLE_MS, None);
         }
     }
 
@@ -312,7 +351,7 @@ impl StatusUi {
         }
 
         unsafe {
-            self.show();
+            self.show(false);
 
             SetTimer(self.hwnd, TIMER_HIDE_ID, ACTION_VISIBLE_MS, None);
         }
@@ -324,7 +363,7 @@ impl StatusUi {
                 KillTimer(self.hwnd, TIMER_DELAY_ID);
 
                 if job_manager::is_running() {
-                    self.show();
+                    self.show(false);
                 }
             },
 
@@ -365,8 +404,9 @@ impl StatusUi {
         }
     }
 
-    // Показывает окно в углу монитора, где сейчас курсор.
-    unsafe fn show(&self) {
+    // Показывает окно в углу монитора, где сейчас курсор, или (at_cursor)
+    // рядом с самим курсором.
+    unsafe fn show(&self, at_cursor: bool) {
         let mut cursor = POINT { x: 0, y: 0 };
 
         unsafe {
@@ -390,9 +430,21 @@ impl StatusUi {
 
         let margin = dpi::scale(MARGIN as i32, inner.dpi);
 
-        inner.position = POINT {
-            x: area.right - size.0 - margin,
-            y: area.bottom - size.1 - margin,
+        inner.position = if at_cursor {
+            // Карточка справа снизу от курсора, но целиком на экране.
+            let shadow = dpi::scale(SHADOW as i32, inner.dpi);
+
+            let offset = dpi::scale(HINT_OFFSET as i32, inner.dpi);
+
+            POINT {
+                x: (cursor.x + offset - shadow).clamp(area.left - shadow, area.right - size.0 + shadow),
+                y: (cursor.y + offset - shadow).clamp(area.top - shadow, area.bottom - size.1 + shadow),
+            }
+        } else {
+            POINT {
+                x: area.right - size.0 - margin,
+                y: area.bottom - size.1 - margin,
+            }
         };
 
         inner.visible = true;
@@ -455,7 +507,7 @@ impl StatusUi {
                 ((done as f32 + job_manager::file_progress()) / total as f32).min(1.0)
             }
             Mode::Working => 0.0,
-            Mode::Success | Mode::Skipped | Mode::Error => 1.0,
+            Mode::Success | Mode::Skipped | Mode::Error | Mode::Info => 1.0,
         };
 
         render::approach(&mut inner.progress, target, 0.2, dt);
@@ -469,6 +521,14 @@ impl StatusUi {
         }
 
         true
+    }
+}
+
+fn mode_of(outcome: Outcome) -> Mode {
+    match outcome {
+        Outcome::Success => Mode::Success,
+        Outcome::Skipped => Mode::Skipped,
+        Outcome::Error => Mode::Error,
     }
 }
 
@@ -552,10 +612,11 @@ fn paint(pixmap: &mut Pixmap, inner: &Inner, done: usize, total: usize) {
             render::stroke(pixmap, &arc.finish(), with_alpha(ACCENT, appear), s(2.5));
         }
 
-        Mode::Success | Mode::Skipped | Mode::Error => {
+        Mode::Success | Mode::Skipped | Mode::Error | Mode::Info => {
             let color = match inner.mode {
                 Mode::Success => SUCCESS,
                 Mode::Skipped => WARNING,
+                Mode::Info => ACCENT,
                 _ => DANGER,
             };
 
@@ -573,6 +634,14 @@ fn paint(pixmap: &mut Pixmap, inner: &Inner, done: usize, total: usize) {
                     mark.move_to(s(icon_x - 5.0), s(icon_y));
                     mark.line_to(s(icon_x - 1.5), s(icon_y + 3.5));
                     mark.line_to(s(icon_x + 5.0), s(icon_y - 3.5));
+                }
+
+                // «i»: точка и черта.
+                Mode::Info => {
+                    mark.move_to(s(icon_x), s(icon_y - 5.0));
+                    mark.line_to(s(icon_x), s(icon_y - 4.5));
+                    mark.move_to(s(icon_x), s(icon_y - 1.5));
+                    mark.line_to(s(icon_x), s(icon_y + 5.5));
                 }
 
                 // Восклицательный знак: черта и точка.
@@ -640,7 +709,7 @@ fn paint(pixmap: &mut Pixmap, inner: &Inner, done: usize, total: usize) {
             let hover = if MOUSE_OVER_BUTTON.get() { 1.0 } else { 0.0 };
 
             let fill = match button {
-                Button::Cancel => mix([45, 49, 59, 255], [60, 65, 78, 255], hover),
+                Button::Cancel | Button::Undo | Button::OpenLog => mix([45, 49, 59, 255], [60, 65, 78, 255], hover),
                 Button::OpenStore => mix(ACCENT_DARK, ACCENT, hover),
             };
 

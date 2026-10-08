@@ -6,14 +6,9 @@ use windows::Storage::StorageFile;
 use windows::Storage::Streams::{DataReader, IRandomAccessStream};
 use windows::core::{HSTRING, Interface};
 
+// context — понятная пользователю фраза; код и текст Windows уходят в журнал.
 pub fn winrt_error(context: &str, error: windows::core::Error) -> String {
-    let message = error.message();
-
-    if message.trim().is_empty() {
-        format!("{context}: error 0x{:08X}", error.code().0)
-    } else {
-        format!("{context}: {}", message.trim())
-    }
+    crate::errors::winrt(context, &error)
 }
 
 // COM/WinRT в текущем потоке на время работы. Только STA: в MTA движки
@@ -43,36 +38,36 @@ impl Drop for ComScope {
 }
 
 pub fn storage_file(path: &Path) -> Result<StorageFile, String> {
-    let absolute = std::path::absolute(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let absolute = std::path::absolute(path).map_err(|error| crate::errors::io("Не удалось открыть файл", &error))?;
 
     StorageFile::GetFileFromPathAsync(&HSTRING::from(absolute.as_os_str()))
         .and_then(|operation| operation.join())
-        .map_err(|error| winrt_error(&format!("Could not open {}", path.display()), error))
+        .map_err(|error| winrt_error("Не удалось открыть файл", error))
 }
 
 // Всё содержимое потока WinRT в память.
 pub fn read_stream(stream: &impl Interface) -> Result<Vec<u8>, String> {
     let stream: IRandomAccessStream = stream
         .cast()
-        .map_err(|error| winrt_error("Stream", error))?;
+        .map_err(|error| winrt_error("Не удалось прочитать данные", error))?;
 
-    let length = stream.Size().map_err(|error| winrt_error("Stream", error))?;
+    let length = stream.Size().map_err(|error| winrt_error("Не удалось прочитать данные", error))?;
 
     let reader = stream
         .GetInputStreamAt(0)
         .and_then(|input| DataReader::CreateDataReader(&input))
-        .map_err(|error| winrt_error("Stream", error))?;
+        .map_err(|error| winrt_error("Не удалось прочитать данные", error))?;
 
     reader
         .LoadAsync(length as u32)
         .and_then(|operation| operation.join())
-        .map_err(|error| winrt_error("Stream", error))?;
+        .map_err(|error| winrt_error("Не удалось прочитать данные", error))?;
 
     let mut bytes = vec![0u8; length as usize];
 
     reader
         .ReadBytes(&mut bytes)
-        .map_err(|error| winrt_error("Stream", error))?;
+        .map_err(|error| winrt_error("Не удалось прочитать данные", error))?;
 
     Ok(bytes)
 }

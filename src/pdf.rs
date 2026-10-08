@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use image::{ExtendedColorType, ImageDecoder, ImageReader, metadata::Orientation};
-use lopdf::{Dictionary, Document, Object, ObjectId, Stream, dictionary};
+use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat, dictionary};
 
 use crate::converter::{self, Encoding};
 use crate::file_types::{self, ImageKind};
@@ -10,13 +10,17 @@ use crate::params::Params;
 use crate::{job_manager, output};
 use crate::winrt::{self, winrt_error};
 
-// Страница PDF из картинки: 96 пикселей на дюйм, как на экране при 100%.
+// Страница PDF размером с картинку: 96 пикселей на дюйм, как на экране при 100%.
 const IMAGE_DPI: f32 = 96.0;
+
+// Лист A4 в пунктах (1/72 дюйма).
+const A4_WIDTH: f32 = 595.28;
+const A4_HEIGHT: f32 = 841.89;
 
 const MAX_RENDER_SIDE: f32 = 10_000.0;
 
 fn pdf_error(context: &str, error: impl std::fmt::Display) -> String {
-    format!("{context}: {error}")
+    crate::errors::fail(context, error)
 }
 
 fn save_document(document: &mut Document, target: &Path) -> Result<PathBuf, String> {
@@ -25,7 +29,7 @@ fn save_document(document: &mut Document, target: &Path) -> Result<PathBuf, Stri
     output::write_file(target, |writer| {
         document
             .save_to(writer)
-            .map_err(|error| pdf_error("Could not write PDF", error))
+            .map_err(|error| pdf_error("Не удалось записать PDF", error))
     })
 }
 
@@ -172,14 +176,42 @@ fn image_object(document: &mut Document, path: &Path, params: &Params) -> Result
     Ok((document.add_object(stream), width, height))
 }
 
-// Каждая картинка — отдельная страница её размера. Результат рядом с первой
-// картинкой: "photo.jpg" -> "photo.pdf".
+// Размер страницы и где на ней картинка: (ширина, высота, x, y, w, h) в пунктах.
+// A4 — лист, повёрнутый по картинке, картинка вписана по центру без искажений.
+// Иначе — страница размером с картинку.
+fn page_layout(width: u32, height: u32, a4: bool) -> (f32, f32, f32, f32, f32, f32) {
+    let points = |pixels: u32| pixels as f32 * 72.0 / IMAGE_DPI;
+
+    let (image_width, image_height) = (points(width), points(height));
+
+    if !a4 {
+        return (image_width, image_height, 0.0, 0.0, image_width, image_height);
+    }
+
+    let (page_width, page_height) = if width > height { (A4_HEIGHT, A4_WIDTH) } else { (A4_WIDTH, A4_HEIGHT) };
+
+    let scale = (page_width / image_width).min(page_height / image_height);
+
+    let (drawn_width, drawn_height) = (image_width * scale, image_height * scale);
+
+    (
+        page_width,
+        page_height,
+        (page_width - drawn_width) / 2.0,
+        (page_height - drawn_height) / 2.0,
+        drawn_width,
+        drawn_height,
+    )
+}
+
+// Каждая картинка — отдельная страница (A4 или размером с картинку — по
+// параметрам). Результат рядом с первой картинкой: "photo.jpg" -> "photo.pdf".
 pub fn images_to_pdf(
     images: &[PathBuf],
     params: &Params,
     mut progress: impl FnMut(usize),
 ) -> Result<PathBuf, String> {
-    let first = images.first().ok_or("No images")?;
+    let first = images.first().ok_or("Нет картинок")?;
 
     let mut document = Document::with_version("1.7");
 
@@ -190,14 +222,12 @@ pub fn images_to_pdf(
     for (index, path) in images.iter().enumerate() {
         job_manager::check_cancelled()?;
 
-        let (image_id, width, height) = image_object(&mut document, path, params)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let (image_id, width, height) = image_object(&mut document, path, params)?;
 
-        let points = |pixels: u32| pixels as f32 * 72.0 / IMAGE_DPI;
+        let (page_width, page_height, x, y, drawn_width, drawn_height) =
+            page_layout(width, height, params.a4_pages());
 
-        let (page_width, page_height) = (points(width), points(height));
-
-        let content = format!("q {page_width} 0 0 {page_height} 0 0 cm /Im0 Do Q");
+        let content = format!("q {drawn_width} 0 0 {drawn_height} {x} {y} cm /Im0 Do Q");
 
         let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
 
@@ -221,7 +251,7 @@ pub fn images_to_pdf(
     save_document(&mut document, &output::next_to(first, "pdf")?)
 }
 
-fn finish_page_tree(document: &mut Document, pages_id: ObjectId, kids: Vec<Object>) {
+fn finish_page_tree(document: &mut Document, pages_id: ObjectId, kids: Vec<Object>) -> ObjectId {
     let count = kids.len() as i64;
 
     document.objects.insert(
@@ -239,6 +269,8 @@ fn finish_page_tree(document: &mut Document, pages_id: ObjectId, kids: Vec<Objec
     });
 
     document.trailer.set("Root", catalog_id);
+
+    catalog_id
 }
 
 // ---------------------------------------------------------------------------
@@ -285,9 +317,220 @@ fn inherited_attributes(document: &Document, page_id: ObjectId) -> Vec<(Vec<u8>,
     found
 }
 
-// Склеивает PDF по порядку. Результат: "first (merged).pdf".
+// Текст для PDF (заголовок закладки): ASCII как есть, остальное — UTF-16BE.
+fn text_string(text: &str) -> Object {
+    if text.is_ascii() {
+        return Object::String(text.as_bytes().to_vec(), StringFormat::Literal);
+    }
+
+    let mut bytes = vec![0xFE, 0xFF];
+
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+
+    Object::String(bytes, StringFormat::Hexadecimal)
+}
+
+// Объект по ссылке или сам объект.
+fn resolve<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Object> {
+    match object {
+        Object::Reference(id) => document.get_object(*id).ok(),
+        object => Some(object),
+    }
+}
+
+fn resolve_dictionary<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Dictionary> {
+    resolve(document, object)?.as_dict().ok()
+}
+
+// Именованные места документа (на них ссылаются закладки и ссылки внутри
+// текста). Каталог исходного файла в склейку не попадает, поэтому они
+// переносятся в каталог нового. Совпадающие имена — от первого файла.
+#[derive(Default)]
+struct NamedDestinations {
+    // Старый способ: словарь /Dests в каталоге, ключи — имена.
+    by_name: Dictionary,
+    // Новый способ: дерево /Names /Dests, ключи — строки.
+    by_string: std::collections::BTreeMap<Vec<u8>, Object>,
+}
+
+impl NamedDestinations {
+    fn collect(&mut self, document: &Document) {
+        let Ok(catalog) = document.catalog() else {
+            return;
+        };
+
+        if let Some(dests) = catalog.get(b"Dests").ok().and_then(|dests| resolve_dictionary(document, dests)) {
+            for (key, value) in dests.iter() {
+                if !self.by_name.has(key) {
+                    self.by_name.set(key.clone(), value.clone());
+                }
+            }
+        }
+
+        let tree = catalog
+            .get(b"Names")
+            .ok()
+            .and_then(|names| resolve_dictionary(document, names))
+            .and_then(|names| names.get(b"Dests").ok());
+
+        if let Some(tree) = tree {
+            self.walk(document, tree, 0);
+        }
+    }
+
+    fn walk(&mut self, document: &Document, node: &Object, depth: u32) {
+        // Защита от зацикленного дерева в битом файле.
+        if depth > 32 {
+            return;
+        }
+
+        let Some(node) = resolve_dictionary(document, node) else {
+            return;
+        };
+
+        if let Ok(Object::Array(pairs)) = node.get(b"Names").map(|names| resolve(document, names).unwrap_or(names)) {
+            for pair in pairs.chunks(2) {
+                if let [Object::String(key, _), value] = pair {
+                    self.by_string.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+        }
+
+        if let Ok(Object::Array(kids)) = node.get(b"Kids").map(|kids| resolve(document, kids).unwrap_or(kids)) {
+            for kid in kids {
+                self.walk(document, kid, depth + 1);
+            }
+        }
+    }
+
+    fn write(self, document: &mut Document, catalog_id: ObjectId) {
+        let mut names = None;
+
+        if !self.by_string.is_empty() {
+            let pairs: Vec<Object> = self
+                .by_string
+                .into_iter()
+                .flat_map(|(key, value)| [Object::String(key, StringFormat::Literal), value])
+                .collect();
+
+            let tree = document.add_object(dictionary! { "Names" => pairs });
+
+            names = Some(dictionary! { "Dests" => tree });
+        }
+
+        let dests = (!self.by_name.is_empty()).then(|| document.add_object(self.by_name));
+
+        if let Ok(catalog) = document.get_dictionary_mut(catalog_id) {
+            if let Some(names) = names {
+                catalog.set("Names", names);
+            }
+
+            if let Some(dests) = dests {
+                catalog.set("Dests", dests);
+            }
+        }
+    }
+}
+
+// Закладка на файл в склейке.
+struct FileBookmark {
+    title: String,
+    first_page: ObjectId,
+    // Первая и последняя закладка верхнего уровня самого файла.
+    children: Option<(ObjectId, ObjectId)>,
+}
+
+fn own_bookmarks(document: &Document) -> Option<(ObjectId, ObjectId)> {
+    let outlines = document.catalog().ok()?.get(b"Outlines").ok()?;
+
+    let outlines = resolve_dictionary(document, outlines)?;
+
+    let first = outlines.get(b"First").ok()?.as_reference().ok()?;
+    let last = outlines.get(b"Last").ok()?.as_reference().ok()?;
+
+    Some((first, last))
+}
+
+// Строит закладки склейки: по одной на файл (по имени файла), собственные
+// закладки файла — свёрнутые внутри неё.
+fn write_bookmarks(document: &mut Document, catalog_id: ObjectId, files: Vec<FileBookmark>) {
+    if files.is_empty() {
+        return;
+    }
+
+    let root_id = document.new_object_id();
+
+    let ids: Vec<ObjectId> = files.iter().map(|_| document.new_object_id()).collect();
+
+    for (index, file) in files.iter().enumerate() {
+        let mut item = dictionary! {
+            "Title" => text_string(&file.title),
+            "Parent" => root_id,
+            "Dest" => vec![Object::Reference(file.first_page), Object::Name(b"Fit".to_vec())],
+        };
+
+        if index > 0 {
+            item.set("Prev", ids[index - 1]);
+        }
+
+        if index + 1 < ids.len() {
+            item.set("Next", ids[index + 1]);
+        }
+
+        if let Some((first, last)) = file.children {
+            // Закладки файла теперь лежат внутри закладки-файла.
+            let mut child = Some(first);
+
+            let mut count = 0;
+
+            while let Some(id) = child {
+                count += 1;
+
+                child = document.get_dictionary_mut(id).ok().and_then(|dictionary| {
+                    dictionary.set("Parent", ids[index]);
+
+                    dictionary.get(b"Next").and_then(Object::as_reference).ok()
+                });
+
+                if id == last || count > 10_000 {
+                    break;
+                }
+            }
+
+            item.set("First", first);
+            item.set("Last", last);
+
+            // Отрицательное число — закладка свёрнута.
+            item.set("Count", -(count as i64));
+        }
+
+        document.objects.insert(ids[index], Object::Dictionary(item));
+    }
+
+    document.objects.insert(
+        root_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Outlines",
+            "First" => ids[0],
+            "Last" => ids[ids.len() - 1],
+            "Count" => ids.len() as i64,
+        }),
+    );
+
+    if let Ok(catalog) = document.get_dictionary_mut(catalog_id) {
+        catalog.set("Outlines", root_id);
+
+        // Панель закладок открывается сразу.
+        catalog.set("PageMode", "UseOutlines");
+    }
+}
+
+// Склеивает PDF по порядку. Результат: "first (склеено).pdf" с закладкой на
+// каждый файл; закладки и ссылки внутри файлов сохраняются.
 pub fn merge(files: &[PathBuf], mut progress: impl FnMut(usize)) -> Result<PathBuf, String> {
-    let first = files.first().ok_or("No PDF files")?;
+    let first = files.first().ok_or("Нет PDF")?;
 
     let mut merged = Document::with_version("1.7");
 
@@ -297,14 +540,18 @@ pub fn merge(files: &[PathBuf], mut progress: impl FnMut(usize)) -> Result<PathB
 
     let mut kids = Vec::new();
 
+    let mut bookmarks = Vec::new();
+
+    let mut destinations = NamedDestinations::default();
+
     for (index, path) in files.iter().enumerate() {
         job_manager::check_cancelled()?;
 
         let mut document = Document::load(path)
-            .map_err(|error| pdf_error(&path.display().to_string(), error))?;
+            .map_err(|error| pdf_error("PDF повреждён или не открывается", error))?;
 
         if document.is_encrypted() {
-            return Err(format!("{} is password-protected", path.display()));
+            return Err("PDF с паролем — такие пока не поддерживаются".to_string());
         }
 
         document.renumber_objects_with(next_id);
@@ -329,8 +576,18 @@ pub fn merge(files: &[PathBuf], mut progress: impl FnMut(usize)) -> Result<PathB
             kids.push(page_id.into());
         }
 
-        // Каталог и узлы дерева страниц заменяются новыми. Остальное
-        // (закладки, формы) без каталога недостижимо и будет выброшено.
+        if let Some(&first_page) = pages.first() {
+            bookmarks.push(FileBookmark {
+                title: path.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
+                first_page,
+                children: own_bookmarks(&document),
+            });
+        }
+
+        destinations.collect(&document);
+
+        // Каталог и узлы дерева страниц заменяются новыми. Закладки
+        // и именованные места переносятся в новый каталог; формы — нет.
         for (id, object) in document.objects {
             let skip = matches!(object.type_name().unwrap_or(b""), b"Catalog" | b"Pages");
 
@@ -344,7 +601,11 @@ pub fn merge(files: &[PathBuf], mut progress: impl FnMut(usize)) -> Result<PathB
 
     merged.max_id = next_id;
 
-    finish_page_tree(&mut merged, pages_id, kids);
+    let catalog_id = finish_page_tree(&mut merged, pages_id, kids);
+
+    write_bookmarks(&mut merged, catalog_id, bookmarks);
+
+    destinations.write(&mut merged, catalog_id);
 
     merged.prune_objects();
 
@@ -365,26 +626,26 @@ fn render_page(page: &windows::Data::Pdf::PdfPage, params: &Params) -> Result<Ve
     use windows::Data::Pdf::PdfPageRenderOptions;
     use windows::Storage::Streams::InMemoryRandomAccessStream;
 
-    let size = page.Size().map_err(|error| winrt_error("Page size", error))?;
+    let size = page.Size().map_err(|error| winrt_error("Не удалось отрисовать страницу PDF", error))?;
 
     // Размер страницы в DIP (1/96 дюйма).
     let scale = (params.pdf_dpi as f32 / 96.0)
         .min(MAX_RENDER_SIDE / size.Width.max(1.0))
         .min(MAX_RENDER_SIDE / size.Height.max(1.0));
 
-    let options = PdfPageRenderOptions::new().map_err(|error| winrt_error("Render", error))?;
+    let options = PdfPageRenderOptions::new().map_err(|error| winrt_error("Не удалось отрисовать страницу PDF", error))?;
 
     options
         .SetDestinationWidth((size.Width * scale).round().max(1.0) as u32)
         .and_then(|_| options.SetDestinationHeight((size.Height * scale).round().max(1.0) as u32))
-        .map_err(|error| winrt_error("Render", error))?;
+        .map_err(|error| winrt_error("Не удалось отрисовать страницу PDF", error))?;
 
-    let stream = InMemoryRandomAccessStream::new().map_err(|error| winrt_error("Render", error))?;
+    let stream = InMemoryRandomAccessStream::new().map_err(|error| winrt_error("Не удалось отрисовать страницу PDF", error))?;
 
     // По умолчанию страница рендерится в PNG на белом фоне.
     page.RenderWithOptionsToStreamAsync(&stream, &options)
         .and_then(|operation| operation.join())
-        .map_err(|error| winrt_error("Render", error))?;
+        .map_err(|error| winrt_error("Не удалось отрисовать страницу PDF", error))?;
 
     let png = winrt::read_stream(&stream)?;
 
@@ -393,7 +654,7 @@ fn render_page(page: &windows::Data::Pdf::PdfPage, params: &Params) -> Result<Ve
     }
 
     let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
-        .map_err(|error| format!("Render: {error}"))?;
+        .map_err(|error| crate::errors::fail("Не удалось сохранить страницу в JPG", error))?;
 
     converter::encode(
         &image,
@@ -421,20 +682,20 @@ fn render_document(source: &Path, params: &Params) -> Result<PathBuf, String> {
 
     let document = PdfDocument::LoadFromFileAsync(&file)
         .and_then(|operation| operation.join())
-        .map_err(|error| winrt_error(&format!("Could not open {}", source.display()), error))?;
+        .map_err(|error| winrt_error("Не удалось открыть PDF", error))?;
 
     let page_count = document
         .PageCount()
-        .map_err(|error| winrt_error("Page count", error))?;
+        .map_err(|error| winrt_error("Не удалось открыть PDF", error))?;
 
     if page_count == 0 {
-        return Err("PDF has no pages".to_string());
+        return Err("В PDF нет страниц".to_string());
     }
 
     let page = |index: u32| -> Result<Vec<u8>, String> {
         let page = document
             .GetPage(index)
-            .map_err(|error| winrt_error("Page", error))?;
+            .map_err(|error| winrt_error("Не удалось отрисовать страницу PDF", error))?;
 
         render_page(&page, params)
     };
@@ -447,7 +708,7 @@ fn render_document(source: &Path, params: &Params) -> Result<PathBuf, String> {
         return output::write_file(&output::next_to(source, extension)?, |writer| {
             writer
                 .write_all(&bytes)
-                .map_err(|error| format!("Could not write image: {error}"))
+                .map_err(|error| crate::errors::io("Не удалось записать результат", &error))
         });
     }
 
@@ -471,7 +732,7 @@ fn render_document(source: &Path, params: &Params) -> Result<PathBuf, String> {
         name.push(format!(" {:0digits$}.{extension}", index + 1));
 
         std::fs::write(temp.path().join(name), bytes)
-            .map_err(|error| format!("Could not write page: {error}"))?;
+            .map_err(|error| crate::errors::io("Не удалось записать результат", &error))?;
     }
 
     output::finish_temp(temp, None, &target)

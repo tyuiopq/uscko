@@ -7,6 +7,7 @@ use std::sync::{OnceLock, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::actions::{ActionId, Category};
+use crate::hotkeys::{Hotkey, Hotkeys, Slot};
 use crate::params::{ParamId, Params};
 
 // Действующие настройки: по ним работает колесо.
@@ -196,6 +197,8 @@ pub struct AppConfig {
 
     // Параметры действий (качество, размеры...).
     pub params: Params,
+
+    pub hotkeys: Hotkeys,
 }
 
 impl Default for AppConfig {
@@ -204,6 +207,7 @@ impl Default for AppConfig {
             version: CONFIG_VERSION,
             wheel: WheelConfig::default(),
             params: Params::default(),
+            hotkeys: Hotkeys::default(),
         }
     }
 }
@@ -473,7 +477,11 @@ fn load_or_create() -> Result<(AppConfig, PathBuf), String> {
     match read_config(&path) {
         Ok(mut config) => {
             // Без короткого замыкания: все шаги должны выполниться.
-            if migrate(&mut config) | fit_to_categories(&mut config) | config.params.sanitize() {
+            if migrate(&mut config)
+                | fit_to_categories(&mut config)
+                | config.params.sanitize()
+                | config.hotkeys.sanitize()
+            {
                 if let Err(error) = write_config(&path, &config) {
                     eprintln!("{error}");
                 }
@@ -595,6 +603,37 @@ pub fn set_draft_param(id: ParamId, value: u32) {
         && let Ok(mut draft) = draft.write()
     {
         draft.params.set(id, value);
+    }
+}
+
+// Действующие горячие клавиши.
+pub fn hotkeys() -> Hotkeys {
+    CONFIG
+        .get()
+        .and_then(|config| config.read().ok().map(|config| config.hotkeys))
+        .unwrap_or_default()
+}
+
+pub fn draft_hotkeys() -> Hotkeys {
+    DRAFT
+        .get()
+        .and_then(|draft| draft.read().ok().map(|draft| draft.hotkeys))
+        .unwrap_or_default()
+}
+
+pub fn set_draft_hotkey(slot: Slot, hotkey: Hotkey) {
+    if let Some(draft) = DRAFT.get()
+        && let Ok(mut draft) = draft.write()
+    {
+        draft.hotkeys.set(slot, hotkey);
+    }
+}
+
+pub fn reset_draft_hotkeys() {
+    if let Some(draft) = DRAFT.get()
+        && let Ok(mut draft) = draft.write()
+    {
+        draft.hotkeys = Hotkeys::default();
     }
 }
 

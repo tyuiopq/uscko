@@ -23,6 +23,7 @@ use windows_sys::Win32::{
 };
 
 use crate::actions::ActionId;
+use crate::icons::{self, Icon};
 use crate::params::Params;
 use crate::render::{self, Rgba, ease_out_cubic, mix, to_color, with_alpha};
 use crate::{dpi, text};
@@ -33,6 +34,11 @@ const WINDOW_SIZE: f32 = 380.0;
 pub const OUTER_RADIUS: f32 = 140.0;
 const INNER_RADIUS: f32 = 56.0;
 const CENTER_RADIUS: f32 = 50.0;
+
+// Иконка в секции и подпись под ней: смещения от центра секции вверх и вниз.
+const ICON_SIZE: f32 = 22.0;
+const ICON_SHIFT: f32 = 10.0;
+const LABEL_SHIFT: f32 = 13.0;
 
 // Внутри этого радиуса — «центр»: ничего не выбрано, отпускание = отмена.
 const DEAD_ZONE: f32 = 44.0;
@@ -84,6 +90,8 @@ pub struct SlotView {
     // Подписи зависят от параметров действий, поэтому считаются заранее.
     pub label: &'static str,
     pub title: &'static str,
+    // None — «только текст» (параметр «Секции колеса»).
+    pub icon: Option<Icon>,
 }
 
 impl SlotView {
@@ -93,6 +101,7 @@ impl SlotView {
             enabled,
             label: action.map_or("", |action| action.label(params)),
             title: action.map_or("", |action| action.title(params)),
+            icon: action.filter(|_| params.wheel_icons()).map(ActionId::icon),
         }
     }
 }
@@ -411,13 +420,33 @@ impl WheelPicture<'_> {
 
         let max_width = (chord - 10.0).clamp(30.0, OUTER_RADIUS - INNER_RADIUS - 8.0) * scale;
 
-        let mut size = (14.5 + hover * 1.5) * scale;
+        let color = if view.enabled { TEXT } else { TEXT_DISABLED };
+
+        // С иконкой: иконка сверху, подпись под ней, помельче.
+        let (anchor, base_size) = match view.icon {
+            Some(icon) => {
+                let icon_size = (ICON_SIZE + hover * 2.0) * scale;
+
+                icons::draw(
+                    pixmap,
+                    icon,
+                    anchor.x,
+                    anchor.y - ICON_SHIFT * scale,
+                    icon_size,
+                    with_alpha(color, alpha),
+                );
+
+                (Point::from_xy(anchor.x, anchor.y + LABEL_SHIFT * scale), 12.5)
+            }
+
+            None => (anchor, 14.5),
+        };
+
+        let mut size = (base_size + hover * 1.5) * scale;
 
         while text::measure(&fonts.semibold, size, view.label) > max_width && size > 8.0 * scale {
             size -= 0.5 * scale;
         }
-
-        let color = if view.enabled { TEXT } else { TEXT_DISABLED };
 
         text::draw_centered(
             pixmap,

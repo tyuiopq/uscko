@@ -13,7 +13,9 @@ use windows_sys::Win32::{
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 use crate::params::Params;
-use crate::{file_types, job_manager, output};
+use crate::{errors, file_types, job_manager, output};
+
+const PASSWORD_PROTECTED: &str = "Архив с паролем — такие пока не поддерживаются";
 
 // Эти форматы уже сжаты: повторное сжатие только тратит время.
 const STORED_EXTENSIONS: &[&str] = &[
@@ -95,7 +97,7 @@ fn zip_to_system_time(time: DateTime) -> Option<SystemTime> {
 fn entry_name(path: &Path, base: &Path) -> Result<String, String> {
     let relative = path
         .strip_prefix(base)
-        .map_err(|_| format!("{} is outside {}", path.display(), base.display()))?;
+        .map_err(|_| "Файлы должны лежать в одной папке".to_string())?;
 
     let parts: Vec<String> = relative
         .components()
@@ -114,7 +116,7 @@ fn add_to_zip<W: Write + std::io::Seek>(
     job_manager::check_cancelled()?;
 
     let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+        .map_err(|error| errors::io("Не удалось прочитать файл", &error))?;
 
     // Ссылки и точки соединения не разворачиваем: они могут указывать
     // куда угодно, в том числе на саму папку (бесконечный цикл).
@@ -132,10 +134,10 @@ fn add_to_zip<W: Write + std::io::Seek>(
 
     if metadata.is_dir() {
         zip.add_directory(format!("{name}/"), options)
-            .map_err(|error| format!("{name}: {error}"))?;
+            .map_err(|error| errors::fail("Не удалось записать архив", error))?;
 
         let mut children: Vec<PathBuf> = fs::read_dir(path)
-            .map_err(|error| format!("{}: {error}", path.display()))?
+            .map_err(|error| errors::io("Не удалось прочитать папку", &error))?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
             .collect();
 
@@ -165,18 +167,18 @@ fn add_to_zip<W: Write + std::io::Seek>(
         .large_file(metadata.len() >= u32::MAX as u64);
 
     zip.start_file(&name, options)
-        .map_err(|error| format!("{name}: {error}"))?;
+        .map_err(|error| errors::fail("Не удалось записать архив", error))?;
 
-    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut file = File::open(path).map_err(|error| errors::io("Не удалось прочитать файл", &error))?;
 
-    std::io::copy(&mut file, zip).map_err(|error| format!("{}: {error}", path.display()))?;
+    std::io::copy(&mut file, zip).map_err(|error| errors::io("Не удалось упаковать файл", &error))?;
 
     Ok(())
 }
 
 // Один элемент -> "name.zip", несколько -> по имени папки, где они лежат.
 pub fn create(items: &[PathBuf], params: &Params, mut progress: impl FnMut(usize)) -> Result<PathBuf, String> {
-    let first = items.first().ok_or("Nothing to archive")?;
+    let first = items.first().ok_or("Нечего упаковывать")?;
 
     let base = output::parent_of(first)?;
 
@@ -189,7 +191,7 @@ pub fn create(items: &[PathBuf], params: &Params, mut progress: impl FnMut(usize
     } else {
         base.file_name().map(OsString::from)
     }
-    .unwrap_or_else(|| OsString::from("Archive"));
+    .unwrap_or_else(|| OsString::from("Архив"));
 
     let target = output::available_path(base, &stem, Some("zip"))?;
 
@@ -204,7 +206,7 @@ pub fn create(items: &[PathBuf], params: &Params, mut progress: impl FnMut(usize
 
         zip.finish()
             .map(|_| ())
-            .map_err(|error| format!("Could not finish archive: {error}"))
+            .map_err(|error| errors::fail("Не удалось записать архив", error))
     })
 }
 
@@ -304,7 +306,7 @@ fn write_entry(
     modified: Option<SystemTime>,
 ) -> Result<(), String> {
     let Some(relative) = safe_relative_path(name) else {
-        eprintln!("Skipped unsafe path in archive: {name}");
+        crate::journal::write("    пропущен файл архива с небезопасным путём");
 
         return Ok(());
     };
@@ -312,16 +314,16 @@ fn write_entry(
     let target = root.join(&relative);
 
     if is_directory {
-        return fs::create_dir_all(&target).map_err(|error| format!("{name}: {error}"));
+        return fs::create_dir_all(&target).map_err(|error| errors::io("Не удалось распаковать", &error));
     }
 
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("{name}: {error}"))?;
+        fs::create_dir_all(parent).map_err(|error| errors::io("Не удалось распаковать", &error))?;
     }
 
-    let mut file = File::create(&target).map_err(|error| format!("{name}: {error}"))?;
+    let mut file = File::create(&target).map_err(|error| errors::io("Не удалось распаковать", &error))?;
 
-    std::io::copy(content, &mut file).map_err(|error| format!("{name}: {error}"))?;
+    std::io::copy(content, &mut file).map_err(|error| errors::io("Архив повреждён или не распаковался", &error))?;
 
     if let Some(time) = modified {
         let _ = file.set_modified(time);
@@ -331,20 +333,20 @@ fn write_entry(
 }
 
 fn extract_zip(source: &Path, root: &Path) -> Result<(), String> {
-    let file = File::open(source).map_err(|error| format!("{}: {error}", source.display()))?;
+    let file = File::open(source).map_err(|error| errors::io("Не удалось открыть архив", &error))?;
 
     let mut archive = ZipArchive::new(BufReader::new(file))
-        .map_err(|error| format!("{}: {error}", source.display()))?;
+        .map_err(|error| errors::fail("Архив повреждён или это не ZIP", error))?;
 
     for index in 0..archive.len() {
         job_manager::check_cancelled()?;
 
         let mut entry = archive
             .by_index(index)
-            .map_err(|error| format!("{}: {error}", source.display()))?;
+            .map_err(|error| errors::fail("Архив повреждён", error))?;
 
         if entry.encrypted() {
-            return Err(format!("{} is password-protected", source.display()));
+            return Err(PASSWORD_PROTECTED.to_string());
         }
 
         let name = decode_entry_name(entry.name_raw());
@@ -363,11 +365,9 @@ fn extract_seven_zip(source: &Path, root: &Path) -> Result<(), String> {
     use sevenz_rust2::{ArchiveReader, Error, Password};
 
     let describe = |error: Error| match error {
-        Error::PasswordRequired | Error::MaybeBadPassword(_) => {
-            format!("{} is password-protected", source.display())
-        }
+        Error::PasswordRequired | Error::MaybeBadPassword(_) => PASSWORD_PROTECTED.to_string(),
 
-        error => format!("{}: {error}", source.display()),
+        error => errors::fail("Архив повреждён или это не 7z", error),
     };
 
     let mut archive = ArchiveReader::open(source, Password::empty()).map_err(describe)?;
@@ -425,15 +425,15 @@ pub fn extract(source: &Path) -> Result<PathBuf, String> {
     }
 
     let top_level: Vec<PathBuf> = fs::read_dir(temp.path())
-        .map_err(|error| format!("Could not read extracted files: {error}"))?
+        .map_err(|error| errors::io("Не удалось распаковать", &error))?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .collect();
 
     match top_level.as_slice() {
-        [] => Err(format!("{} is empty", source.display())),
+        [] => Err("Архив пустой".to_string()),
 
         [single] => {
-            let name = single.file_name().ok_or("Invalid extracted name")?;
+            let name = single.file_name().ok_or("Не удалось распаковать")?;
 
             let target = if single.is_dir() {
                 output::available_path(folder, name, None)?

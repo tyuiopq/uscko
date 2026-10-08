@@ -13,6 +13,7 @@ pub enum ParamId {
     WebpQuality,
     ImageCompression,
     ResizeSide,
+    PdfPageSize,
     PdfDpi,
     PdfPageFormat,
     VideoCompression,
@@ -20,6 +21,8 @@ pub enum ParamId {
     VideoHeight,
     AudioBitrate,
     ZipLevel,
+    WheelIcons,
+    LogPaths,
 }
 
 pub struct Choice {
@@ -39,6 +42,14 @@ pub const WEBP_LOSSLESS: u32 = 101;
 pub const PAGES_PNG: u32 = 0;
 pub const PAGES_JPEG: u32 = 1;
 
+// Размер страниц «Собрать в PDF».
+pub const PAGE_AS_IMAGE: u32 = 0;
+pub const PAGE_A4: u32 = 1;
+
+// Вид секций колеса.
+pub const WHEEL_ICONS: u32 = 0;
+pub const WHEEL_TEXT: u32 = 1;
+
 // Высота при сжатии видео: 0 — не уменьшать.
 pub const KEEP_HEIGHT: u32 = 0;
 
@@ -46,6 +57,17 @@ pub const KEEP_HEIGHT: u32 = 0;
 pub struct Group {
     pub label: &'static str,
     pub params: &'static [ParamId],
+    // Что ещё показать в разделе, кроме параметров.
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extra {
+    None,
+    // Карточка с кнопкой «Открыть журнал».
+    OpenLog,
+    // Карточки горячих клавиш.
+    Hotkeys,
 }
 
 pub const GROUPS: &[Group] = &[
@@ -57,22 +79,42 @@ pub const GROUPS: &[Group] = &[
             ParamId::ImageCompression,
             ParamId::ResizeSide,
         ],
+        extra: Extra::None,
     },
     Group {
         label: "PDF",
-        params: &[ParamId::PdfDpi, ParamId::PdfPageFormat],
+        params: &[ParamId::PdfPageSize, ParamId::PdfDpi, ParamId::PdfPageFormat],
+        extra: Extra::None,
     },
     Group {
         label: "Видео",
         params: &[ParamId::VideoCompression, ParamId::CompressHeight, ParamId::VideoHeight],
+        extra: Extra::None,
     },
     Group {
         label: "Аудио",
         params: &[ParamId::AudioBitrate],
+        extra: Extra::None,
     },
     Group {
         label: "Архивы",
         params: &[ParamId::ZipLevel],
+        extra: Extra::None,
+    },
+    Group {
+        label: "Колесо",
+        params: &[ParamId::WheelIcons],
+        extra: Extra::None,
+    },
+    Group {
+        label: "Клавиши",
+        params: &[],
+        extra: Extra::Hotkeys,
+    },
+    Group {
+        label: "Журнал",
+        params: &[ParamId::LogPaths],
+        extra: Extra::OpenLog,
     },
 ];
 
@@ -89,13 +131,16 @@ impl ParamId {
             Self::WebpQuality => "Качество WebP",
             Self::ImageCompression => "Сила сжатия",
             Self::ResizeSide => "Уменьшать до",
-            Self::PdfDpi => "Разрешение страниц",
-            Self::PdfPageFormat => "Формат страниц",
+            Self::PdfPageSize => "Размер страниц",
+            Self::PdfDpi => "Разрешение картинок",
+            Self::PdfPageFormat => "Формат картинок",
             Self::VideoCompression => "Сила сжатия",
             Self::CompressHeight => "Высота при сжатии",
             Self::VideoHeight => "Уменьшать до",
             Self::AudioBitrate => "Битрейт MP3 и M4A",
             Self::ZipLevel => "Сжатие ZIP",
+            Self::WheelIcons => "Секции колеса",
+            Self::LogPaths => "Имена файлов в журнале",
         }
     }
 
@@ -106,13 +151,16 @@ impl ParamId {
             Self::WebpQuality => "Для фото. Скриншоты и графика всегда сохраняются без потерь",
             Self::ImageCompression => "Для «Сжать»: сильнее — меньше файл, но заметнее потери",
             Self::ResizeSide => "Длинная сторона картинки после «Уменьшить», пиксели",
+            Self::PdfPageSize => "Для «Собрать в PDF». Ориентация листа — по картинке",
             Self::PdfDpi => "Для «Страницы в картинки»: больше — чётче, но тяжелее",
-            Self::PdfPageFormat => "PNG — без потерь, JPG — в несколько раз меньше",
+            Self::PdfPageFormat => "Для «Страницы в картинки»: PNG без потерь, JPG меньше",
             Self::VideoCompression => "Для «Сжать видео»: сильнее — меньше файл, но хуже картинка",
             Self::CompressHeight => "При сжатии видео выше этого уменьшается",
             Self::VideoHeight => "Высота видео после «Уменьшить»",
             Self::AudioBitrate => "Также для «Извлечь звук» и склейки. M4A — не выше 192",
             Self::ZipLevel => "Сильнее — архив меньше, но упаковка дольше",
+            Self::WheelIcons => "Иконка узнаётся быстрее, текст — привычнее",
+            Self::LogPaths => "Журнал хранится только на этом компьютере и никуда не отправляется",
         }
     }
 
@@ -144,6 +192,11 @@ impl ParamId {
                 Choice { label: "3840", value: 3840 },
             ],
 
+            Self::PdfPageSize => &[
+                Choice { label: "A4", value: PAGE_A4 },
+                Choice { label: "Как у картинки", value: PAGE_AS_IMAGE },
+            ],
+
             Self::PdfDpi => &[
                 Choice { label: "96 dpi", value: 96 },
                 Choice { label: "150 dpi", value: 150 },
@@ -169,6 +222,16 @@ impl ParamId {
 
             // Уровень deflate.
             Self::ZipLevel => &[Choice { label: "Быстрое", value: 1 }, Choice { label: "Обычное", value: 6 }, Choice { label: "Максимум", value: 9 }],
+
+            Self::WheelIcons => &[
+                Choice { label: "Иконка и текст", value: WHEEL_ICONS },
+                Choice { label: "Только текст", value: WHEEL_TEXT },
+            ],
+
+            Self::LogPaths => &[
+                Choice { label: "Не писать", value: 0 },
+                Choice { label: "С путями", value: 1 },
+            ],
         }
     }
 
@@ -184,6 +247,7 @@ pub struct Params {
     pub webp_quality: u32,
     pub image_compression: u32,
     pub resize_side: u32,
+    pub pdf_page_size: u32,
     pub pdf_dpi: u32,
     pub pdf_page_format: u32,
     pub video_compression: u32,
@@ -191,6 +255,8 @@ pub struct Params {
     pub video_height: u32,
     pub audio_bitrate: u32,
     pub zip_level: u32,
+    pub wheel_icons: u32,
+    pub log_paths: u32,
 }
 
 impl Default for Params {
@@ -200,6 +266,7 @@ impl Default for Params {
             webp_quality: 90,
             image_compression: MEDIUM,
             resize_side: 1920,
+            pdf_page_size: PAGE_A4,
             pdf_dpi: 150,
             pdf_page_format: PAGES_PNG,
             video_compression: MEDIUM,
@@ -207,6 +274,8 @@ impl Default for Params {
             video_height: 720,
             audio_bitrate: 192,
             zip_level: 6,
+            wheel_icons: WHEEL_ICONS,
+            log_paths: 0,
         }
     }
 }
@@ -218,6 +287,7 @@ impl Params {
             ParamId::WebpQuality => &mut self.webp_quality,
             ParamId::ImageCompression => &mut self.image_compression,
             ParamId::ResizeSide => &mut self.resize_side,
+            ParamId::PdfPageSize => &mut self.pdf_page_size,
             ParamId::PdfDpi => &mut self.pdf_dpi,
             ParamId::PdfPageFormat => &mut self.pdf_page_format,
             ParamId::VideoCompression => &mut self.video_compression,
@@ -225,6 +295,8 @@ impl Params {
             ParamId::VideoHeight => &mut self.video_height,
             ParamId::AudioBitrate => &mut self.audio_bitrate,
             ParamId::ZipLevel => &mut self.zip_level,
+            ParamId::WheelIcons => &mut self.wheel_icons,
+            ParamId::LogPaths => &mut self.log_paths,
         }
     }
 
@@ -293,6 +365,19 @@ impl Params {
 
     pub fn pages_as_jpeg(&self) -> bool {
         self.pdf_page_format == PAGES_JPEG
+    }
+
+    pub fn a4_pages(&self) -> bool {
+        self.pdf_page_size == PAGE_A4
+    }
+
+    pub fn wheel_icons(&self) -> bool {
+        self.wheel_icons == WHEEL_ICONS
+    }
+
+    // Писать в журнал пути к файлам.
+    pub fn log_paths(&self) -> bool {
+        self.log_paths == 1
     }
 
     pub fn zip_level(&self) -> i64 {

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::output;
+use crate::{errors, output};
 
 const NEW_FOLDER_NAME: &str = "Новая папка";
 
@@ -20,7 +20,7 @@ pub fn paths_text(items: &[PathBuf]) -> String {
 }
 
 pub fn sha256(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut file = File::open(path).map_err(|error| errors::io("Не удалось прочитать файл", &error))?;
 
     let mut hasher = Sha256::new();
 
@@ -29,7 +29,7 @@ pub fn sha256(path: &Path) -> Result<String, String> {
     loop {
         let read = file
             .read(&mut buffer)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+            .map_err(|error| errors::io("Не удалось прочитать файл", &error))?;
 
         if read == 0 {
             break;
@@ -48,13 +48,13 @@ pub fn sha256(path: &Path) -> Result<String, String> {
 // Перекладывает выделенное в новую папку рядом. Возвращает папку и список
 // того, что переместить не удалось (например, файл открыт в другой программе).
 pub fn into_new_folder(items: &[PathBuf]) -> Result<(PathBuf, Vec<(PathBuf, String)>), String> {
-    let first = items.first().ok_or("Nothing selected")?;
+    let first = items.first().ok_or("Ничего не выделено")?;
 
     let parent = output::parent_of(first)?;
 
     let folder = output::available_path(parent, NEW_FOLDER_NAME.as_ref(), None)?;
 
-    std::fs::create_dir(&folder).map_err(|error| format!("Could not create folder: {error}"))?;
+    std::fs::create_dir(&folder).map_err(|error| errors::io("Не удалось создать папку", &error))?;
 
     let mut failures = Vec::new();
 
@@ -64,7 +64,7 @@ pub fn into_new_folder(items: &[PathBuf]) -> Result<(PathBuf, Vec<(PathBuf, Stri
         };
 
         if let Err(error) = std::fs::rename(item, folder.join(name)) {
-            failures.push((item.clone(), error.to_string()));
+            failures.push((item.clone(), errors::io("Не удалось переместить", &error)));
         }
     }
 
@@ -74,7 +74,7 @@ pub fn into_new_folder(items: &[PathBuf]) -> Result<(PathBuf, Vec<(PathBuf, Stri
 
         let (_, error) = &failures[0];
 
-        return Err(format!("Could not move files: {error}"));
+        return Err(error.clone());
     }
 
     Ok((folder, failures))

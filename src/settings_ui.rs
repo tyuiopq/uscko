@@ -29,7 +29,9 @@ use windows_sys::Win32::{
             CreateWindowExW, DefWindowProcW, GetCursorPos, IDC_ARROW, IDC_HAND, IsWindowVisible,
             KillTimer, LoadCursorW, RegisterClassW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
             SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, WINDOW_STYLE,
-            WM_CLOSE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_CAPTION,
+            PostMessageW, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
+            WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETCURSOR, WM_SYSCHAR, WM_SYSKEYDOWN,
+            WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CAPTION,
             WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
         },
     },
@@ -37,13 +39,14 @@ use windows_sys::Win32::{
 
 use crate::actions::{ActionId, Category};
 use crate::config::{self, Layout, MAX_SECTIONS, MIN_SECTIONS};
-use crate::params::{self, ParamId, Params};
+use crate::hotkeys::{self, Hotkey, Slot};
+use crate::params::{self, Extra, ParamId, Params};
 use crate::render::{
     self, ACCENT, ACCENT_DARK, BACKGROUND, BORDER, CARD, CARD_HOVER, DANGER, Rgba, SUCCESS, TEXT,
     TEXT_FAINT, TEXT_MUTED, WARNING, mix, with_alpha,
 };
 use crate::wheel::{self, SlotView, WheelPicture};
-use crate::{dpi, text};
+use crate::{dpi, journal, text};
 
 // Размер клиентской области.
 const WIDTH: f32 = 840.0;
@@ -111,6 +114,19 @@ const MENU_ITEM_HOVER: Rgba = [48, 53, 65, 255];
 // Мышь ушла из окна (приходит после TrackMouseEvent с TME_LEAVE).
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
+// Главному циклу: снять наши горячие клавиши на время, пока ловим новое
+// сочетание (wParam = HOTKEYS_SUSPEND), или занять их заново по настройкам
+// (HOTKEYS_RESUME) — после захвата и после «Сохранить».
+pub const WM_SETTINGS_HOTKEYS: u32 = WM_APP + 5;
+pub const HOTKEYS_SUSPEND: usize = 0;
+pub const HOTKEYS_RESUME: usize = 1;
+
+const VK_SHIFT: i32 = 0x10;
+const VK_MENU: i32 = 0x12;
+
+// Карточка горячей клавиши: кнопка «Изменить» справа.
+const HOTKEY_BUTTON_WIDTH: f32 = 120.0;
+
 const ANIMATION_TIMER_ID: usize = 1;
 const ANIMATION_INTERVAL_MS: u32 = 16;
 
@@ -162,6 +178,8 @@ enum Target {
     Group(usize),
     Choice(ParamId, usize),
     ResetParams,
+    OpenLog,
+    ChangeHotkey(Slot),
     Tab(usize),
     Sections(usize),
     Row(usize),
@@ -187,6 +205,13 @@ impl Page {
             Self::Params => "Параметры",
         }
     }
+}
+
+// Ловим новое сочетание для slot.
+struct Capture {
+    slot: Slot,
+    // Почему последнее нажатое сочетание не подошло.
+    error: Option<&'static str>,
 }
 
 struct Menu {
@@ -223,6 +248,7 @@ struct State {
     // Проявление содержимого после переключения страницы или раздела, 0..1.
     fade: f32,
     fade_area: Area,
+    capture: Option<Capture>,
     category: usize,
     mouse: Option<(f32, f32)>,
     hover: HashMap<Target, f32>,
@@ -323,6 +349,78 @@ fn choice_area(param: usize, choice: usize, count: usize) -> Area {
         width,
         CHOICE_HEIGHT,
     )
+}
+
+// Карточка «Файл журнала» — под параметрами раздела «Журнал».
+const LOG_CARD_HEIGHT: f32 = 76.0;
+const LOG_BUTTON_WIDTH: f32 = 160.0;
+
+fn log_card_area(group: usize) -> Option<Area> {
+    let group_info = params::GROUPS.get(group).filter(|group| group.extra == Extra::OpenLog)?;
+
+    let top = param_area(group_info.params.len()).y;
+
+    Some(Area::new(PANEL_X, top, PANEL_WIDTH, LOG_CARD_HEIGHT))
+}
+
+fn log_button_area(card: Area) -> Area {
+    Area::new(
+        card.x + card.width - PARAM_INSET - LOG_BUTTON_WIDTH,
+        card.center_y() - 17.0,
+        LOG_BUTTON_WIDTH,
+        34.0,
+    )
+}
+
+fn group_extra(group: usize) -> Extra {
+    params::GROUPS.get(group).map_or(Extra::None, |group| group.extra)
+}
+
+// Карточки горячих клавиш стоят там же, где карточки параметров.
+fn hotkey_button_area(index: usize) -> Area {
+    let card = param_area(index);
+
+    Area::new(
+        card.x + card.width - PARAM_INSET - HOTKEY_BUTTON_WIDTH,
+        card.y + 60.0,
+        HOTKEY_BUTTON_WIDTH,
+        CHOICE_HEIGHT,
+    )
+}
+
+// Нажатые сейчас модификаторы (MOD_CONTROL | MOD_ALT | MOD_SHIFT).
+fn held_modifiers() -> u32 {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT};
+
+    let down = |vk: i32| unsafe { GetKeyState(vk) } < 0;
+
+    let mut modifiers = 0;
+
+    if down(VK_CONTROL as i32) {
+        modifiers |= MOD_CONTROL;
+    }
+
+    if down(VK_MENU) {
+        modifiers |= MOD_ALT;
+    }
+
+    if down(VK_SHIFT) {
+        modifiers |= MOD_SHIFT;
+    }
+
+    modifiers
+}
+
+// В разделе есть изменённые значения (точка у раздела, «Сбросить раздел»).
+fn group_changed(group: usize, draft: &Params) -> bool {
+    let defaults = Params::default();
+
+    let params_changed = group_params(group).iter().any(|&id| draft.get(id) != defaults.get(id));
+
+    let hotkeys_changed =
+        group_extra(group) == Extra::Hotkeys && config::draft_hotkeys() != hotkeys::Hotkeys::default();
+
+    params_changed || hotkeys_changed
 }
 
 fn group_params(group: usize) -> &'static [ParamId] {
@@ -524,6 +622,18 @@ impl State {
             return Some(Target::ResetParams);
         }
 
+        if let Some(card) = log_card_area(self.group)
+            && log_button_area(card).contains(x, y)
+        {
+            return Some(Target::OpenLog);
+        }
+
+        if group_extra(self.group) == Extra::Hotkeys
+            && let Some(index) = (0..Slot::ALL.len()).find(|&index| hotkey_button_area(index).contains(x, y))
+        {
+            return Some(Target::ChangeHotkey(Slot::ALL[index]));
+        }
+
         for (index, &id) in group_params(self.group).iter().enumerate() {
             let count = id.choices().len();
 
@@ -617,6 +727,13 @@ impl State {
     fn click(&mut self, x: f32, y: f32) -> After {
         let target = self.hit(x, y);
 
+        // Клик мимо кнопки «Отмена» захвата — захват прекращается.
+        if let Some(capture) = &self.capture
+            && target != Some(Target::ChangeHotkey(capture.slot))
+        {
+            self.end_capture();
+        }
+
         // Клик по пункту выбирает его, клик мимо списка просто закрывает список.
         if let Some(menu) = self.menu.take() {
             if let Some(Target::Item(index)) = target
@@ -641,6 +758,8 @@ impl State {
 
             Some(Target::Group(index)) => {
                 if index != self.group {
+                    self.end_capture();
+
                     self.group = index;
 
                     self.start_fade(panel_area());
@@ -657,7 +776,21 @@ impl State {
                 for &id in group_params(self.group) {
                     config::set_draft_param(id, id.default_value());
                 }
+
+                if group_extra(self.group) == Extra::Hotkeys {
+                    config::reset_draft_hotkeys();
+                }
             }
+
+            Some(Target::ChangeHotkey(slot)) => {
+                if self.capture.as_ref().is_some_and(|capture| capture.slot == slot) {
+                    self.end_capture();
+                } else {
+                    self.start_capture(slot);
+                }
+            }
+
+            Some(Target::OpenLog) => journal::open(),
 
             Some(Target::Tab(index)) => self.category = index,
 
@@ -696,6 +829,79 @@ impl State {
         After::Nothing
     }
 
+    fn notify_hotkeys(&self, command: usize) {
+        unsafe {
+            PostMessageW(self.hwnd, WM_SETTINGS_HOTKEYS, command, 0);
+        }
+    }
+
+    fn start_capture(&mut self, slot: Slot) {
+        if self.capture.is_none() {
+            self.notify_hotkeys(HOTKEYS_SUSPEND);
+        }
+
+        self.capture = Some(Capture { slot, error: None });
+    }
+
+    fn end_capture(&mut self) {
+        if self.capture.take().is_some() {
+            self.notify_hotkeys(HOTKEYS_RESUME);
+        }
+    }
+
+    // Клавиша нажата во время захвата.
+    fn capture_key(&mut self, key: u32) {
+        const VK_ESCAPE_CODE: u32 = 0x1B;
+
+        let Some(capture) = &mut self.capture else {
+            return;
+        };
+
+        // Модификатор сам по себе — ждём основную клавишу.
+        if hotkeys::is_modifier(key) {
+            capture.error = None;
+
+            return;
+        }
+
+        let modifiers = held_modifiers();
+
+        if key == VK_ESCAPE_CODE && modifiers == 0 {
+            self.end_capture();
+
+            return;
+        }
+
+        let candidate = Hotkey { modifiers, key };
+
+        let slot = capture.slot;
+
+        let other = Slot::ALL.into_iter().find(|&other| other != slot).unwrap_or(slot);
+
+        let problem = if let Some(problem) = candidate.problem() {
+            Some(problem)
+        } else if config::draft_hotkeys().get(other) == candidate {
+            Some(match other {
+                Slot::Wheel => "Это сочетание уже открывает колесо",
+                Slot::Settings => "Это сочетание уже открывает настройки",
+            })
+        } else if !candidate.is_available(self.hwnd) {
+            Some("Занято другой программой или Windows")
+        } else {
+            None
+        };
+
+        match problem {
+            Some(problem) => capture.error = Some(problem),
+
+            None => {
+                config::set_draft_hotkey(slot, candidate);
+
+                self.end_capture();
+            }
+        }
+    }
+
     fn start_fade(&mut self, area: Area) {
         self.fade = 0.0;
 
@@ -704,7 +910,12 @@ impl State {
 
     fn save(&mut self) {
         match config::save() {
-            Ok(()) => self.set_status("✓ Сохранено", SUCCESS),
+            Ok(()) => {
+                self.set_status("✓ Сохранено", SUCCESS);
+
+                // Сочетания могли поменяться — главный цикл займёт новые.
+                self.notify_hotkeys(HOTKEYS_RESUME);
+            }
 
             Err(error) => {
                 eprintln!("Could not save settings: {error}");
@@ -858,7 +1069,7 @@ impl State {
                 "Выберите, сколько секций будет на колесе и какое действие в каждой",
             ),
 
-            Page::Params => ("Параметры действий", "Качество, размеры и форматы результатов"),
+            Page::Params => ("Параметры", "Качество результатов, вид колеса, клавиши и журнал"),
         };
 
         label(pixmap, &fonts.semibold, 26.0, title, PADDING, 36.0, TEXT);
@@ -926,10 +1137,18 @@ impl State {
                 ("● Есть несохранённые изменения".to_string(), WARNING)
             }
 
-            None => (
-                "Колесо: Ctrl+Alt+Space   ·   Настройки: Ctrl+Alt+F12".to_string(),
-                TEXT_FAINT,
-            ),
+            None => {
+                let hotkeys = config::hotkeys();
+
+                (
+                    format!(
+                        "Колесо: {}   ·   Настройки: {}",
+                        hotkeys.wheel.label(),
+                        hotkeys.settings.label()
+                    ),
+                    TEXT_FAINT,
+                )
+            }
         };
 
         label(pixmap, &fonts.regular, 14.0, &status, PADDING, BUTTON_Y + BUTTON_HEIGHT / 2.0, status_color);
@@ -1221,7 +1440,7 @@ impl State {
             label(pixmap, &fonts.semibold, 15.0, group.label, area.x + 14.0, area.center_y(), color);
 
             // Точка — в разделе есть изменённые параметры.
-            if group.params.iter().any(|&id| changed(id)) {
+            if group_changed(index, &draft) {
                 render::fill(
                     pixmap,
                     &render::circle(s(area.x + area.width - 16.0), s(area.center_y()), s(3.5)),
@@ -1235,7 +1454,7 @@ impl State {
 
         let reset_hover = self.hover_of(Target::ResetParams);
 
-        let resettable = group_params(self.group).iter().any(|&id| changed(id));
+        let resettable = group_changed(self.group, &draft);
 
         if resettable {
             render::fill(pixmap, &area_path(reset, 8.0), with_alpha(CARD_HOVER, reset_hover));
@@ -1314,6 +1533,157 @@ impl State {
 
                 centered(pixmap, &fonts.semibold, 14.5, option.label, area, color);
             }
+        }
+
+        if let Some(card) = log_card_area(self.group) {
+            render::fill(pixmap, &area_path(card, 14.0), CARD);
+            render::stroke(pixmap, &area_path(card, 14.0), BORDER, scale);
+
+            label(pixmap, &fonts.semibold, 16.0, "Файл журнала", card.x + PARAM_INSET, card.y + 26.0, TEXT);
+
+            label(
+                pixmap,
+                &fonts.regular,
+                13.5,
+                "%LOCALAPPDATA%\\FileHalo\\журнал.txt",
+                card.x + PARAM_INSET,
+                card.y + 50.0,
+                TEXT_MUTED,
+            );
+
+            let button = log_button_area(card);
+
+            render::fill(
+                pixmap,
+                &area_path(button, 8.0),
+                mix(ACCENT_DARK, ACCENT, self.hover_of(Target::OpenLog)),
+            );
+
+            centered(pixmap, &fonts.semibold, 14.5, "Открыть журнал", button, TEXT);
+        }
+
+        if group_extra(self.group) == Extra::Hotkeys {
+            self.paint_hotkeys(pixmap, scale, fonts);
+        }
+    }
+
+    fn paint_hotkeys(&self, pixmap: &mut Pixmap, scale: f32, fonts: &text::Fonts) {
+        let s = |value: f32| value * scale;
+
+        let area_path = |area: Area, radius: f32| {
+            render::rounded_rect(s(area.x), s(area.y), s(area.width), s(area.height), s(radius))
+        };
+
+        let draft = config::draft_hotkeys();
+
+        let active = config::hotkeys();
+
+        let defaults = hotkeys::Hotkeys::default();
+
+        for (index, &slot) in Slot::ALL.iter().enumerate() {
+            let card = param_area(index);
+
+            let capture = self.capture.as_ref().filter(|capture| capture.slot == slot);
+
+            render::fill(pixmap, &area_path(card, 14.0), CARD);
+            render::stroke(
+                pixmap,
+                &area_path(card, 14.0),
+                if capture.is_some() { with_alpha(ACCENT, 0.8) } else { BORDER },
+                scale,
+            );
+
+            let title_y = card.y + 24.0;
+
+            draw_left(pixmap, &fonts.semibold, s(16.0), slot.title(), s(card.x + PARAM_INSET), s(title_y), TEXT);
+
+            if draft.get(slot) != defaults.get(slot) {
+                let width = text::measure(&fonts.semibold, s(16.0), slot.title()) / scale;
+
+                render::fill(
+                    pixmap,
+                    &render::circle(s(card.x + PARAM_INSET + width + 10.0), s(title_y), s(3.5)),
+                    ACCENT,
+                );
+            }
+
+            draw_left(
+                pixmap,
+                &fonts.regular,
+                s(13.5),
+                slot.hint(),
+                s(card.x + PARAM_INSET),
+                s(card.y + 45.0),
+                TEXT_MUTED,
+            );
+
+            // Клавиши «колпачками»: при захвате — те модификаторы, что держат сейчас.
+            let parts: Vec<String> = match capture {
+                Some(_) => hotkeys::modifier_names(held_modifiers()).iter().map(|name| name.to_string()).collect(),
+
+                None => draft.get(slot).parts(),
+            };
+
+            let row_y = card.y + 60.0;
+
+            let mut x = card.x + PARAM_INSET;
+
+            for part in &parts {
+                let width = (text::measure(&fonts.semibold, s(14.0), part) / scale + 22.0).max(36.0);
+
+                let cap = Area::new(x, row_y, width, CHOICE_HEIGHT);
+
+                render::fill(pixmap, &area_path(cap, 7.0), BACKGROUND);
+                render::stroke(pixmap, &area_path(cap, 7.0), BORDER, scale);
+
+                text::draw_centered(
+                    pixmap,
+                    &fonts.semibold,
+                    s(14.0),
+                    part,
+                    s(cap.center_x()),
+                    s(cap.center_y()),
+                    TEXT,
+                );
+
+                x += width + 6.0;
+            }
+
+            let (note, color) = match capture {
+                Some(Capture { error: Some(error), .. }) => (*error, DANGER),
+                Some(_) => ("Нажмите новое сочетание · Esc — отмена", ACCENT),
+                None if draft.get(slot) != active.get(slot) => ("Заработает после «Сохранить»", TEXT_FAINT),
+                None => ("", TEXT_FAINT),
+            };
+
+            if !note.is_empty() {
+                draw_left(
+                    pixmap,
+                    &fonts.regular,
+                    s(13.5),
+                    note,
+                    s(x + if parts.is_empty() { 0.0 } else { 6.0 }),
+                    s(row_y + CHOICE_HEIGHT / 2.0),
+                    color,
+                );
+            }
+
+            let button = hotkey_button_area(index);
+
+            let hover = self.hover_of(Target::ChangeHotkey(slot));
+
+            render::fill(pixmap, &area_path(button, 8.0), mix(BACKGROUND, CARD_HOVER, hover));
+            render::stroke(pixmap, &area_path(button, 8.0), BORDER, scale);
+
+            text::draw_centered(
+                pixmap,
+                &fonts.semibold,
+                s(14.5),
+                if capture.is_some() { "Отмена" } else { "Изменить" },
+                s(button.center_x()),
+                s(button.center_y()),
+                TEXT,
+            );
         }
     }
 
@@ -1445,6 +1815,8 @@ fn with_state<R>(handler: impl FnOnce(&mut State) -> R) -> Option<R> {
 }
 
 fn hide(hwnd: HWND) {
+    with_state(State::end_capture);
+
     unsafe {
         ShowWindow(hwnd, SW_HIDE);
     }
@@ -1599,6 +1971,31 @@ unsafe extern "system" fn window_proc(
             1
         }
 
+        // Во время захвата сочетания все нажатия — наши: Alt не должен
+        // открывать системное меню окна, Esc — закрывать окно.
+        WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP | WM_SYSCHAR
+            if with_state(|state| state.capture.is_some()).unwrap_or(false) =>
+        {
+            if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+                with_state(|state| state.capture_key(wparam as u32));
+            }
+
+            invalidate(hwnd);
+
+            0
+        }
+
+        // Окно ушло на задний план — захват прекращается.
+        WM_ACTIVATE => {
+            if wparam & 0xFFFF == 0 {
+                with_state(State::end_capture);
+
+                invalidate(hwnd);
+            }
+
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
         WM_KEYDOWN => {
             let key = wparam as u16;
 
@@ -1742,6 +2139,7 @@ impl SettingsUi {
                 choice_x: HashMap::new(),
                 fade: 1.0,
                 fade_area: content_area(),
+                capture: None,
                 menu: None,
                 preview_hover: vec![0.0; MAX_SECTIONS],
                 preview_tilt: (0.0, 0.0),
@@ -1813,4 +2211,3 @@ unsafe fn place_window(hwnd: HWND) {
         SetWindowPos(hwnd, null_mut(), x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
-

@@ -4,12 +4,16 @@ mod clipboard;
 mod config;
 mod converter;
 mod dpi;
+mod errors;
 mod explorer_selection;
 mod file_tools;
 mod file_types;
 mod foreground;
 mod heic;
+mod hotkeys;
+mod icons;
 mod job_manager;
+mod journal;
 mod media;
 mod metadata;
 mod output;
@@ -19,6 +23,7 @@ mod render;
 mod settings_ui;
 mod status_ui;
 mod text;
+mod undo;
 mod wheel;
 mod winrt;
 
@@ -32,24 +37,13 @@ use windows_sys::Win32::Foundation::POINT;
 
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
-};
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, MSG, SetTimer, TranslateMessage,
     WM_HOTKEY, WM_TIMER,
 };
 
-const HOTKEY_ID: i32 = 1;
-const SETTINGS_HOTKEY_ID: i32 = 2;
-
-const VK_SPACE: i32 = 0x20;
-const VK_CONTROL: i32 = 0x11;
-const VK_MENU: i32 = 0x12;
-// Не буква: на раскладках с AltGr (польская и др.) Ctrl+Alt+буква
-// печатает символ, и глобальная горячая клавиша мешала бы набору текста.
-const VK_F12: u32 = 0x7B;
+use hotkeys::Slot;
 
 // Кадр анимации колеса (~60 к/с). Таймер идёт, пока колесо видно.
 const FRAME_TIMER_ID: usize = 1;
@@ -61,12 +55,30 @@ const SELECT_TIMER_ID: usize = 3;
 const SELECT_RETRY_MS: u32 = 100;
 const SELECT_MAX_ATTEMPTS: u32 = 20;
 
-fn key_is_down(vk: i32) -> bool {
-    unsafe { GetAsyncKeyState(vk) < 0 }
+// Колесо открыто, пока держат его сочетание.
+fn trigger_is_held() -> bool {
+    config::hotkeys().wheel.is_held()
 }
 
-fn trigger_is_held() -> bool {
-    key_is_down(VK_CONTROL) && key_is_down(VK_MENU) && key_is_down(VK_SPACE)
+// Регистрирует горячие клавиши из настроек. Возвращает сочетания, которые
+// занять не удалось (их уже использует другая программа).
+fn register_hotkeys() -> Vec<Slot> {
+    let hotkeys = config::hotkeys();
+
+    Slot::ALL
+        .into_iter()
+        .filter(|&slot| {
+            hotkeys::unregister(null_mut(), slot.id());
+
+            !hotkeys.get(slot).register(null_mut(), slot.id())
+        })
+        .collect()
+}
+
+fn unregister_hotkeys() {
+    for slot in Slot::ALL {
+        hotkeys::unregister(null_mut(), slot.id());
+    }
 }
 
 // «1 файл», «2 файла», «5 файлов».
@@ -91,8 +103,8 @@ struct Report {
     detail: Option<String>,
     // Показать, даже если задача была мгновенной.
     always: bool,
-    // Предложить установить расширение HEVC.
-    offer_store: bool,
+    // Кнопка на карточке: «Открыть Store», «Отменить», «Подробнее».
+    button: Option<status_ui::Button>,
 }
 
 fn capitalize(text: &str) -> String {
@@ -128,7 +140,7 @@ fn report(outcome: &ActionOutcome) -> Report {
             title: "Отменено".to_string(),
             detail: (done > 0).then(|| format!("Готово до отмены: {done}")),
             always: true,
-            offer_store: false,
+            button: None,
         };
     }
 
@@ -139,23 +151,31 @@ fn report(outcome: &ActionOutcome) -> Report {
             title: "Нужно расширение HEVC".to_string(),
             detail: Some("Видео снято в HEVC, как на iPhone".to_string()),
             always: true,
-            offer_store: true,
+            button: Some(status_ui::Button::OpenStore),
         };
     }
 
     if failed > 0 {
-        let title = if done == 0 && skipped == 0 && failed == 1 {
-            "Ошибка".to_string()
+        let first = outcome.failures.first().map(|(_, error)| error.as_str()).unwrap_or_default();
+
+        // Одна ошибка: что не получилось — заголовком, причина — второй
+        // строкой («Не удалось открыть картинку» / «Файл занят другой программой»).
+        let (title, detail) = if done == 0 && skipped == 0 && failed == 1 {
+            match first.split_once(": ") {
+                Some((what, why)) => (what.to_string(), capitalize(why)),
+                None => ("Ошибка".to_string(), first.to_string()),
+            }
         } else {
-            format!("Ошибок: {failed} из {}", done + skipped + failed)
+            (format!("Ошибок: {failed} из {}", done + skipped + failed), first.to_string())
         };
 
         return Report {
             outcome: Outcome::Error,
             title,
-            detail: outcome.failures.first().map(|(_, error)| error.clone()),
+            detail: Some(detail),
             always: true,
-            offer_store: false,
+            // Подробности — в журнале.
+            button: Some(status_ui::Button::OpenLog),
         };
     }
 
@@ -165,7 +185,7 @@ fn report(outcome: &ActionOutcome) -> Report {
             title: message.clone(),
             detail: None,
             always: true,
-            offer_store: false,
+            button: None,
         };
     }
 
@@ -178,7 +198,7 @@ fn report(outcome: &ActionOutcome) -> Report {
             },
             detail: skip_reason(&outcome.skipped),
             always: true,
-            offer_store: false,
+            button: None,
         };
     }
 
@@ -188,12 +208,47 @@ fn report(outcome: &ActionOutcome) -> Report {
         (_, _) => format!("Готово: {done}, пропущено: {skipped}"),
     };
 
+    // Есть что отменить — карточку показываем, даже если всё было быстро:
+    // иначе кнопку не успеть нажать.
+    let undoable = !outcome.undo.is_empty();
+
     Report {
         outcome: Outcome::Success,
         title,
         detail: skip_reason(&outcome.skipped),
-        always: skipped > 0,
-        offer_store: false,
+        always: skipped > 0 || undoable,
+        button: undoable.then_some(status_ui::Button::Undo),
+    }
+}
+
+// Итог «Отменить»: сколько не получилось вернуть и почему.
+fn undo_report(failures: &[String]) -> Report {
+    use status_ui::Outcome;
+
+    match failures {
+        [] => Report {
+            outcome: Outcome::Success,
+            title: "Отменено".to_string(),
+            detail: Some("Созданное — в корзине, изменённое — как было".to_string()),
+            always: true,
+            button: None,
+        },
+
+        [single] => Report {
+            outcome: Outcome::Error,
+            title: "Отменить не удалось".to_string(),
+            detail: Some(single.clone()),
+            always: true,
+            button: Some(status_ui::Button::OpenLog),
+        },
+
+        [first, ..] => Report {
+            outcome: Outcome::Error,
+            title: format!("Не удалось отменить: {}", failures.len()),
+            detail: Some(first.clone()),
+            always: true,
+            button: Some(status_ui::Button::OpenLog),
+        },
     }
 }
 
@@ -212,11 +267,15 @@ fn open_url(url: &str) {
 fn main() {
     dpi::enable_per_monitor_awareness();
 
+    journal::install_panic_hook();
+
+    journal::write(&format!("Запуск FileHalo {}", env!("CARGO_PKG_VERSION")));
+
+    // Копии для «Отменить» от прошлого запуска уже не понадобятся.
+    undo::clear_backups();
+
     println!("FileHalo starting...");
 
-    println!("Hold: Ctrl + Alt + Space");
-
-    println!("Settings: Ctrl + Alt + F12");
 
     let config_path = match config::initialize() {
         Ok(path) => path,
@@ -257,32 +316,28 @@ fn main() {
             return;
         };
 
-        let registered = RegisterHotKey(
-            null_mut(),
-            HOTKEY_ID,
-            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
-            VK_SPACE as u32,
-        );
+        let hotkeys = config::hotkeys();
 
-        if registered == 0 {
+        println!("Hold: {}", hotkeys.wheel.label());
+
+        println!("Settings: {}", hotkeys.settings.label());
+
+        let failed = register_hotkeys();
+
+        // Колесо не зарегистрировалось — скорее всего, программа уже
+        // запущена (или сочетание заняла другая).
+        if failed.contains(&Slot::Wheel) {
+            journal::write(&format!("Сочетание {} занято — выход", hotkeys.wheel.label()));
+
             eprintln!("Could not register wheel hotkey.");
+
+            unregister_hotkeys();
 
             return;
         }
 
-        let settings_registered = RegisterHotKey(
-            null_mut(),
-            SETTINGS_HOTKEY_ID,
-            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
-            VK_F12,
-        );
-
-        if settings_registered == 0 {
-            eprintln!("Could not register settings hotkey.");
-
-            UnregisterHotKey(null_mut(), HOTKEY_ID);
-
-            return;
+        if failed.contains(&Slot::Settings) {
+            journal::write(&format!("Сочетание {} занято другой программой", hotkeys.settings.label()));
         }
 
         println!("FileHalo ready.");
@@ -302,6 +357,9 @@ fn main() {
         // (файлы, включить переименование, номер попытки).
         let mut pending_select: Option<(Vec<PathBuf>, bool, u32)> = None;
 
+        // Как отменить последнее действие (кнопка «Отменить»).
+        let mut last_undo: Vec<undo::Step> = Vec::new();
+
         loop {
             let result = GetMessageW(&mut message, null_mut(), 0, 0);
 
@@ -320,7 +378,7 @@ fn main() {
             // -------------------------
 
             if message.message == job_manager::WM_FILEHALO_JOB_DONE {
-                if let Some(job_manager::JobResult { action, outcome }) = job_manager::take_result()
+                if let Some(job_manager::JobResult { action, mut outcome }) = job_manager::take_result()
                 {
                     println!("FINISHED: {}", action.title(&config::params()));
 
@@ -336,20 +394,43 @@ fn main() {
                         eprintln!("FAILED: {}: {}", input.display(), error);
                     }
 
-                    if let Some(text) = &outcome.clipboard
-                        && let Err(error) = clipboard::set_text(wheel.hwnd(), text)
-                    {
-                        eprintln!("CLIPBOARD: {error}");
+                    let clipboard_error = outcome
+                        .clipboard
+                        .as_ref()
+                        .and_then(|text| clipboard::set_text(wheel.hwnd(), text).err());
+
+                    // Новое действие — отменять можно уже только его.
+                    undo::discard(&last_undo);
+
+                    last_undo = std::mem::take(&mut outcome.undo);
+
+                    let mut report = report(&outcome);
+
+                    if !last_undo.is_empty() && report.button != Some(status_ui::Button::Undo) {
+                        undo::discard(&last_undo);
+
+                        last_undo.clear();
                     }
 
-                    let report = report(&outcome);
+                    // «Путь скопирован» — только если он правда в буфере.
+                    if let Some(error) = clipboard_error {
+                        journal::write(&format!("  буфер обмена: {error}"));
+
+                        report = Report {
+                            outcome: status_ui::Outcome::Error,
+                            title: "Не скопировано".to_string(),
+                            detail: Some(error),
+                            always: true,
+                            button: None,
+                        };
+                    }
 
                     status_ui.finish(
                         report.outcome,
                         report.title,
                         report.detail,
                         report.always,
-                        report.offer_store,
+                        report.button,
                     );
 
                     if !outcome.outputs.is_empty() {
@@ -414,6 +495,26 @@ fn main() {
                         status_ui.show_store_hint();
                     }
 
+                    Some(status_ui::Button::Undo) => {
+                        // Результат больше не нужно выделять в Проводнике.
+                        pending_select = None;
+
+                        let failures = undo::revert(&last_undo);
+
+                        last_undo.clear();
+
+                        journal::write(&match failures.len() {
+                            0 => "↶ отменено".to_string(),
+                            count => format!("↶ отменено, кроме {count}: {}", failures.join("; ")),
+                        });
+
+                        let report = undo_report(&failures);
+
+                        status_ui.finish(report.outcome, report.title, report.detail, true, report.button);
+                    }
+
+                    Some(status_ui::Button::OpenLog) => journal::open(),
+
                     None => {}
                 }
 
@@ -434,7 +535,38 @@ fn main() {
             // SETTINGS HOTKEY
             // -------------------------
 
-            if message.message == WM_HOTKEY && message.wParam == SETTINGS_HOTKEY_ID as usize {
+            // -------------------------
+            // HOTKEYS CHANGED IN SETTINGS
+            // -------------------------
+
+            if message.message == settings_ui::WM_SETTINGS_HOTKEYS {
+                if message.wParam == settings_ui::HOTKEYS_SUSPEND {
+                    // Пока в настройках ловят новое сочетание, наши не мешают.
+                    unregister_hotkeys();
+                } else {
+                    let failed = register_hotkeys();
+
+                    if !failed.is_empty() {
+                        let hotkeys = config::hotkeys();
+
+                        let names: Vec<String> = failed.iter().map(|&slot| hotkeys.get(slot).label()).collect();
+
+                        journal::write(&format!("Не удалось занять сочетание: {}", names.join(", ")));
+
+                        status_ui.finish(
+                            status_ui::Outcome::Error,
+                            format!("Сочетание {} занято", names[0]),
+                            Some("Выберите другое в настройках".to_string()),
+                            true,
+                            None,
+                        );
+                    }
+                }
+
+                continue;
+            }
+
+            if message.message == WM_HOTKEY && message.wParam == Slot::Settings.id() as usize {
                 settings_ui.show();
 
                 continue;
@@ -444,9 +576,14 @@ fn main() {
             // OPEN WHEEL
             // -------------------------
 
-            if message.message == WM_HOTKEY && message.wParam == HOTKEY_ID as usize && !holding {
+            if message.message == WM_HOTKEY && message.wParam == Slot::Wheel.id() as usize && !holding {
+                // Колесо работает с выделенным в Проводнике. Иначе — подсказка
+                // у курсора, чтобы было понятно, почему ничего не открылось.
                 if !foreground::foreground_is_explorer() {
-                    println!("Not Explorer. Ignoring.");
+                    status_ui.hint(
+                        "Колесо работает в Проводнике",
+                        "Выделите файлы в папке или на рабочем столе",
+                    );
 
                     continue;
                 }
@@ -454,7 +591,10 @@ fn main() {
                 let selection = Selection::new(explorer_selection::selected_paths());
 
                 if selection.files.is_empty() {
-                    println!("No selected file.");
+                    status_ui.hint(
+                        "Ничего не выделено",
+                        &format!("Выделите файлы и нажмите {}", config::hotkeys().wheel.label()),
+                    );
 
                     continue;
                 }
@@ -571,8 +711,6 @@ fn main() {
             DispatchMessageW(&message);
         }
 
-        UnregisterHotKey(null_mut(), HOTKEY_ID);
-
-        UnregisterHotKey(null_mut(), SETTINGS_HOTKEY_ID);
+        unregister_hotkeys();
     }
 }

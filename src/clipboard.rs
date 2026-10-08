@@ -27,18 +27,18 @@ pub fn set_text(owner: HWND, text: &str) -> Result<(), String> {
         }
 
         if !opened {
-            return Err("Clipboard is busy".to_string());
+            return Err("Буфер обмена занят другой программой".to_string());
         }
 
         let result = (|| {
             if EmptyClipboard() == 0 {
-                return Err("Could not clear clipboard".to_string());
+                return Err("Не удалось скопировать в буфер обмена".to_string());
             }
 
             let memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
 
             if memory.is_null() {
-                return Err("Out of memory".to_string());
+                return Err("Не хватает памяти".to_string());
             }
 
             let target = GlobalLock(memory) as *mut u16;
@@ -46,7 +46,7 @@ pub fn set_text(owner: HWND, text: &str) -> Result<(), String> {
             if target.is_null() {
                 GlobalFree(memory);
 
-                return Err("Could not lock clipboard memory".to_string());
+                return Err("Не удалось скопировать в буфер обмена".to_string());
             }
 
             std::ptr::copy_nonoverlapping(wide.as_ptr(), target, wide.len());
@@ -57,7 +57,7 @@ pub fn set_text(owner: HWND, text: &str) -> Result<(), String> {
             if SetClipboardData(CF_UNICODETEXT as u32, memory).is_null() {
                 GlobalFree(memory);
 
-                return Err("Could not set clipboard data".to_string());
+                return Err("Не удалось скопировать в буфер обмена".to_string());
             }
 
             Ok(())

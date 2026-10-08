@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::file_types::{self, ImageKind};
 use crate::icons::Icon;
+use crate::archive::ArchiveFormat;
 use crate::media::{self, AudioFormat, VideoFormat};
 use crate::params::Params;
 use crate::undo::{self, Step};
@@ -70,7 +71,30 @@ fn is_audio(path: &Path) -> bool {
 }
 
 fn is_archive(path: &Path) -> bool {
-    (file_types::is_zip(path) || file_types::is_seven_zip(path)) && is_file(path)
+    (file_types::is_zip(path) || file_types::is_seven_zip(path) || file_types::is_rar(path)) && is_file(path)
+}
+
+// Архивы из выделения. Части многотомного RAR («.part2.rar» ...) — это один
+// архив: остаётся только первая часть, даже если выделены все.
+fn archives(selection: &Selection, keep: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let mut result: Vec<PathBuf> = Vec::new();
+
+    for file in selection.matching(|file| is_archive(file) && keep(file)) {
+        let first = if file_types::is_rar(&file) {
+            unrar::Archive::new(&file)
+                .first_part_option()
+                .filter(|first| first.exists())
+                .unwrap_or_else(|| file.clone())
+        } else {
+            file
+        };
+
+        if !result.contains(&first) {
+            result.push(first);
+        }
+    }
+
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +185,8 @@ pub enum ActionId {
     PdfToImages,
     CreateZip,
     ExtractArchive,
+    ArchiveToZip,
+    ArchiveTo7z,
     RotateLeft,
     RotateRight,
     ConvertToIco,
@@ -223,6 +249,8 @@ impl ActionId {
         ActionId::PdfToImages,
         ActionId::CreateZip,
         ActionId::ExtractArchive,
+        ActionId::ArchiveToZip,
+        ActionId::ArchiveTo7z,
         ActionId::RotateLeft,
         ActionId::RotateRight,
         ActionId::ConvertToIco,
@@ -258,6 +286,8 @@ impl ActionId {
             Self::PdfToImages => "PNG",
             Self::CreateZip => "ZIP",
             Self::ExtractArchive => "Распаковать",
+            Self::ArchiveToZip => "В ZIP",
+            Self::ArchiveTo7z => "В 7z",
             Self::RotateLeft => "Влево",
             Self::RotateRight => "Вправо",
             Self::ConvertToIco => "ICO",
@@ -302,6 +332,8 @@ impl ActionId {
             Self::PdfToImages => "Страницы в PNG",
             Self::CreateZip => "Упаковать в ZIP",
             Self::ExtractArchive => "Распаковать сюда",
+            Self::ArchiveToZip => "Переупаковать в ZIP",
+            Self::ArchiveTo7z => "Переупаковать в 7z",
             Self::RotateLeft => "Повернуть влево",
             Self::RotateRight => "Повернуть вправо",
             Self::ConvertToIco => "Сделать значок ICO",
@@ -338,6 +370,7 @@ impl ActionId {
             Self::MergePdfs | Self::MergeVideos | Self::MergeAudio => Icon::Merge,
             Self::CreateZip => Icon::Archive,
             Self::ExtractArchive => Icon::Extract,
+            Self::ArchiveToZip | Self::ArchiveTo7z => Icon::Repack,
             Self::RotateLeft => Icon::RotateLeft,
             Self::RotateRight => Icon::RotateRight,
             Self::ConvertToIco => Icon::AppIcon,
@@ -378,7 +411,7 @@ impl ActionId {
 
             Self::MergePdfs | Self::PdfToImages => category == Category::Pdf,
 
-            Self::ExtractArchive => category == Category::Archive,
+            Self::ExtractArchive | Self::ArchiveToZip | Self::ArchiveTo7z => category == Category::Archive,
 
             Self::ConvertToMp4
             | Self::ConvertToWmv
@@ -427,7 +460,11 @@ impl ActionId {
 
             Self::CreateZip => selection.matching(|_| true),
 
-            Self::ExtractArchive => selection.matching(is_archive),
+            Self::ExtractArchive => archives(selection, |_| true),
+
+            Self::ArchiveToZip => archives(selection, |file| !file_types::is_zip(file)),
+
+            Self::ArchiveTo7z => archives(selection, |file| !file_types::is_seven_zip(file)),
 
             Self::CopyPath | Self::IntoNewFolder => selection.matching(|_| true),
 
@@ -662,6 +699,8 @@ impl ActionId {
             Self::StripMetadata => metadata::strip(input),
             Self::PdfToImages => Ok(pdf::to_images(input, params)?),
             Self::ExtractArchive => Ok(archive::extract(input)?),
+            Self::ArchiveToZip => Ok(archive::repack(input, ArchiveFormat::Zip, params)?),
+            Self::ArchiveTo7z => Ok(archive::repack(input, ArchiveFormat::SevenZip, params)?),
             Self::RotateLeft => converter::rotate(input, false),
             Self::RotateRight => converter::rotate(input, true),
             Self::ConvertToIco => Ok(converter::to_ico(input)?),

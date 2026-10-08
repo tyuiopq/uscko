@@ -56,6 +56,10 @@ pub fn is_seven_zip(path: &Path) -> bool {
     extension(path).as_deref() == Some("7z")
 }
 
+pub fn is_rar(path: &Path) -> bool {
+    extension(path).as_deref() == Some("rar")
+}
+
 // Видео и аудио, которые умеет открыть встроенный в Windows медиадвижок
 // (для части форматов нужны расширения из Microsoft Store).
 pub fn is_video(path: &Path) -> bool {

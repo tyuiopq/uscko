@@ -11,4 +11,8 @@ fn main() {
     println!("cargo:rustc-link-lib=oleaut32");
     println!("cargo:rustc-link-lib=shell32");
     println!("cargo:rustc-link-lib=uuid");
+
+    // UnRAR (крейт unrar) использует реестр и криптографию Windows,
+    // но сам advapi32 не подключает.
+    println!("cargo:rustc-link-lib=advapi32");
 }

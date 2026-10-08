@@ -1,6 +1,23 @@
+// Архивы: упаковка в ZIP, распаковка ZIP, 7z и RAR, переупаковка
+// RAR/7z -> ZIP и ZIP/RAR -> 7z.
+//
+// RAR читается официальной библиотекой UnRAR (через крейт unrar). Её
+// лицензия требует приводить этот абзац:
+//
+//   UnRAR source code may be used in any software to handle RAR archives
+//   without limitations free of charge, but cannot be used to develop RAR
+//   (WinRAR) compatible archiver and to re-create RAR compression
+//   algorithm, which is proprietary. Distribution of modified UnRAR source
+//   code in separate form or as a part of other software is permitted,
+//   provided that full text of this paragraph, starting from "UnRAR source
+//   code" words, is included in license, or in documentation if license is
+//   not available, and in source code comments of resulting package.
+//
+// Создавать RAR нельзя никому, кроме WinRAR, поэтому «в RAR» нет.
+
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -410,19 +427,115 @@ fn extract_seven_zip(source: &Path, root: &Path) -> Result<(), String> {
     }
 }
 
-// Распаковывает рядом с архивом (ZIP или 7z). Если в архиве один файл или
-// одна папка — она кладётся прямо рядом, иначе всё содержимое — в папку
+// Ссылка (symlink) внутри RAR: атрибут Windows «точка повторной обработки»
+// или тип «ссылка» в правах Unix. Такие не распаковываем: ссылка может
+// вести куда угодно за пределы папки.
+fn is_rar_link(attributes: u32) -> bool {
+    const REPARSE_POINT: u32 = 0x400;
+    const UNIX_TYPE_MASK: u32 = 0o170000;
+    const UNIX_SYMLINK: u32 = 0o120000;
+
+    attributes & REPARSE_POINT != 0 || attributes & UNIX_TYPE_MASK == UNIX_SYMLINK
+}
+
+fn extract_rar(source: &Path, root: &Path) -> Result<(), String> {
+    use unrar::error::{Code, UnrarError};
+
+    let describe = |error: UnrarError| match error.code {
+        Code::MissingPassword | Code::BadPassword => PASSWORD_PROTECTED.to_string(),
+
+        Code::EOpen => errors::fail("Не хватает части многотомного архива", error),
+
+        Code::BadData | Code::BadArchive | Code::UnknownFormat => {
+            errors::fail("Архив повреждён или это не RAR", error)
+        }
+
+        _ => errors::fail("Не удалось распаковать RAR", error),
+    };
+
+    // Многотомный архив всегда читается с первой части.
+    let mut archive = unrar::Archive::new(source)
+        .as_first_part()
+        .open_for_processing()
+        .map_err(describe)?;
+
+    while let Some(header) = archive.read_header().map_err(describe)? {
+        job_manager::check_cancelled()?;
+
+        let entry = header.entry();
+
+        if entry.is_encrypted() {
+            return Err(PASSWORD_PROTECTED.to_string());
+        }
+
+        let name = entry.filename.to_string_lossy().into_owned();
+
+        let relative = safe_relative_path(&name);
+
+        archive = match relative {
+            Some(relative) if entry.is_directory() => {
+                fs::create_dir_all(root.join(relative))
+                    .map_err(|error| errors::io("Не удалось распаковать", &error))?;
+
+                header.skip().map_err(describe)?
+            }
+
+            Some(relative) if !is_rar_link(entry.file_attr) => {
+                let target = root.join(relative);
+
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(|error| errors::io("Не удалось распаковать", &error))?;
+                }
+
+                header.extract_to(&target).map_err(describe)?
+            }
+
+            _ => {
+                crate::journal::write("    пропущен файл архива с небезопасным путём или ссылка");
+
+                header.skip().map_err(describe)?
+            }
+        };
+    }
+
+    Ok(())
+}
+
+// Распаковывает архив любого поддерживаемого формата в папку root.
+fn unpack(source: &Path, root: &Path) -> Result<(), String> {
+    if file_types::is_seven_zip(source) {
+        extract_seven_zip(source, root)
+    } else if file_types::is_rar(source) {
+        extract_rar(source, root)
+    } else {
+        extract_zip(source, root)
+    }
+}
+
+// Имя для результата: «фильм.part1.rar» -> «фильм», «docs.zip» -> «docs».
+fn archive_stem(source: &Path) -> Result<OsString, String> {
+    let stem = output::stem_of(source)?.to_string_lossy().into_owned();
+
+    if file_types::is_rar(source)
+        && let Some(index) = stem.to_ascii_lowercase().rfind(".part")
+        && stem.len() > index + 5
+        && stem[index + 5..].chars().all(|character| character.is_ascii_digit())
+    {
+        return Ok(OsString::from(&stem[..index]));
+    }
+
+    Ok(OsString::from(stem))
+}
+
+// Распаковывает рядом с архивом (ZIP, 7z или RAR). Если в архиве один файл
+// или одна папка — она кладётся прямо рядом, иначе всё содержимое — в папку
 // с именем архива.
 pub fn extract(source: &Path) -> Result<PathBuf, String> {
     let folder = output::parent_of(source)?;
 
     let temp = output::temp_dir(folder)?;
 
-    if file_types::is_seven_zip(source) {
-        extract_seven_zip(source, temp.path())?;
-    } else {
-        extract_zip(source, temp.path())?;
-    }
+    unpack(source, temp.path())?;
 
     let top_level: Vec<PathBuf> = fs::read_dir(temp.path())
         .map_err(|error| errors::io("Не удалось распаковать", &error))?
@@ -453,9 +566,207 @@ pub fn extract(source: &Path) -> Result<PathBuf, String> {
         }
 
         _ => {
-            let target = output::available_path(folder, output::stem_of(source)?, None)?;
+            let target = output::available_path(folder, &archive_stem(source)?, None)?;
 
             output::finish_temp(temp, None, &target)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Переупаковка
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    Zip,
+    SevenZip,
+}
+
+impl ArchiveFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Zip => "zip",
+            Self::SevenZip => "7z",
+        }
+    }
+}
+
+// Всё содержимое папки: (путь, имя внутри архива), папки раньше своих файлов.
+fn collect_entries(root: &Path) -> Result<Vec<(PathBuf, String, bool)>, String> {
+    let mut entries = Vec::new();
+
+    let mut pending = vec![root.to_path_buf()];
+
+    while let Some(folder) = pending.pop() {
+        let mut children: Vec<PathBuf> = fs::read_dir(&folder)
+            .map_err(|error| errors::io("Не удалось прочитать распакованное", &error))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
+
+        children.sort();
+
+        for child in children {
+            let metadata = fs::symlink_metadata(&child)
+                .map_err(|error| errors::io("Не удалось прочитать распакованное", &error))?;
+
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+
+            let name = entry_name(&child, root)?;
+
+            if metadata.is_dir() {
+                pending.push(child.clone());
+            }
+
+            entries.push((child, name, metadata.is_dir()));
+        }
+    }
+
+    entries.sort_by(|a, b| a.1.cmp(&b.1));
+
+    Ok(entries)
+}
+
+// Файл открывается только когда до него дошла очередь (в 7z сразу
+// передаются все файлы блока). Чтение отслеживает «Отменить» и прогресс.
+struct LazyFile {
+    path: PathBuf,
+    file: Option<File>,
+    done: bool,
+    progress: std::rc::Rc<std::cell::Cell<(u64, u64)>>,
+}
+
+impl Read for LazyFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if job_manager::is_cancelled() {
+            return Err(std::io::Error::other(job_manager::CANCELLED));
+        }
+
+        if self.done {
+            return Ok(0);
+        }
+
+        if self.file.is_none() {
+            self.file = Some(File::open(&self.path)?);
+        }
+
+        let read = self.file.as_mut().map_or(Ok(0), |file| file.read(buffer))?;
+
+        if read == 0 {
+            // Прочитан до конца — закрываем, чтобы не держать тысячи файлов.
+            self.file = None;
+            self.done = true;
+        }
+
+        let (done, total) = self.progress.get();
+
+        let done = done + read as u64;
+
+        self.progress.set((done, total));
+
+        job_manager::set_file_progress(done as f64 / total.max(1) as f64);
+
+        Ok(read)
+    }
+}
+
+fn pack_seven_zip<W: Write + std::io::Seek>(root: &Path, writer: W) -> Result<(), String> {
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader};
+
+    let failed = |error: sevenz_rust2::Error| errors::fail("Не удалось записать 7z", error);
+
+    let entries = collect_entries(root)?;
+
+    let total: u64 = entries
+        .iter()
+        .filter(|(_, _, is_dir)| !is_dir)
+        .filter_map(|(path, _, _)| fs::metadata(path).ok().map(|metadata| metadata.len()))
+        .sum();
+
+    let progress = std::rc::Rc::new(std::cell::Cell::new((0, total)));
+
+    let mut archive = ArchiveWriter::new(writer).map_err(failed)?;
+
+    let mut files = Vec::new();
+
+    let mut readers = Vec::new();
+
+    for (path, name, is_dir) in entries {
+        let entry = ArchiveEntry::from_path(&path, name);
+
+        if is_dir {
+            archive.push_archive_entry::<&[u8]>(entry, None).map_err(failed)?;
+
+            continue;
+        }
+
+        files.push(entry);
+
+        readers.push(SourceReader::new(LazyFile {
+            path,
+            file: None,
+            done: false,
+            progress: progress.clone(),
+        }));
+    }
+
+    // Все файлы — одним «сплошным» блоком: так 7z сжимает лучше всего.
+    if !files.is_empty() {
+        archive.push_archive_entries(files, readers).map_err(failed)?;
+    }
+
+    archive
+        .finish()
+        .map(|_| ())
+        .map_err(|error| errors::io("Не удалось записать 7z", &error))
+}
+
+fn pack_zip<W: Write + std::io::Seek>(root: &Path, writer: W, level: i64) -> Result<(), String> {
+    let mut zip = ZipWriter::new(writer);
+
+    let mut top_level: Vec<PathBuf> = fs::read_dir(root)
+        .map_err(|error| errors::io("Не удалось прочитать распакованное", &error))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+
+    top_level.sort();
+
+    let count = top_level.len();
+
+    for (index, item) in top_level.iter().enumerate() {
+        add_to_zip(&mut zip, item, root, level)?;
+
+        job_manager::set_file_progress((index + 1) as f64 / count.max(1) as f64);
+    }
+
+    zip.finish()
+        .map(|_| ())
+        .map_err(|error| errors::fail("Не удалось записать архив", error))
+}
+
+// Переупаковывает архив в другой формат: «docs.rar» -> «docs.zip» рядом.
+// Содержимое распаковывается во временную папку и упаковывается заново.
+pub fn repack(source: &Path, format: ArchiveFormat, params: &Params) -> Result<PathBuf, String> {
+    let folder = output::parent_of(source)?;
+
+    let temp = output::temp_dir(folder)?;
+
+    unpack(source, temp.path())?;
+
+    job_manager::check_cancelled()?;
+
+    let target = output::available_path(folder, &archive_stem(source)?, Some(format.extension()))?;
+
+    let result = output::write_file(&target, |writer| match format {
+        ArchiveFormat::Zip => pack_zip(temp.path(), writer, params.zip_level()),
+        ArchiveFormat::SevenZip => pack_seven_zip(temp.path(), writer),
+    });
+
+    // Отмена посреди упаковки приходит ошибкой чтения — это не сбой.
+    match result {
+        Err(_) if job_manager::is_cancelled() => Err(job_manager::CANCELLED.to_string()),
+        result => result,
     }
 }

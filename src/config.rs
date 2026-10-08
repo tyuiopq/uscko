@@ -184,7 +184,7 @@ pub struct WheelConfig {
 
 // Версия формата конфига. Повышается, когда новым действиям нужно место
 // в уже сохранённых раскладках (см. migrate).
-const CONFIG_VERSION: u32 = 5;
+const CONFIG_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -294,6 +294,22 @@ fn default_video() -> Layout {
     )
 }
 
+// Вверх — распаковать, по бокам — переупаковки, вниз — в папку и путь.
+fn default_archive() -> Layout {
+    use ActionId::*;
+
+    Layout::new(
+        5,
+        vec![
+            Some(ExtractArchive),
+            Some(ArchiveToZip),
+            Some(IntoNewFolder),
+            Some(CopyPath),
+            Some(ArchiveTo7z),
+        ],
+    )
+}
+
 fn default_audio() -> Layout {
     use ActionId::*;
 
@@ -364,6 +380,17 @@ fn migrate(config: &mut AppConfig) -> bool {
         }
     }
 
+    // Версия 6: в архивах появились «В ZIP» и «В 7z». Нетронутая раскладка
+    // меняется на новую; изменённую пользователем не трогаем — новые
+    // действия можно поставить в настройках.
+    if config.version < 6 {
+        let old = Layout::new(3, vec![Some(ActionId::ExtractArchive), Some(ActionId::IntoNewFolder), Some(ActionId::CopyPath)]);
+
+        if config.wheel.archive == old {
+            config.wheel.archive = default_archive();
+        }
+    }
+
     config.version = CONFIG_VERSION;
 
     true
@@ -385,10 +412,7 @@ impl Default for WheelConfig {
                 vec![Some(PdfToImages), Some(MergePdfs), Some(CreateZip), Some(CopyPath)],
             ),
 
-            archive: Layout::new(
-                3,
-                vec![Some(ExtractArchive), Some(IntoNewFolder), Some(CopyPath)],
-            ),
+            archive: default_archive(),
 
             video: default_video(),
 

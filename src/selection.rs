@@ -25,6 +25,8 @@ unsafe extern "C" {
 
     fn filehalo_dialog_show_files(dialog: HWND, paths: *const u16, select: i32) -> i32;
 
+    fn filehalo_dialog_refresh(dialog: HWND);
+
 }
 
 unsafe extern "C" fn collect_path(context: *mut c_void, path: *const u16) {
@@ -138,12 +140,15 @@ pub fn put_into_dialog(dialog: isize, outputs: &[PathBuf]) -> bool {
 // выделяется: имя попало бы в поле и при сохранении перезаписало бы результат.
 //
 // Окно замечает новые файлы само, но не сразу (под нагрузкой — секунды),
-// поэтому пробуем несколько раз. Обновлять его принудительно (F5) нельзя:
-// обновление сбрасывает выделение, в том числе только что сделанное. Не
+// поэтому пробуем несколько раз; не заметило за 3 секунды — просим его
+// обновиться (F5). Обновление сбрасывает выделение и может прийти позже
+// нашего, поэтому через полсекунды после выделения выделяем ещё раз. Не
 // дождались — в «Открыть» в поле «Имя файла» всё равно будет полный путь.
-// Всё в фоновом потоке: зависшая чужая программа не должна подвесить FileHalo.
+// Всё в фоновом потоке: зависшая чужая программа не должна подвесить uskko.
 pub fn deliver_to_dialog(dialog: isize, outputs: Vec<PathBuf>) -> std::thread::JoinHandle<()> {
-    const ATTEMPTS: u32 = 50;
+    const ATTEMPTS: u32 = 60;
+    const REFRESH_AT: u32 = 30;
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
     const PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 
     std::thread::spawn(move || {
@@ -182,9 +187,20 @@ pub fn deliver_to_dialog(dialog: isize, outputs: Vec<PathBuf>) -> std::thread::J
                 _ => {}
             }
 
+            if attempt == REFRESH_AT {
+                unsafe { filehalo_dialog_refresh(window) };
+            }
+
             if attempt + 1 < ATTEMPTS {
                 std::thread::sleep(PAUSE);
             }
+        }
+
+        // Выделение могло сбросить запоздавшее обновление — выделяем ещё раз.
+        if shown {
+            std::thread::sleep(SETTLE);
+
+            unsafe { filehalo_dialog_show_files(window, list.as_ptr(), open as i32) };
         }
 
         // Выделенный файл окно само вписало в поле «Имя файла» (а запись в

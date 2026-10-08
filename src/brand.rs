@@ -125,7 +125,8 @@ pub fn draw(size: u32) -> Pixmap {
     pixmap
 }
 
-#[cfg(test)]
+// Установщик подключает этот файл без крейта image — там тест не нужен.
+#[cfg(all(test, not(uskko_installer)))]
 mod tests {
     use image::codecs::ico::{IcoEncoder, IcoFrame};
 

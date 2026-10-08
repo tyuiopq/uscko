@@ -3,6 +3,9 @@ name = "uskko"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [".", "installer"]
+
 [dependencies]
 ab_glyph = "0.2.32"
 crc32fast = "1"

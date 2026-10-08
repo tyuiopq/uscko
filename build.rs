@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(uskko_installer)");
+
     println!("cargo:rerun-if-changed=src/explorer_selection.cpp");
     println!("cargo:rerun-if-changed=src/file_dialog.cpp");
 

@@ -694,3 +694,19 @@ int filehalo_dialog_show_files(HWND dialog, const wchar_t* paths, int select) {
 
     return result;
 }
+
+// Просит список файлов диалога перечитать папку (как F5). Выделение при этом
+// сбрасывается, поэтому вызывается только до того, как мы что-то выделили.
+extern "C"
+void filehalo_dialog_refresh(HWND dialog) {
+    HWND view = find_descendant(dialog, L"SHELLDLL_DefView");
+
+    HWND items = view != nullptr ? FindWindowExW(view, nullptr, L"DirectUIHWND", nullptr) : nullptr;
+
+    HWND target = items != nullptr ? items : view;
+
+    if (target != nullptr) {
+        PostMessageW(target, WM_KEYDOWN, VK_F5, 0);
+        PostMessageW(target, WM_KEYUP, VK_F5, static_cast<LPARAM>(0xC0000001));
+    }
+}

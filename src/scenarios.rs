@@ -1270,6 +1270,9 @@ mod dialogs {
     fn show(save: bool, folder: &Path, title: &str) -> (isize, std::thread::JoinHandle<()>) {
         let folder = folder.to_path_buf();
 
+        // Заголовок уникален для запуска: по нему ищем окно.
+        let title = &format!("{title} {}", folder.file_name().unwrap().to_string_lossy());
+
         let title_text = title.to_string();
 
         let thread = std::thread::spawn(move || unsafe {
@@ -1425,7 +1428,38 @@ mod dialogs {
 
     // Диалог в другом процессе (PowerShell + WinForms) — как в настоящих
     // программах. Окно сразу уводится за край экрана.
-    fn foreign_dialog(save: bool, folder: &Path, title: &str) -> (isize, std::process::Child) {
+    // Диалог в другом процессе. Закрывается при выходе из области видимости —
+    // даже если тест упал: иначе окно осталось бы висеть, и следующий запуск
+    // нашёл бы по заголовку его, а не своё.
+    struct ForeignDialog {
+        window: isize,
+        child: std::process::Child,
+    }
+
+    impl Drop for ForeignDialog {
+        fn drop(&mut self) {
+            unsafe {
+                PostMessageW(self.window as _, WM_CLOSE, 0, 0);
+            }
+
+            let started = std::time::Instant::now();
+
+            while started.elapsed().as_secs() < 3 {
+                if let Ok(Some(_)) = self.child.try_wait() {
+                    return;
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            let _ = self.child.kill();
+        }
+    }
+
+    fn foreign_dialog(save: bool, folder: &Path, title: &str) -> ForeignDialog {
+        // Заголовок уникален для запуска: по нему ищем окно.
+        let title = &format!("{title} {}", folder.file_name().unwrap().to_string_lossy());
+
         let kind = if save { "SaveFileDialog" } else { "OpenFileDialog" };
 
         let script = format!(
@@ -1458,7 +1492,7 @@ mod dialogs {
             SetWindowPos(window, HWND_TOP, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
         }
 
-        (window as isize, child)
+        ForeignDialog { window: window as isize, child }
     }
 
     // Список файлов диалога (а не панель навигации и прочие списки).
@@ -1560,7 +1594,9 @@ mod dialogs {
 
         photo(60, 40).save(dir.join("снимок.png")).unwrap();
 
-        let (window, mut child) = foreign_dialog(false, &dir.0, "FileHalo — чужое окно «Открыть»");
+        let dialog = foreign_dialog(false, &dir.0, "uskko — чужое окно «Открыть»");
+
+        let window = dialog.window;
 
         select(window, &["снимок"]);
 
@@ -1572,11 +1608,7 @@ mod dialogs {
 
         let name_box = foreign_file_name_box(window);
 
-        unsafe {
-            PostMessageW(window as _, WM_CLOSE, 0, 0);
-        }
-
-        let _ = child.wait();
+        drop(dialog);
 
         // Выделен новый файл (с расширением или без — как настроено в Windows).
         assert_eq!(selected.len(), 1, "{selected:?}");
@@ -1592,7 +1624,9 @@ mod dialogs {
 
         photo(60, 40).save(dir.join("кадр.png")).unwrap();
 
-        let (window, mut child) = foreign_dialog(true, &dir.0, "FileHalo — чужое окно «Сохранить»");
+        let dialog = foreign_dialog(true, &dir.0, "uskko — чужое окно «Сохранить»");
+
+        let window = dialog.window;
 
         select(window, &["кадр"]);
 
@@ -1604,11 +1638,7 @@ mod dialogs {
 
         let after = selected_in_list(window);
 
-        unsafe {
-            PostMessageW(window as _, WM_CLOSE, 0, 0);
-        }
-
-        let _ = child.wait();
+        drop(dialog);
 
         // Выделение не тронуто: новый файл не подставится как имя для сохранения.
         assert_eq!(before, after);
@@ -1622,7 +1652,7 @@ mod dialogs {
             photo(60, 40).save(dir.join(name)).unwrap();
         }
 
-        let (window, thread) = show(false, &dir.0, "FileHalo — проверка окна «Открыть»");
+        let (window, thread) = show(false, &dir.0, "uskko — проверка окна «Открыть»");
 
         select(window, &["отчёт", "схема"]);
 
@@ -1670,7 +1700,7 @@ mod dialogs {
 
         photo(60, 40).save(dir.join("x.png")).unwrap();
 
-        let (window, thread) = show(true, &dir.0, "FileHalo — проверка окна «Сохранить»");
+        let (window, thread) = show(true, &dir.0, "uskko — проверка окна «Сохранить»");
 
         // Подстановка имени в «Сохранить» могла бы привести к перезаписи.
         assert!(!crate::selection::put_into_dialog(window, &[dir.join("x.pdf")]));

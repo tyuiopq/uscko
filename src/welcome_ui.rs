@@ -601,3 +601,19 @@ pub fn render_for_test(scale: f32, seconds: f32) -> Pixmap {
 
     pixmap
 }
+
+#[cfg(test)]
+mod tests {
+    // Окно подсказки рисуется без сбоев, и на кадре есть текст и колесо.
+    #[test]
+    fn welcome_window_renders() {
+        let pixmap = super::render_for_test(1.25, 2.5);
+
+        let bright = pixmap.pixels().iter().filter(|pixel| pixel.red() > 200 && pixel.green() > 200).count();
+
+        let accent = pixmap.pixels().iter().filter(|pixel| pixel.blue() > 200 && pixel.red() < 150).count();
+
+        assert!(bright > 500, "мало текста: {bright}");
+        assert!(accent > 500, "нет подсвеченной секции колеса: {accent}");
+    }
+}

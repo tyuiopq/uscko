@@ -13,6 +13,7 @@ mod job_manager;
 mod media;
 mod metadata;
 mod output;
+mod params;
 mod pdf;
 mod render;
 mod settings_ui;
@@ -321,7 +322,7 @@ fn main() {
             if message.message == job_manager::WM_FILEHALO_JOB_DONE {
                 if let Some(job_manager::JobResult { action, outcome }) = job_manager::take_result()
                 {
-                    println!("FINISHED: {}", action.title());
+                    println!("FINISHED: {}", action.title(&config::params()));
 
                     for output in &outcome.outputs {
                         println!("DONE: {}", output.display());
@@ -466,14 +467,15 @@ fn main() {
 
                 println!("Selected: {} ({})", files_text(selection.files.len()), category.label());
 
+                let params = config::params();
+
                 let slots: Vec<wheel::SlotView> = (0..config::sections(category))
                     .map(|slot| {
                         let action = config::action_for_slot(category, slot);
 
-                        wheel::SlotView {
-                            action,
-                            enabled: action.is_some_and(|action| !action.inputs(&selection).is_empty()),
-                        }
+                        let enabled = action.is_some_and(|action| !action.inputs(&selection).is_empty());
+
+                        wheel::SlotView::new(action, enabled, &params)
                     })
                     .collect();
 
@@ -522,7 +524,7 @@ fn main() {
                                 last_slot = slot;
 
                                 match wheel.selected_action() {
-                                    Some(action) => println!("Selected: {}", action.title()),
+                                    Some(action) => println!("Selected: {}", action.title(&config::params())),
                                     None => println!("Selected: nothing"),
                                 }
                             }
@@ -535,7 +537,7 @@ fn main() {
                             (Some(action), Some(selection)) => {
                                 let inputs = action.inputs(&selection);
 
-                                println!("ACTION: {} ({})", action.title(), files_text(inputs.len()));
+                                println!("ACTION: {} ({})", action.title(&config::params()), files_text(inputs.len()));
 
                                 // Пока идёт предыдущая задача, новая ждёт в очереди;
                                 // окно статуса показывает, сколько ещё ждёт.

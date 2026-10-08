@@ -6,18 +6,14 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream, dictionary};
 
 use crate::converter::{self, Encoding};
 use crate::file_types::{self, ImageKind};
+use crate::params::Params;
 use crate::{job_manager, output};
 use crate::winrt::{self, winrt_error};
 
 // Страница PDF из картинки: 96 пикселей на дюйм, как на экране при 100%.
 const IMAGE_DPI: f32 = 96.0;
 
-// PDF -> картинки: разрешение страниц (150 dpi — чёткий текст на экране).
-const RENDER_DPI: f32 = 150.0;
-
 const MAX_RENDER_SIDE: f32 = 10_000.0;
-
-const JPEG_QUALITY: u8 = 92;
 
 fn pdf_error(context: &str, error: impl std::fmt::Display) -> String {
     format!("{context}: {error}")
@@ -115,7 +111,7 @@ fn try_jpeg_passthrough(document: &mut Document, path: &Path) -> Option<(ObjectI
     Some((document.add_object(stream), width, height))
 }
 
-fn image_object(document: &mut Document, path: &Path) -> Result<(ObjectId, u32, u32), String> {
+fn image_object(document: &mut Document, path: &Path, params: &Params) -> Result<(ObjectId, u32, u32), String> {
     if let Some(result) = try_jpeg_passthrough(document, path) {
         return Ok(result);
     }
@@ -136,7 +132,7 @@ fn image_object(document: &mut Document, path: &Path) -> Result<(ObjectId, u32, 
             image,
             None,
             Encoding::Jpeg {
-                quality: JPEG_QUALITY,
+                quality: params.jpeg_quality(),
             },
         )?;
 
@@ -180,6 +176,7 @@ fn image_object(document: &mut Document, path: &Path) -> Result<(ObjectId, u32, 
 // картинкой: "photo.jpg" -> "photo.pdf".
 pub fn images_to_pdf(
     images: &[PathBuf],
+    params: &Params,
     mut progress: impl FnMut(usize),
 ) -> Result<PathBuf, String> {
     let first = images.first().ok_or("No images")?;
@@ -193,7 +190,7 @@ pub fn images_to_pdf(
     for (index, path) in images.iter().enumerate() {
         job_manager::check_cancelled()?;
 
-        let (image_id, width, height) = image_object(&mut document, path)
+        let (image_id, width, height) = image_object(&mut document, path, params)
             .map_err(|error| format!("{}: {error}", path.display()))?;
 
         let points = |pixels: u32| pixels as f32 * 72.0 / IMAGE_DPI;
@@ -363,14 +360,15 @@ pub fn merge(files: &[PathBuf], mut progress: impl FnMut(usize)) -> Result<PathB
 // PDF -> картинки (встроенный в Windows 10/11 движок Windows.Data.Pdf)
 // ---------------------------------------------------------------------------
 
-fn render_page(page: &windows::Data::Pdf::PdfPage) -> Result<Vec<u8>, String> {
+// Страница в PNG или JPG (по параметрам).
+fn render_page(page: &windows::Data::Pdf::PdfPage, params: &Params) -> Result<Vec<u8>, String> {
     use windows::Data::Pdf::PdfPageRenderOptions;
     use windows::Storage::Streams::InMemoryRandomAccessStream;
 
     let size = page.Size().map_err(|error| winrt_error("Page size", error))?;
 
     // Размер страницы в DIP (1/96 дюйма).
-    let scale = (RENDER_DPI / 96.0)
+    let scale = (params.pdf_dpi as f32 / 96.0)
         .min(MAX_RENDER_SIDE / size.Width.max(1.0))
         .min(MAX_RENDER_SIDE / size.Height.max(1.0));
 
@@ -388,20 +386,35 @@ fn render_page(page: &windows::Data::Pdf::PdfPage) -> Result<Vec<u8>, String> {
         .and_then(|operation| operation.join())
         .map_err(|error| winrt_error("Render", error))?;
 
-    winrt::read_stream(&stream)
+    let png = winrt::read_stream(&stream)?;
+
+    if !params.pages_as_jpeg() {
+        return Ok(png);
+    }
+
+    let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+        .map_err(|error| format!("Render: {error}"))?;
+
+    converter::encode(
+        &image,
+        None,
+        Encoding::Jpeg {
+            quality: params.jpeg_quality(),
+        },
+    )
 }
 
 // Одностраничный PDF -> "doc.png" рядом. Многостраничный -> папка "doc"
-// со страницами "doc 01.png", "doc 02.png", ...
-pub fn to_images(source: &Path) -> Result<PathBuf, String> {
+// со страницами "doc 01.png", "doc 02.png", ... (или .jpg — по параметрам).
+pub fn to_images(source: &Path, params: &Params) -> Result<PathBuf, String> {
     let _com = winrt::ComScope::new();
 
     // Все объекты WinRT живут внутри render_document и освобождаются
     // до того, как _com завершит COM.
-    render_document(source)
+    render_document(source, params)
 }
 
-fn render_document(source: &Path) -> Result<PathBuf, String> {
+fn render_document(source: &Path, params: &Params) -> Result<PathBuf, String> {
     use windows::Data::Pdf::PdfDocument;
 
     let file = winrt::storage_file(source)?;
@@ -423,13 +436,15 @@ fn render_document(source: &Path) -> Result<PathBuf, String> {
             .GetPage(index)
             .map_err(|error| winrt_error("Page", error))?;
 
-        render_page(&page)
+        render_page(&page, params)
     };
+
+    let extension = if params.pages_as_jpeg() { "jpg" } else { "png" };
 
     if page_count == 1 {
         let bytes = page(0)?;
 
-        return output::write_file(&output::next_to(source, "png")?, |writer| {
+        return output::write_file(&output::next_to(source, extension)?, |writer| {
             writer
                 .write_all(&bytes)
                 .map_err(|error| format!("Could not write image: {error}"))
@@ -453,7 +468,7 @@ fn render_document(source: &Path) -> Result<PathBuf, String> {
 
         let mut name = stem.to_os_string();
 
-        name.push(format!(" {:0digits$}.png", index + 1));
+        name.push(format!(" {:0digits$}.{extension}", index + 1));
 
         std::fs::write(temp.path().join(name), bytes)
             .map_err(|error| format!("Could not write page: {error}"))?;

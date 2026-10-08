@@ -15,10 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::file_types::{self, ImageKind};
 use crate::media::{self, AudioFormat, VideoFormat};
+use crate::params::Params;
 use crate::{archive, converter, file_tools, job_manager, metadata, pdf};
-
-// Уменьшение картинок: длинная сторона не больше этого значения.
-const RESIZE_MAX_SIDE: u32 = 1920;
 
 pub struct Selection {
     pub files: Vec<PathBuf>,
@@ -240,8 +238,9 @@ impl ActionId {
         ActionId::MergeAudio,
     ];
 
-    // Короткая подпись на секции колеса.
-    pub fn label(self) -> &'static str {
+    // Короткая подпись на секции колеса. Некоторые подписи зависят
+    // от параметров (размер, формат), поэтому они передаются сюда.
+    pub fn label(self, params: &Params) -> &'static str {
         match self {
             Self::ConvertToPng => "PNG",
             Self::ConvertToJpeg => "JPG",
@@ -251,6 +250,7 @@ impl ActionId {
             Self::ResizeImages => "Уменьшить",
             Self::StripMetadata => "Очистить",
             Self::MergePdfs => "Склеить",
+            Self::PdfToImages if params.pages_as_jpeg() => "JPG",
             Self::PdfToImages => "PNG",
             Self::CreateZip => "ZIP",
             Self::ExtractArchive => "Распаковать",
@@ -263,7 +263,11 @@ impl ActionId {
             Self::ConvertToMp4 => "MP4",
             Self::ConvertToWmv => "WMV",
             Self::CompressVideo => "Сжать",
-            Self::VideoTo720p => "720p",
+            Self::VideoTo720p => match params.video_height {
+                480 => "480p",
+                1080 => "1080p",
+                _ => "720p",
+            },
             Self::ExtractAudio => "Звук",
             Self::MergeVideos | Self::MergeAudio => "Склеить",
             Self::ConvertToMp3 => "MP3",
@@ -274,16 +278,23 @@ impl ActionId {
     }
 
     // Полное название: в центре колеса при наведении и в настройках.
-    pub fn title(self) -> &'static str {
+    pub fn title(self, params: &Params) -> &'static str {
         match self {
             Self::ConvertToPng => "Конвертировать в PNG",
             Self::ConvertToJpeg => "Конвертировать в JPG",
             Self::ConvertToWebp => "Конвертировать в WebP",
             Self::ImagesToPdf => "Собрать в PDF",
             Self::CompressImages => "Сжать",
-            Self::ResizeImages => "Уменьшить до 1920 px",
+            Self::ResizeImages => match params.resize_side {
+                1280 => "Уменьшить до 1280 px",
+                1600 => "Уменьшить до 1600 px",
+                2560 => "Уменьшить до 2560 px",
+                3840 => "Уменьшить до 3840 px",
+                _ => "Уменьшить до 1920 px",
+            },
             Self::StripMetadata => "Удалить метаданные",
             Self::MergePdfs => "Склеить PDF",
+            Self::PdfToImages if params.pages_as_jpeg() => "Страницы в JPG",
             Self::PdfToImages => "Страницы в PNG",
             Self::CreateZip => "Упаковать в ZIP",
             Self::ExtractArchive => "Распаковать сюда",
@@ -296,7 +307,11 @@ impl ActionId {
             Self::ConvertToMp4 => "Конвертировать в MP4",
             Self::ConvertToWmv => "Конвертировать в WMV",
             Self::CompressVideo => "Сжать видео",
-            Self::VideoTo720p => "Уменьшить до 720p",
+            Self::VideoTo720p => match params.video_height {
+                480 => "Уменьшить до 480p",
+                1080 => "Уменьшить до 1080p",
+                _ => "Уменьшить до 720p",
+            },
             Self::ExtractAudio => "Извлечь звук в MP3",
             Self::MergeVideos => "Склеить видео",
             Self::ConvertToMp3 => "Конвертировать в MP3",
@@ -409,6 +424,7 @@ impl ActionId {
     pub fn execute(
         self,
         inputs: &[PathBuf],
+        params: &Params,
         mut progress: impl FnMut(usize, usize),
     ) -> ActionOutcome {
         let total = inputs.len();
@@ -486,15 +502,15 @@ impl ActionId {
 
         // Действия «много файлов -> один результат».
         let combined = match self {
-            Self::ImagesToPdf => Some(pdf::images_to_pdf(inputs, &mut report)),
+            Self::ImagesToPdf => Some(pdf::images_to_pdf(inputs, params, &mut report)),
 
             Self::MergePdfs => Some(pdf::merge(inputs, &mut report)),
 
-            Self::CreateZip => Some(archive::create(inputs, &mut report)),
+            Self::CreateZip => Some(archive::create(inputs, params, &mut report)),
 
             Self::MergeVideos => Some(media::merge_videos(inputs)),
 
-            Self::MergeAudio => Some(media::merge_audio(inputs)),
+            Self::MergeAudio => Some(media::merge_audio(inputs, params)),
 
             _ => None,
         };
@@ -524,7 +540,7 @@ impl ActionId {
                 break;
             }
 
-            match self.process_one(input) {
+            match self.process_one(input, params) {
                 Ok(output) => outcome.outputs.push(output),
 
                 Err(ActionError::Skipped(reason)) => {
@@ -546,28 +562,28 @@ impl ActionId {
         outcome
     }
 
-    fn process_one(self, input: &Path) -> Result<PathBuf, ActionError> {
+    fn process_one(self, input: &Path, params: &Params) -> Result<PathBuf, ActionError> {
         match self {
-            Self::ConvertToPng => Ok(converter::convert(input, ImageKind::Png)?),
-            Self::ConvertToJpeg => Ok(converter::convert(input, ImageKind::Jpeg)?),
-            Self::ConvertToWebp => Ok(converter::convert(input, ImageKind::WebP)?),
-            Self::CompressImages => converter::compress(input),
-            Self::ResizeImages => converter::resize(input, RESIZE_MAX_SIDE),
+            Self::ConvertToPng => Ok(converter::convert(input, ImageKind::Png, params)?),
+            Self::ConvertToJpeg => Ok(converter::convert(input, ImageKind::Jpeg, params)?),
+            Self::ConvertToWebp => Ok(converter::convert(input, ImageKind::WebP, params)?),
+            Self::CompressImages => converter::compress(input, params),
+            Self::ResizeImages => converter::resize(input, params),
             Self::StripMetadata => metadata::strip(input),
-            Self::PdfToImages => Ok(pdf::to_images(input)?),
+            Self::PdfToImages => Ok(pdf::to_images(input, params)?),
             Self::ExtractArchive => Ok(archive::extract(input)?),
             Self::RotateLeft => converter::rotate(input, false),
             Self::RotateRight => converter::rotate(input, true),
             Self::ConvertToIco => Ok(converter::to_ico(input)?),
             Self::ConvertToMp4 => Ok(media::convert_video(input, VideoFormat::Mp4)?),
             Self::ConvertToWmv => Ok(media::convert_video(input, VideoFormat::Wmv)?),
-            Self::CompressVideo => media::compress_video(input),
-            Self::VideoTo720p => media::video_to_720p(input),
-            Self::ExtractAudio => Ok(media::extract_audio(input)?),
-            Self::ConvertToMp3 => Ok(media::convert_audio(input, AudioFormat::Mp3)?),
-            Self::ConvertToM4a => Ok(media::convert_audio(input, AudioFormat::M4a)?),
-            Self::ConvertToWav => Ok(media::convert_audio(input, AudioFormat::Wav)?),
-            Self::ConvertToFlac => Ok(media::convert_audio(input, AudioFormat::Flac)?),
+            Self::CompressVideo => media::compress_video(input, params),
+            Self::VideoTo720p => media::shrink_video(input, params.video_height),
+            Self::ExtractAudio => Ok(media::extract_audio(input, params)?),
+            Self::ConvertToMp3 => Ok(media::convert_audio(input, AudioFormat::Mp3, params)?),
+            Self::ConvertToM4a => Ok(media::convert_audio(input, AudioFormat::M4a, params)?),
+            Self::ConvertToWav => Ok(media::convert_audio(input, AudioFormat::Wav, params)?),
+            Self::ConvertToFlac => Ok(media::convert_audio(input, AudioFormat::Flac, params)?),
 
             Self::ImagesToPdf
             | Self::MergePdfs

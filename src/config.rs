@@ -7,6 +7,7 @@ use std::sync::{OnceLock, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::actions::{ActionId, Category};
+use crate::params::{ParamId, Params};
 
 // Действующие настройки: по ним работает колесо.
 static CONFIG: OnceLock<RwLock<AppConfig>> = OnceLock::new();
@@ -192,6 +193,9 @@ pub struct AppConfig {
     pub version: u32,
 
     pub wheel: WheelConfig,
+
+    // Параметры действий (качество, размеры...).
+    pub params: Params,
 }
 
 impl Default for AppConfig {
@@ -199,6 +203,7 @@ impl Default for AppConfig {
         Self {
             version: CONFIG_VERSION,
             wheel: WheelConfig::default(),
+            params: Params::default(),
         }
     }
 }
@@ -467,8 +472,8 @@ fn load_or_create() -> Result<(AppConfig, PathBuf), String> {
 
     match read_config(&path) {
         Ok(mut config) => {
-            // Без короткого замыкания: оба шага должны выполниться.
-            if migrate(&mut config) | fit_to_categories(&mut config) {
+            // Без короткого замыкания: все шаги должны выполниться.
+            if migrate(&mut config) | fit_to_categories(&mut config) | config.params.sanitize() {
                 if let Err(error) = write_config(&path, &config) {
                     eprintln!("{error}");
                 }
@@ -567,6 +572,30 @@ pub fn sections(category: Category) -> usize {
         .get()
         .and_then(|config| config.read().ok().map(|config| layout(&config, category).sections))
         .unwrap_or(MAX_SECTIONS)
+}
+
+// Действующие параметры действий.
+pub fn params() -> Params {
+    CONFIG
+        .get()
+        .and_then(|config| config.read().ok().map(|config| config.params))
+        .unwrap_or_default()
+}
+
+// Параметры в черновике окна настроек.
+pub fn draft_params() -> Params {
+    DRAFT
+        .get()
+        .and_then(|draft| draft.read().ok().map(|draft| draft.params))
+        .unwrap_or_default()
+}
+
+pub fn set_draft_param(id: ParamId, value: u32) {
+    if let Some(draft) = DRAFT.get()
+        && let Ok(mut draft) = draft.write()
+    {
+        draft.params.set(id, value);
+    }
 }
 
 // Начинает редактирование: черновик сбрасывается к действующим настройкам.

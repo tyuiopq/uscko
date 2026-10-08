@@ -19,20 +19,20 @@ use windows::Storage::StorageFile;
 use windows_future::{AsyncActionProgressHandler, AsyncOperationProgressHandler, AsyncStatus};
 
 use crate::actions::ActionError;
+use crate::params::Params;
 use crate::winrt::{self, winrt_error};
 use crate::{job_manager, output};
 
 // Битрейт видео: бит на пиксель кадра (ширина * высота * кадров в секунду).
 const CONVERT_BITS_PER_PIXEL: f64 = 0.1;
-const COMPRESS_BITS_PER_PIXEL: f64 = 0.05;
 const SMALL_BITS_PER_PIXEL: f64 = 0.08;
 const MAX_VIDEO_BITRATE: f64 = 25_000_000.0;
 
 // Звук в профиле MP4 по умолчанию (AAC), бит/с.
 const AUDIO_BITRATE: f64 = 192_000.0;
 
-const COMPRESS_MAX_HEIGHT: u32 = 1080;
-const SMALL_HEIGHT: u32 = 720;
+// Предел AAC-кодировщика Windows, кбит/с.
+const M4A_MAX_BITRATE: u32 = 192;
 
 // TimeSpan в Windows — в сотнях наносекунд.
 const TICKS_PER_SECOND: f64 = 10_000_000.0;
@@ -87,15 +87,27 @@ impl AudioFormat {
         }
     }
 
-    fn profile(self) -> windows::core::Result<MediaEncodingProfile> {
+    // Профиль с битрейтом из параметров (для MP3 и M4A; WAV и FLAC без потерь).
+    fn profile(self, params: &Params) -> windows::core::Result<MediaEncodingProfile> {
         let quality = AudioEncodingQuality::High;
 
-        match self {
-            Self::Mp3 => MediaEncodingProfile::CreateMp3(quality),
-            Self::M4a => MediaEncodingProfile::CreateM4a(quality),
-            Self::Wav => MediaEncodingProfile::CreateWav(quality),
-            Self::Flac => MediaEncodingProfile::CreateFlac(quality),
+        let (profile, kbps) = match self {
+            Self::Mp3 => (MediaEncodingProfile::CreateMp3(quality)?, Some(params.audio_bitrate)),
+
+            Self::M4a => (
+                MediaEncodingProfile::CreateM4a(quality)?,
+                Some(params.audio_bitrate.min(M4A_MAX_BITRATE)),
+            ),
+
+            Self::Wav => (MediaEncodingProfile::CreateWav(quality)?, None),
+            Self::Flac => (MediaEncodingProfile::CreateFlac(quality)?, None),
+        };
+
+        if let Some(kbps) = kbps {
+            profile.Audio()?.SetBitrate(kbps * 1000)?;
         }
+
+        Ok(profile)
     }
 }
 
@@ -346,8 +358,13 @@ pub fn convert_video(source: &Path, format: VideoFormat) -> Result<PathBuf, Stri
     transcode_video(source, format, target, None, CONVERT_BITS_PER_PIXEL)
 }
 
-// Меньший битрейт и не выше 1080p. Если файл не стал заметно меньше — пропуск.
-pub fn compress_video(source: &Path) -> Result<PathBuf, ActionError> {
+// Меньший битрейт и, по параметрам, не выше заданной высоты.
+// Если файл не стал заметно меньше — пропуск.
+pub fn compress_video(source: &Path, params: &Params) -> Result<PathBuf, ActionError> {
+    let max_height = params.compress_height();
+
+    let bits_per_pixel = params.video_bits_per_pixel();
+
     let original = std::fs::metadata(source)
         .map_err(|error| format!("{}: {error}", source.display()))?
         .len();
@@ -361,7 +378,7 @@ pub fn compress_video(source: &Path) -> Result<PathBuf, ActionError> {
 
         let info = video_info(&file)?;
 
-        let target = video_bitrate(&info, fit_height(&info, Some(COMPRESS_MAX_HEIGHT)), COMPRESS_BITS_PER_PIXEL)
+        let target = video_bitrate(&info, fit_height(&info, max_height), bits_per_pixel)
             + AUDIO_BITRATE;
 
         let current = file
@@ -382,8 +399,8 @@ pub fn compress_video(source: &Path) -> Result<PathBuf, ActionError> {
         source,
         VideoFormat::Mp4,
         target,
-        Some(COMPRESS_MAX_HEIGHT),
-        COMPRESS_BITS_PER_PIXEL,
+        max_height,
+        bits_per_pixel,
     )?;
 
     let compressed = std::fs::metadata(&result).map(|metadata| metadata.len()).unwrap_or(0);
@@ -397,23 +414,24 @@ pub fn compress_video(source: &Path) -> Result<PathBuf, ActionError> {
     Ok(result)
 }
 
-pub fn video_to_720p(source: &Path) -> Result<PathBuf, ActionError> {
+// Уменьшает видео до высоты height (480p, 720p...).
+pub fn shrink_video(source: &Path, height: u32) -> Result<PathBuf, ActionError> {
     {
         let _com = winrt::ComScope::new();
 
         let info = video_info(&winrt::storage_file(source)?)?;
 
-        if info.height <= SMALL_HEIGHT {
-            return Err(ActionError::Skipped(format!("уже не больше {SMALL_HEIGHT}p")));
+        if info.height <= height {
+            return Err(ActionError::Skipped(format!("уже не больше {height}p")));
         }
     }
 
-    let target = output::next_to_with_suffix(source, &format!("{SMALL_HEIGHT}p"), "mp4")?;
+    let target = output::next_to_with_suffix(source, &format!("{height}p"), "mp4")?;
 
-    Ok(transcode_video(source, VideoFormat::Mp4, target, Some(SMALL_HEIGHT), SMALL_BITS_PER_PIXEL)?)
+    Ok(transcode_video(source, VideoFormat::Mp4, target, Some(height), SMALL_BITS_PER_PIXEL)?)
 }
 
-pub fn extract_audio(source: &Path) -> Result<PathBuf, String> {
+pub fn extract_audio(source: &Path, params: &Params) -> Result<PathBuf, String> {
     let _com = winrt::ComScope::new();
 
     let file = winrt::storage_file(source)?;
@@ -428,18 +446,18 @@ pub fn extract_audio(source: &Path) -> Result<PathBuf, String> {
     }
 
     let profile = AudioFormat::Mp3
-        .profile()
+        .profile(params)
         .map_err(|error| winrt_error("Profile", error))?;
 
     output::produce_file(&output::next_to(source, "mp3")?, |temp| transcode(&file, temp, &profile))
 }
 
-pub fn convert_audio(source: &Path, format: AudioFormat) -> Result<PathBuf, String> {
+pub fn convert_audio(source: &Path, format: AudioFormat, params: &Params) -> Result<PathBuf, String> {
     let _com = winrt::ComScope::new();
 
     let file = winrt::storage_file(source)?;
 
-    let profile = format.profile().map_err(|error| winrt_error("Profile", error))?;
+    let profile = format.profile(params).map_err(|error| winrt_error("Profile", error))?;
 
     output::produce_file(&output::next_to(source, format.extension())?, |temp| {
         transcode(&file, temp, &profile)
@@ -510,7 +528,7 @@ pub fn merge_videos(files: &[PathBuf]) -> Result<PathBuf, String> {
 // Склеивает аудиофайлы по порядку. Монтажной ленте Windows нужен видеоряд,
 // поэтому под звук подкладывается пустой клип нужной длины, а в файл
 // пишется только звук.
-pub fn merge_audio(files: &[PathBuf]) -> Result<PathBuf, String> {
+pub fn merge_audio(files: &[PathBuf], params: &Params) -> Result<PathBuf, String> {
     let first = files.first().ok_or("No audio files")?;
 
     let format = if crate::file_types::has_extension(first, "m4a") {
@@ -553,7 +571,7 @@ pub fn merge_audio(files: &[PathBuf]) -> Result<PathBuf, String> {
         .and_then(|clips| clips.Append(&clip))
         .map_err(|error| winrt_error("Composition", error))?;
 
-    let profile = format.profile().map_err(|error| winrt_error("Profile", error))?;
+    let profile = format.profile(params).map_err(|error| winrt_error("Profile", error))?;
 
     output::produce_file(&output::next_to_with_suffix(first, "склеено", format.extension())?, |temp| {
         render(&composition, temp, &profile)

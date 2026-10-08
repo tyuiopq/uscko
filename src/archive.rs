@@ -12,6 +12,7 @@ use windows_sys::Win32::{
 };
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
+use crate::params::Params;
 use crate::{file_types, job_manager, output};
 
 // Эти форматы уже сжаты: повторное сжатие только тратит время.
@@ -108,6 +109,7 @@ fn add_to_zip<W: Write + std::io::Seek>(
     zip: &mut ZipWriter<W>,
     path: &Path,
     base: &Path,
+    level: i64,
 ) -> Result<(), String> {
     job_manager::check_cancelled()?;
 
@@ -140,7 +142,7 @@ fn add_to_zip<W: Write + std::io::Seek>(
         children.sort();
 
         for child in children {
-            add_to_zip(zip, &child, base)?;
+            add_to_zip(zip, &child, base, level)?;
         }
 
         return Ok(());
@@ -151,14 +153,15 @@ fn add_to_zip<W: Write + std::io::Seek>(
         .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
 
-    let method = if STORED_EXTENSIONS.contains(&extension.as_str()) {
-        CompressionMethod::Stored
+    options = if STORED_EXTENSIONS.contains(&extension.as_str()) {
+        options.compression_method(CompressionMethod::Stored)
     } else {
-        CompressionMethod::Deflated
+        options
+            .compression_method(CompressionMethod::Deflated)
+            .compression_level(Some(level))
     };
 
     options = options
-        .compression_method(method)
         .large_file(metadata.len() >= u32::MAX as u64);
 
     zip.start_file(&name, options)
@@ -172,7 +175,7 @@ fn add_to_zip<W: Write + std::io::Seek>(
 }
 
 // Один элемент -> "name.zip", несколько -> по имени папки, где они лежат.
-pub fn create(items: &[PathBuf], mut progress: impl FnMut(usize)) -> Result<PathBuf, String> {
+pub fn create(items: &[PathBuf], params: &Params, mut progress: impl FnMut(usize)) -> Result<PathBuf, String> {
     let first = items.first().ok_or("Nothing to archive")?;
 
     let base = output::parent_of(first)?;
@@ -194,7 +197,7 @@ pub fn create(items: &[PathBuf], mut progress: impl FnMut(usize)) -> Result<Path
         let mut zip = ZipWriter::new(writer);
 
         for (index, item) in items.iter().enumerate() {
-            add_to_zip(&mut zip, item, base)?;
+            add_to_zip(&mut zip, item, base, params.zip_level())?;
 
             progress(index + 1);
         }

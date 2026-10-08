@@ -23,6 +23,7 @@ use windows_sys::Win32::{
 };
 
 use crate::actions::ActionId;
+use crate::params::Params;
 use crate::render::{self, Rgba, ease_out_cubic, mix, to_color, with_alpha};
 use crate::{dpi, text};
 
@@ -80,6 +81,20 @@ pub struct SlotView {
     pub action: Option<ActionId>,
     // false — действие есть, но к выделению неприменимо (например, PNG -> PNG).
     pub enabled: bool,
+    // Подписи зависят от параметров действий, поэтому считаются заранее.
+    pub label: &'static str,
+    pub title: &'static str,
+}
+
+impl SlotView {
+    pub fn new(action: Option<ActionId>, enabled: bool, params: &Params) -> Self {
+        Self {
+            action,
+            enabled,
+            label: action.map_or("", |action| action.label(params)),
+            title: action.map_or("", |action| action.title(params)),
+        }
+    }
 }
 
 // Кадр колеса: всё, что нужно для отрисовки. Используется и окном колеса,
@@ -385,9 +400,9 @@ impl WheelPicture<'_> {
             0.0
         };
 
-        let Some(action) = view.action else {
+        if view.action.is_none() {
             return;
-        };
+        }
 
         let anchor = at(label_radius + label_shift);
 
@@ -398,7 +413,7 @@ impl WheelPicture<'_> {
 
         let mut size = (14.5 + hover * 1.5) * scale;
 
-        while text::measure(&fonts.semibold, size, action.label()) > max_width && size > 8.0 * scale {
+        while text::measure(&fonts.semibold, size, view.label) > max_width && size > 8.0 * scale {
             size -= 0.5 * scale;
         }
 
@@ -408,7 +423,7 @@ impl WheelPicture<'_> {
             pixmap,
             &fonts.semibold,
             size,
-            action.label(),
+            view.label,
             anchor.x,
             anchor.y,
             with_alpha(color, alpha),
@@ -433,13 +448,13 @@ impl WheelPicture<'_> {
         let hovered = self
             .active
             .and_then(|slot| self.slots.get(slot))
-            .and_then(|slot| slot.action.map(|action| (action, slot.enabled)));
+            .and_then(|slot| slot.action.map(|_| (slot.title, slot.enabled)));
 
         match hovered {
             // Наведено на действие — его полное название.
-            Some((action, enabled)) => {
+            Some((title, enabled)) => {
                 let (lines, size) =
-                    text::fit_lines(&fonts.semibold, action.title(), max_width, 3, 14.0 * pixel_scale);
+                    text::fit_lines(&fonts.semibold, title, max_width, 3, 14.0 * pixel_scale);
 
                 let line_height = size * 1.15;
 

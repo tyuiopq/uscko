@@ -15,15 +15,8 @@ use image::{
 
 use crate::actions::ActionError;
 use crate::file_types::{self, ImageKind};
+use crate::params::Params;
 use crate::{heic, metadata, output};
-
-const JPEG_QUALITY: u8 = 92;
-
-const WEBP_QUALITY: f32 = 90.0;
-
-const COMPRESS_JPEG_QUALITY: u8 = 80;
-
-const COMPRESS_WEBP_QUALITY: f32 = 75.0;
 
 // Поворот пересохраняет PNG/WebP/редкие JPEG: качество повыше, чтобы
 // несколько поворотов подряд не портили картинку.
@@ -204,20 +197,24 @@ pub fn is_lossy_source(source: &Path) -> bool {
     }
 }
 
-pub fn convert(source: &Path, target: ImageKind) -> Result<PathBuf, String> {
+// Качество WebP для source: сжатое с потерями пересжимаем с потерями —
+// заметно ничего не теряется, а файл маленький. Графику и скриншоты — без потерь.
+fn webp_quality(source: &Path, params: &Params) -> Option<f32> {
+    if is_lossy_source(source) { params.webp_quality() } else { None }
+}
+
+pub fn convert(source: &Path, target: ImageKind, params: &Params) -> Result<PathBuf, String> {
     let decoded = decode(source)?;
 
     let encoding = match target {
         ImageKind::Png => Encoding::Png { best: false },
 
         ImageKind::Jpeg => Encoding::Jpeg {
-            quality: JPEG_QUALITY,
+            quality: params.jpeg_quality(),
         },
 
-        // Сжатое с потерями пересжимаем с потерями: заметно ничего не теряется,
-        // а файл получается маленьким. Графику и скриншоты — без потерь.
         ImageKind::WebP => Encoding::WebP {
-            quality: is_lossy_source(source).then_some(WEBP_QUALITY),
+            quality: webp_quality(source, params),
         },
 
         other => return Err(format!("Cannot save as {other:?}")),
@@ -311,20 +308,22 @@ pub fn rotate(source: &Path, clockwise: bool) -> Result<PathBuf, ActionError> {
 }
 
 // Тот же формат, но меньше по размеру файла.
-pub fn compress(source: &Path) -> Result<PathBuf, ActionError> {
+pub fn compress(source: &Path, params: &Params) -> Result<PathBuf, ActionError> {
     let original_size = std::fs::metadata(source)
         .map_err(|error| format!("Could not read {}: {error}", source.display()))?
         .len();
 
     let decoded = decode(source)?;
 
+    let (jpeg_quality, webp_quality) = params.compress_qualities();
+
     let encoding = match file_types::image_kind(source) {
         Some(ImageKind::Jpeg) => Encoding::Jpeg {
-            quality: COMPRESS_JPEG_QUALITY,
+            quality: jpeg_quality,
         },
 
         Some(ImageKind::WebP) if is_lossy_source(source) => Encoding::WebP {
-            quality: Some(COMPRESS_WEBP_QUALITY),
+            quality: Some(webp_quality),
         },
 
         Some(ImageKind::WebP) => Encoding::WebP { quality: None },
@@ -345,8 +344,10 @@ pub fn compress(source: &Path) -> Result<PathBuf, ActionError> {
     )?)
 }
 
-// Уменьшает так, чтобы длинная сторона была не больше max_side.
-pub fn resize(source: &Path, max_side: u32) -> Result<PathBuf, ActionError> {
+// Уменьшает так, чтобы длинная сторона была не больше заданной в параметрах.
+pub fn resize(source: &Path, params: &Params) -> Result<PathBuf, ActionError> {
+    let max_side = params.resize_side;
+
     let decoded = decode(source)?;
 
     if decoded.image.width().max(decoded.image.height()) <= max_side {
@@ -359,11 +360,11 @@ pub fn resize(source: &Path, max_side: u32) -> Result<PathBuf, ActionError> {
 
     let encoding = match file_types::image_kind(source) {
         Some(ImageKind::Jpeg) => Encoding::Jpeg {
-            quality: JPEG_QUALITY,
+            quality: params.jpeg_quality(),
         },
 
         Some(ImageKind::WebP) => Encoding::WebP {
-            quality: is_lossy_source(source).then_some(WEBP_QUALITY),
+            quality: webp_quality(source, params),
         },
 
         _ => Encoding::Png { best: false },

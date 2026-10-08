@@ -1,8 +1,11 @@
 // Окно настроек: своя отрисовка (tiny-skia), тёмная тема, анимации.
 //
-// Слева — живое превью колеса с номерами секций, справа — число секций
-// и список слотов с выпадающими списками действий. Сверху — категории,
-// снизу — «Сохранить» / «Отмена».
+// Две страницы, переключатель справа вверху:
+// «Колесо» — слева живое превью колеса с номерами секций, справа число
+//   секций и список слотов с выпадающими списками действий; сверху категории.
+// «Параметры» — слева разделы, справа карточки параметров действий
+//   (качество, размеры, форматы) с вариантами на выбор.
+// Снизу — «Сохранить» / «Отмена», общие для обеих страниц.
 //
 // Раскладка элементов считается одной функцией на элемент — по ней и рисуем,
 // и определяем, что под курсором. Все координаты логические (как при 100%).
@@ -34,6 +37,7 @@ use windows_sys::Win32::{
 
 use crate::actions::{ActionId, Category};
 use crate::config::{self, Layout, MAX_SECTIONS, MIN_SECTIONS};
+use crate::params::{self, ParamId, Params};
 use crate::render::{
     self, ACCENT, ACCENT_DARK, BACKGROUND, BORDER, CARD, CARD_HOVER, DANGER, Rgba, SUCCESS, TEXT,
     TEXT_FAINT, TEXT_MUTED, WARNING, mix, with_alpha,
@@ -77,6 +81,28 @@ const BUTTON_HEIGHT: f32 = 34.0;
 const SAVE_WIDTH: f32 = 130.0;
 const CANCEL_WIDTH: f32 = 110.0;
 
+// Переключатель страниц.
+const MODE_WIDTH: f32 = 116.0;
+const MODE_HEIGHT: f32 = 38.0;
+const MODE_Y: f32 = 30.0;
+
+// Страница «Параметры».
+const NAV_X: f32 = PADDING;
+const NAV_Y: f32 = TABS_Y;
+const NAV_WIDTH: f32 = 196.0;
+const NAV_HEIGHT: f32 = CARD_Y + CARD_HEIGHT - NAV_Y;
+const NAV_ITEM_HEIGHT: f32 = 42.0;
+const NAV_ITEM_GAP: f32 = 4.0;
+
+const PANEL_X: f32 = NAV_X + NAV_WIDTH + 20.0;
+const PANEL_WIDTH: f32 = WIDTH - PADDING - PANEL_X;
+const PARAM_HEIGHT: f32 = 104.0;
+const PARAM_GAP: f32 = 12.0;
+const PARAM_INSET: f32 = 18.0;
+const CHOICE_HEIGHT: f32 = 30.0;
+const CHOICE_GAP: f32 = 6.0;
+const CHOICE_MAX_WIDTH: f32 = 104.0;
+
 const ITEM_HEIGHT: f32 = 34.0;
 const MENU_PADDING: f32 = 6.0;
 const MENU_FILL: Rgba = [33, 36, 44, 255];
@@ -93,6 +119,7 @@ const HOVER_RATE: f32 = 0.3;
 const SLIDE_RATE: f32 = 0.25;
 const MENU_SECONDS: f32 = 0.12;
 const STATUS_SECONDS: f32 = 2.0;
+const FADE_SECONDS: f32 = 0.18;
 
 const WINDOW_STYLE_FLAGS: WINDOW_STYLE = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 
@@ -131,6 +158,10 @@ impl Area {
 // Всё, на что можно навести и нажать.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Target {
+    Mode(usize),
+    Group(usize),
+    Choice(ParamId, usize),
+    ResetParams,
     Tab(usize),
     Sections(usize),
     Row(usize),
@@ -139,6 +170,23 @@ enum Target {
     Save,
     Cancel,
     Reset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Wheel,
+    Params,
+}
+
+impl Page {
+    const ALL: [Page; 2] = [Page::Wheel, Page::Params];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Wheel => "Колесо",
+            Self::Params => "Параметры",
+        }
+    }
 }
 
 struct Menu {
@@ -164,6 +212,17 @@ struct Status {
 
 struct State {
     hwnd: HWND,
+    page: Page,
+    // Подсветка выбранной страницы в переключателе (x).
+    page_x: f32,
+    // Раздел на странице «Параметры» и подсветка в списке разделов (y).
+    group: usize,
+    group_y: f32,
+    // Подсветка выбранного варианта каждого параметра (x).
+    choice_x: HashMap<ParamId, f32>,
+    // Проявление содержимого после переключения страницы или раздела, 0..1.
+    fade: f32,
+    fade_area: Area,
     category: usize,
     mouse: Option<(f32, f32)>,
     hover: HashMap<Target, f32>,
@@ -192,6 +251,7 @@ thread_local! {
 #[derive(Debug, Clone, PartialEq)]
 struct PreviewKey {
     category: usize,
+    params: Params,
     layout: Layout,
     hover: Vec<i32>,
     tilt: (i32, i32),
@@ -201,6 +261,79 @@ struct PreviewKey {
 
 fn category(index: usize) -> Category {
     Category::ALL.get(index).copied().unwrap_or(Category::ALL[0])
+}
+
+fn mode_area(index: usize) -> Area {
+    let total = Page::ALL.len() as f32 * (MODE_WIDTH + 4.0) + 4.0;
+
+    Area::new(
+        WIDTH - PADDING - total + 4.0 + index as f32 * (MODE_WIDTH + 4.0),
+        MODE_Y + 4.0,
+        MODE_WIDTH,
+        MODE_HEIGHT - 8.0,
+    )
+}
+
+fn nav_area() -> Area {
+    Area::new(NAV_X, NAV_Y, NAV_WIDTH, NAV_HEIGHT)
+}
+
+fn group_area(index: usize) -> Area {
+    Area::new(
+        NAV_X + 8.0,
+        NAV_Y + 8.0 + index as f32 * (NAV_ITEM_HEIGHT + NAV_ITEM_GAP),
+        NAV_WIDTH - 16.0,
+        NAV_ITEM_HEIGHT,
+    )
+}
+
+fn reset_params_area() -> Area {
+    Area::new(NAV_X + 8.0, NAV_Y + NAV_HEIGHT - 44.0, NAV_WIDTH - 16.0, 34.0)
+}
+
+// Вся правая часть страницы «Параметры».
+fn panel_area() -> Area {
+    Area::new(PANEL_X, NAV_Y, PANEL_WIDTH, NAV_HEIGHT)
+}
+
+// Всё между шапкой и нижней панелью.
+fn content_area() -> Area {
+    Area::new(0.0, TABS_Y - 4.0, WIDTH, FOOTER_Y - TABS_Y + 4.0)
+}
+
+fn param_area(index: usize) -> Area {
+    Area::new(
+        PANEL_X,
+        NAV_Y + index as f32 * (PARAM_HEIGHT + PARAM_GAP),
+        PANEL_WIDTH,
+        PARAM_HEIGHT,
+    )
+}
+
+fn choice_area(param: usize, choice: usize, count: usize) -> Area {
+    let card = param_area(param);
+
+    let inner = card.width - PARAM_INSET * 2.0;
+
+    let width = ((inner - CHOICE_GAP * (count as f32 - 1.0)) / count as f32).min(CHOICE_MAX_WIDTH);
+
+    Area::new(
+        card.x + PARAM_INSET + choice as f32 * (width + CHOICE_GAP),
+        card.y + 60.0,
+        width,
+        CHOICE_HEIGHT,
+    )
+}
+
+fn group_params(group: usize) -> &'static [ParamId] {
+    params::GROUPS.get(group).map_or(&[], |group| group.params)
+}
+
+// Индекс выбранного варианта параметра.
+fn selected_choice(params: &Params, id: ParamId) -> usize {
+    let value = params.get(id);
+
+    id.choices().iter().position(|choice| choice.value == value).unwrap_or(0)
 }
 
 fn tab_area(index: usize) -> Area {
@@ -364,6 +497,45 @@ impl State {
                 .map(Target::Item);
         }
 
+        if let Some(index) = (0..Page::ALL.len()).find(|&index| mode_area(index).contains(x, y)) {
+            return Some(Target::Mode(index));
+        }
+
+        if save_area().contains(x, y) {
+            return Some(Target::Save);
+        }
+
+        if cancel_area().contains(x, y) {
+            return Some(Target::Cancel);
+        }
+
+        match self.page {
+            Page::Wheel => self.hit_wheel(x, y),
+            Page::Params => self.hit_params(x, y),
+        }
+    }
+
+    fn hit_params(&self, x: f32, y: f32) -> Option<Target> {
+        if let Some(index) = (0..params::GROUPS.len()).find(|&index| group_area(index).contains(x, y)) {
+            return Some(Target::Group(index));
+        }
+
+        if reset_params_area().contains(x, y) {
+            return Some(Target::ResetParams);
+        }
+
+        for (index, &id) in group_params(self.group).iter().enumerate() {
+            let count = id.choices().len();
+
+            if let Some(choice) = (0..count).find(|&choice| choice_area(index, choice, count).contains(x, y)) {
+                return Some(Target::Choice(id, choice));
+            }
+        }
+
+        None
+    }
+
+    fn hit_wheel(&self, x: f32, y: f32) -> Option<Target> {
         if let Some(index) = (0..Category::ALL.len()).find(|&index| tab_area(index).contains(x, y)) {
             return Some(Target::Tab(index));
         }
@@ -392,14 +564,6 @@ impl State {
             && let Some(slot) = wheel::slot_at((x - cx) / zoom, (y - cy) / zoom, layout.sections)
         {
             return Some(Target::Sector(slot));
-        }
-
-        if save_area().contains(x, y) {
-            return Some(Target::Save);
-        }
-
-        if cancel_area().contains(x, y) {
-            return Some(Target::Cancel);
         }
 
         None
@@ -465,6 +629,36 @@ impl State {
         }
 
         match target {
+            Some(Target::Mode(index)) => {
+                let page = Page::ALL[index];
+
+                if page != self.page {
+                    self.page = page;
+
+                    self.start_fade(content_area());
+                }
+            }
+
+            Some(Target::Group(index)) => {
+                if index != self.group {
+                    self.group = index;
+
+                    self.start_fade(panel_area());
+                }
+            }
+
+            Some(Target::Choice(id, choice)) => {
+                if let Some(choice) = id.choices().get(choice) {
+                    config::set_draft_param(id, choice.value);
+                }
+            }
+
+            Some(Target::ResetParams) => {
+                for &id in group_params(self.group) {
+                    config::set_draft_param(id, id.default_value());
+                }
+            }
+
             Some(Target::Tab(index)) => self.category = index,
 
             Some(Target::Sections(sections)) => {
@@ -500,6 +694,12 @@ impl State {
         }
 
         After::Nothing
+    }
+
+    fn start_fade(&mut self, area: Area) {
+        self.fade = 0.0;
+
+        self.fade_area = area;
     }
 
     fn save(&mut self) {
@@ -550,6 +750,32 @@ impl State {
         // Подсветка выбранной вкладки скользит к ней.
         moving |= render::approach(&mut self.tab_x, tab_area(self.category).x, SLIDE_RATE, dt);
 
+        let page_index = Page::ALL.iter().position(|&page| page == self.page).unwrap_or(0);
+
+        moving |= render::approach(&mut self.page_x, mode_area(page_index).x, SLIDE_RATE, dt);
+
+        moving |= render::approach(&mut self.group_y, group_area(self.group).y, SLIDE_RATE, dt);
+
+        // Подсветка выбранного варианта скользит к нему (например, после
+        // «Сбросить раздел»). Впервые увиденный параметр — сразу на месте.
+        let draft = config::draft_params();
+
+        for (index, &id) in group_params(self.group).iter().enumerate() {
+            let count = id.choices().len();
+
+            let goal = choice_area(index, selected_choice(&draft, id), count).x;
+
+            let value = self.choice_x.entry(id).or_insert(goal);
+
+            moving |= render::approach(value, goal, SLIDE_RATE, dt);
+        }
+
+        if self.fade < 1.0 {
+            self.fade = (self.fade + dt / FADE_SECONDS).min(1.0);
+
+            moving = true;
+        }
+
         // Превью: подсветка слота и наклон к курсору.
         let highlighted = self.highlighted_slot();
 
@@ -562,7 +788,7 @@ impl State {
         let (cx, cy) = preview_center();
 
         let tilt_goal = match self.mouse {
-            Some((x, y)) if card_area().contains(x, y) && self.menu.is_none() => {
+            Some((x, y)) if self.page == Page::Wheel && card_area().contains(x, y) && self.menu.is_none() => {
                 let zoom = preview_zoom();
 
                 wheel::tilt_towards((x - cx) / zoom, (y - cy) / zoom)
@@ -626,17 +852,127 @@ impl State {
         pixmap.fill(render::to_color(BACKGROUND));
 
         // Заголовок.
-        label(pixmap, &fonts.semibold, 26.0, "Настройки колеса", PADDING, 36.0, TEXT);
+        let (title, subtitle) = match self.page {
+            Page::Wheel => (
+                "Настройки колеса",
+                "Выберите, сколько секций будет на колесе и какое действие в каждой",
+            ),
 
-        label(
+            Page::Params => ("Параметры действий", "Качество, размеры и форматы результатов"),
+        };
+
+        label(pixmap, &fonts.semibold, 26.0, title, PADDING, 36.0, TEXT);
+
+        label(pixmap, &fonts.regular, 15.0, subtitle, PADDING, 66.0, TEXT_MUTED);
+
+        // Переключатель страниц: подложка и скользящая подсветка выбранной.
+        let switch_width = Page::ALL.len() as f32 * (MODE_WIDTH + 4.0) + 4.0;
+
+        render::fill(
             pixmap,
-            &fonts.regular,
-            15.0,
-            "Выберите, сколько секций будет на колесе и какое действие в каждой",
-            PADDING,
-            66.0,
-            TEXT_MUTED,
+            &area_path(Area::new(WIDTH - PADDING - switch_width, MODE_Y, switch_width, MODE_HEIGHT), 10.0),
+            CARD,
         );
+
+        render::fill(
+            pixmap,
+            &area_path(Area::new(self.page_x, MODE_Y + 4.0, MODE_WIDTH, MODE_HEIGHT - 8.0), 7.0),
+            ACCENT_DARK,
+        );
+
+        for (index, &page) in Page::ALL.iter().enumerate() {
+            let area = mode_area(index);
+
+            let amount = self.hover_of(Target::Mode(index));
+
+            let selected = page == self.page;
+
+            if !selected {
+                render::fill(pixmap, &area_path(area, 7.0), with_alpha(CARD_HOVER, amount));
+            }
+
+            let color = if selected { TEXT } else { mix(TEXT_MUTED, TEXT, amount) };
+
+            centered(pixmap, &fonts.semibold, 15.0, page.label(), area, color);
+        }
+
+        match self.page {
+            Page::Wheel => self.paint_wheel(pixmap, scale, fonts),
+            Page::Params => self.paint_params(pixmap, scale, fonts),
+        }
+
+        // Новое содержимое проявляется из фона.
+        if self.fade < 1.0 {
+            let area = self.fade_area;
+
+            render::fill_rect(
+                pixmap,
+                s(area.x),
+                s(area.y),
+                s(area.width),
+                s(area.height),
+                with_alpha(BACKGROUND, 1.0 - render::ease_out_cubic(self.fade)),
+            );
+        }
+
+
+        // Нижняя панель.
+        render::fill_rect(pixmap, 0.0, s(FOOTER_Y), s(WIDTH), scale.max(1.0), BORDER);
+
+        let (status, status_color) = match &self.status {
+            Some(status) => (status.text.clone(), with_alpha(status.color, (status.left / 0.4).min(1.0))),
+
+            None if config::has_unsaved_changes() => {
+                ("● Есть несохранённые изменения".to_string(), WARNING)
+            }
+
+            None => (
+                "Колесо: Ctrl+Alt+Space   ·   Настройки: Ctrl+Alt+F12".to_string(),
+                TEXT_FAINT,
+            ),
+        };
+
+        label(pixmap, &fonts.regular, 14.0, &status, PADDING, BUTTON_Y + BUTTON_HEIGHT / 2.0, status_color);
+
+        let cancel = cancel_area();
+
+        let cancel_hover = self.hover_of(Target::Cancel);
+
+        render::fill(pixmap, &area_path(cancel, 8.0), mix(CARD, CARD_HOVER, cancel_hover));
+        render::stroke(pixmap, &area_path(cancel, 8.0), BORDER, scale);
+
+        centered(pixmap, &fonts.semibold, 15.0, "Отмена", cancel, TEXT);
+
+        let save = save_area();
+
+        render::fill(
+            pixmap,
+            &area_path(save, 8.0),
+            mix(ACCENT_DARK, ACCENT, self.hover_of(Target::Save)),
+        );
+
+        centered(pixmap, &fonts.semibold, 15.0, "Сохранить", save, TEXT);
+
+        // Выпадающий список — поверх всего.
+        if let Some(menu) = &self.menu {
+            self.paint_menu(pixmap, menu, &self.layout(), scale, fonts);
+        }
+    }
+
+    fn paint_wheel(&self, pixmap: &mut Pixmap, scale: f32, fonts: &text::Fonts) {
+        let s = |value: f32| value * scale;
+
+        let area_path = |area: Area, radius: f32| {
+            render::rounded_rect(s(area.x), s(area.y), s(area.width), s(area.height), s(radius))
+        };
+
+        let label = |pixmap: &mut Pixmap, font: &FontVec, size: f32, value: &str, x: f32, y: f32, color: Rgba| {
+            draw_left(pixmap, font, s(size), value, s(x), s(y), color);
+        };
+
+        let centered = |pixmap: &mut Pixmap, font: &FontVec, size: f32, value: &str, area: Area, color: Rgba| {
+            text::draw_centered(pixmap, font, s(size), value, s(area.center_x()), s(area.center_y()), color);
+        };
 
         // Вкладки категорий: подложка и скользящая подсветка выбранной.
         let tabs_width = Category::ALL.len() as f32 * (TAB_WIDTH + 4.0) + 4.0;
@@ -667,15 +1003,15 @@ impl State {
 
         let layout = self.layout();
 
+        // Подписи на превью — по параметрам из черновика.
+        let params = config::draft_params();
+
         // Превью колеса.
         render::fill(pixmap, &area_path(card_area(), 16.0), CARD);
         render::stroke(pixmap, &area_path(card_area(), 16.0), BORDER, scale);
 
         let slots: Vec<SlotView> = (0..layout.sections)
-            .map(|slot| SlotView {
-                action: layout.action_for_slot(slot),
-                enabled: true,
-            })
+            .map(|slot| SlotView::new(layout.action_for_slot(slot), true, &params))
             .collect();
 
         let highlighted = self.highlighted_slot();
@@ -686,6 +1022,7 @@ impl State {
 
         let key = PreviewKey {
             category: self.category,
+            params,
             layout: layout.clone(),
             hover: self.preview_hover[..layout.sections]
                 .iter()
@@ -820,7 +1157,7 @@ impl State {
             );
 
             let (title, color) = match layout.action_for_slot(slot) {
-                Some(action) => (action.title(), TEXT),
+                Some(action) => (action.title(&params), TEXT),
                 None => ("Пусто", TEXT_FAINT),
             };
 
@@ -835,47 +1172,148 @@ impl State {
                 s(1.6),
             );
         }
+    }
 
-        // Нижняя панель.
-        render::fill_rect(pixmap, 0.0, s(FOOTER_Y), s(WIDTH), scale.max(1.0), BORDER);
+    fn paint_params(&self, pixmap: &mut Pixmap, scale: f32, fonts: &text::Fonts) {
+        let s = |value: f32| value * scale;
 
-        let (status, status_color) = match &self.status {
-            Some(status) => (status.text.clone(), with_alpha(status.color, (status.left / 0.4).min(1.0))),
-
-            None if config::has_unsaved_changes() => {
-                ("● Есть несохранённые изменения".to_string(), WARNING)
-            }
-
-            None => (
-                "Колесо: Ctrl+Alt+Space   ·   Настройки: Ctrl+Alt+F12".to_string(),
-                TEXT_FAINT,
-            ),
+        let area_path = |area: Area, radius: f32| {
+            render::rounded_rect(s(area.x), s(area.y), s(area.width), s(area.height), s(radius))
         };
 
-        label(pixmap, &fonts.regular, 14.0, &status, PADDING, BUTTON_Y + BUTTON_HEIGHT / 2.0, status_color);
+        let label = |pixmap: &mut Pixmap, font: &FontVec, size: f32, value: &str, x: f32, y: f32, color: Rgba| {
+            draw_left(pixmap, font, s(size), value, s(x), s(y), color);
+        };
 
-        let cancel = cancel_area();
+        let centered = |pixmap: &mut Pixmap, font: &FontVec, size: f32, value: &str, area: Area, color: Rgba| {
+            text::draw_centered(pixmap, font, s(size), value, s(area.center_x()), s(area.center_y()), color);
+        };
 
-        let cancel_hover = self.hover_of(Target::Cancel);
+        let draft = config::draft_params();
 
-        render::fill(pixmap, &area_path(cancel, 8.0), mix(CARD, CARD_HOVER, cancel_hover));
-        render::stroke(pixmap, &area_path(cancel, 8.0), BORDER, scale);
+        let defaults = Params::default();
 
-        centered(pixmap, &fonts.semibold, 15.0, "Отмена", cancel, TEXT);
+        let changed = |id: ParamId| draft.get(id) != defaults.get(id);
 
-        let save = save_area();
+        // Разделы: подложка и скользящая подсветка выбранного.
+        render::fill(pixmap, &area_path(nav_area(), 16.0), CARD);
+        render::stroke(pixmap, &area_path(nav_area(), 16.0), BORDER, scale);
 
         render::fill(
             pixmap,
-            &area_path(save, 8.0),
-            mix(ACCENT_DARK, ACCENT, self.hover_of(Target::Save)),
+            &area_path(Area::new(NAV_X + 8.0, self.group_y, NAV_WIDTH - 16.0, NAV_ITEM_HEIGHT), 8.0),
+            ACCENT_DARK,
         );
 
-        centered(pixmap, &fonts.semibold, 15.0, "Сохранить", save, TEXT);
+        for (index, group) in params::GROUPS.iter().enumerate() {
+            let area = group_area(index);
 
-        // Выпадающий список — поверх всего.
-        if let Some(menu) = &self.menu {
-            self.paint_menu(pixmap, menu, &layout, scale, fonts);
+            let selected = index == self.group;
+
+            let amount = self.hover_of(Target::Group(index));
+
+            if !selected {
+                render::fill(pixmap, &area_path(area, 8.0), with_alpha(CARD_HOVER, amount));
+            }
+
+            let color = if selected { TEXT } else { mix(TEXT_MUTED, TEXT, amount) };
+
+            label(pixmap, &fonts.semibold, 15.0, group.label, area.x + 14.0, area.center_y(), color);
+
+            // Точка — в разделе есть изменённые параметры.
+            if group.params.iter().any(|&id| changed(id)) {
+                render::fill(
+                    pixmap,
+                    &render::circle(s(area.x + area.width - 16.0), s(area.center_y()), s(3.5)),
+                    if selected { TEXT } else { ACCENT },
+                );
+            }
+        }
+
+        // «Сбросить раздел» — активен, только если есть что сбрасывать.
+        let reset = reset_params_area();
+
+        let reset_hover = self.hover_of(Target::ResetParams);
+
+        let resettable = group_params(self.group).iter().any(|&id| changed(id));
+
+        if resettable {
+            render::fill(pixmap, &area_path(reset, 8.0), with_alpha(CARD_HOVER, reset_hover));
+        }
+
+        centered(
+            pixmap,
+            &fonts.regular,
+            14.0,
+            "Сбросить раздел",
+            reset,
+            if resettable { mix(TEXT_MUTED, TEXT, reset_hover) } else { TEXT_FAINT },
+        );
+
+        // Карточки параметров.
+        for (index, &id) in group_params(self.group).iter().enumerate() {
+            let card = param_area(index);
+
+            render::fill(pixmap, &area_path(card, 14.0), CARD);
+            render::stroke(pixmap, &area_path(card, 14.0), BORDER, scale);
+
+            let title_y = card.y + 24.0;
+
+            label(pixmap, &fonts.semibold, 16.0, id.title(), card.x + PARAM_INSET, title_y, TEXT);
+
+            // Отличается от значения по умолчанию.
+            if changed(id) {
+                let width = text::measure(&fonts.semibold, s(16.0), id.title()) / scale;
+
+                render::fill(
+                    pixmap,
+                    &render::circle(s(card.x + PARAM_INSET + width + 10.0), s(title_y), s(3.5)),
+                    ACCENT,
+                );
+            }
+
+            label(pixmap, &fonts.regular, 13.5, id.hint(), card.x + PARAM_INSET, card.y + 45.0, TEXT_MUTED);
+
+            let choices = id.choices();
+
+            let count = choices.len();
+
+            let selected = selected_choice(&draft, id);
+
+            // Подложки вариантов, поверх — скользящая подсветка выбранного,
+            // поверх неё — подписи.
+            for choice in 0..count {
+                let area = choice_area(index, choice, count);
+
+                let amount = self.hover_of(Target::Choice(id, choice));
+
+                render::fill(pixmap, &area_path(area, 8.0), mix(BACKGROUND, CARD_HOVER, amount));
+                render::stroke(pixmap, &area_path(area, 8.0), BORDER, scale);
+            }
+
+            let first = choice_area(index, 0, count);
+
+            let highlight_x = self
+                .choice_x
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| choice_area(index, selected, count).x);
+
+            render::fill(
+                pixmap,
+                &area_path(Area::new(highlight_x, first.y, first.width, first.height), 8.0),
+                ACCENT_DARK,
+            );
+
+            for (choice, option) in choices.iter().enumerate() {
+                let area = choice_area(index, choice, count);
+
+                let amount = self.hover_of(Target::Choice(id, choice));
+
+                let color = if choice == selected { TEXT } else { mix(TEXT_MUTED, TEXT, amount) };
+
+                centered(pixmap, &fonts.semibold, 14.5, option.label, area, color);
+            }
         }
     }
 
@@ -911,6 +1349,8 @@ impl State {
 
         let current = layout.action_for_slot(menu.slot);
 
+        let params = config::draft_params();
+
         for (index, &item) in items.iter().enumerate() {
             let row = item_area(&area, index, menu.scroll);
 
@@ -932,7 +1372,7 @@ impl State {
             let selected = item == current;
 
             let (title, color) = match item {
-                Some(action) => (action.title(), if selected { ACCENT } else { TEXT }),
+                Some(action) => (action.title(&params), if selected { ACCENT } else { TEXT }),
                 None => ("Пусто", TEXT_FAINT),
             };
 
@@ -1295,6 +1735,13 @@ impl SettingsUi {
                 mouse: None,
                 hover: HashMap::new(),
                 tab_x: tab_area(0).x,
+                page: Page::Wheel,
+                page_x: mode_area(0).x,
+                group: 0,
+                group_y: group_area(0).y,
+                choice_x: HashMap::new(),
+                fade: 1.0,
+                fade_area: content_area(),
                 menu: None,
                 preview_hover: vec![0.0; MAX_SECTIONS],
                 preview_tilt: (0.0, 0.0),
@@ -1366,3 +1813,4 @@ unsafe fn place_window(hwnd: HWND) {
         SetWindowPos(hwnd, null_mut(), x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
+

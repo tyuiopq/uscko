@@ -17,6 +17,8 @@ use windows_sys::Win32::{
 };
 
 use crate::actions::{ActionId, ActionOutcome};
+use crate::config;
+use crate::params::Params;
 
 pub const WM_FILEHALO_JOB_DONE: u32 = WM_APP + 1;
 
@@ -26,6 +28,9 @@ pub const CANCELLED: &str = "Отменено";
 struct Job {
     action: ActionId,
     inputs: Vec<PathBuf>,
+    // Параметры на момент запуска: правка настроек не меняет задачу,
+    // которая уже стоит в очереди.
+    params: Params,
 }
 
 pub struct JobResult {
@@ -108,7 +113,11 @@ pub fn enqueue(notify_window: HWND, action: ActionId, inputs: Vec<PathBuf>) -> u
         return 0;
     };
 
-    queue.push_back(Job { action, inputs });
+    queue.push_back(Job {
+        action,
+        inputs,
+        params: config::params(),
+    });
 
     // Решения «запустить поток» и «поток закончил работу» принимаются под
     // одной блокировкой очереди, поэтому задача не может потеряться.
@@ -177,7 +186,7 @@ fn run(job: &Job) -> ActionOutcome {
 
     TOTAL_COUNT.store(if combined { 1 } else { job.inputs.len() }, Ordering::Relaxed);
 
-    job.action.execute(&job.inputs, |done, total| {
+    job.action.execute(&job.inputs, &job.params, |done, total| {
         if combined {
             set_file_progress(done as f64 / total.max(1) as f64);
         } else {

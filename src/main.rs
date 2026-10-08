@@ -794,6 +794,15 @@ fn main() {
                         continue;
                     }
 
+                    Reading::ExplorerFailed => {
+                        status_ui.hint(
+                            "Не удалось прочитать выделение",
+                            "Проводник не ответил. Подробности — в журнале",
+                        );
+
+                        continue;
+                    }
+
                     Reading::Ambiguous => {
                         status_ui.hint(
                             "Несколько файлов с таким именем",

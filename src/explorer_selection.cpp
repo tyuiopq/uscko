@@ -212,6 +212,29 @@ IShellBrowser* foreground_explorer_browser(IShellWindows* shell_windows, HWND fo
     return found;
 }
 
+BOOL CALLBACK find_top_explorer(HWND window, LPARAM found) {
+    wchar_t class_name[64] = {};
+
+    if (IsWindowVisible(window) && GetClassNameW(window, class_name, 64) > 0
+        && wcscmp(class_name, L"CabinetWClass") == 0)
+    {
+        *reinterpret_cast<HWND*>(found) = window;
+
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+// Верхнее по порядку окон (последнее активное) видимое окно Проводника.
+HWND top_explorer_window() {
+    HWND found = nullptr;
+
+    EnumWindows(find_top_explorer, reinterpret_cast<LPARAM>(&found));
+
+    return found;
+}
+
 // Вызывает visit(path) для каждого выделенного элемента, у которого есть путь
 // в файловой системе. Виртуальные элементы (Корзина, Этот компьютер) пропускаются.
 template <typename Visit>
@@ -400,7 +423,9 @@ bool select_in_browser(
 // Выделенные файлы в окне Проводника foreground (или на рабочем столе).
 // Окно передаётся снаружи: оно запомнено в момент нажатия клавиш, а к этому
 // времени на переднем плане может быть уже другое. Для каждого пути
-// вызывает callback. Возвращает число путей.
+// вызывает callback. Возвращает число путей; -1 — не удалось связаться с
+// Проводником; -2 — не нашлось окна Проводника ни для foreground, ни среди
+// открытых.
 extern "C"
 int filehalo_get_selected_paths(HWND foreground, PathCallback callback, void* context) {
     if (callback == nullptr) {
@@ -412,14 +437,25 @@ int filehalo_get_selected_paths(HWND foreground, PathCallback callback, void* co
     IShellWindows* shell_windows = create_shell_windows();
 
     if (shell_windows == nullptr) {
-        return 0;
+        return -1;
     }
 
-    IShellBrowser* browser = foreground_is_desktop(foreground)
+    bool desktop = foreground_is_desktop(foreground);
+
+    IShellBrowser* browser = desktop
         ? desktop_browser(shell_windows)
         : foreground_explorer_browser(shell_windows, foreground);
 
-    int count = 0;
+    // Окно не сопоставилось — берём верхнее открытое окно Проводника.
+    if (browser == nullptr && !desktop) {
+        HWND top = top_explorer_window();
+
+        if (top != nullptr && top != foreground) {
+            browser = foreground_explorer_browser(shell_windows, top);
+        }
+    }
+
+    int count = browser != nullptr ? 0 : -2;
 
     if (browser != nullptr) {
         count = for_each_selected_path(browser, [&](const wchar_t* path) {

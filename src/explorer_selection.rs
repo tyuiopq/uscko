@@ -23,14 +23,15 @@ unsafe extern "C" fn collect_path(context: *mut c_void, path: *const u16) {
 }
 
 // Все выделенные файлы в окне Проводника window или на рабочем столе.
-pub fn selected_paths(window: HWND) -> Vec<PathBuf> {
+// Err — код, почему прочитать не удалось (для журнала).
+pub fn selected_paths(window: HWND) -> Result<Vec<PathBuf>, i32> {
     let mut paths: Vec<PathBuf> = Vec::new();
 
-    unsafe {
-        filehalo_get_selected_paths(window, collect_path, &mut paths as *mut Vec<PathBuf> as *mut c_void);
-    }
+    let code = unsafe {
+        filehalo_get_selected_paths(window, collect_path, &mut paths as *mut Vec<PathBuf> as *mut c_void)
+    };
 
-    paths
+    if code < 0 { Err(code) } else { Ok(paths) }
 }
 
 // Выделяет файлы во всех окнах Проводника (и на рабочем столе), где открыта

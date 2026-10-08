@@ -56,6 +56,8 @@ pub enum Reading {
     Ambiguous,
     // На переднем плане не Проводник и не диалог с файлами.
     NotSupported,
+    // Проводник не отдал выделение (подробности — в журнале).
+    ExplorerFailed,
 }
 
 pub fn read(foreground_window: isize) -> Reading {
@@ -83,9 +85,27 @@ pub fn read(foreground_window: isize) -> Reading {
     }
 
     match explorer_selection::selected_paths(window) {
-        paths if paths.is_empty() => Reading::NothingSelected,
-        paths => Reading::Files(paths, Source::Explorer),
+        Ok(paths) if paths.is_empty() => Reading::NothingSelected,
+
+        Ok(paths) => Reading::Files(paths, Source::Explorer),
+
+        Err(code) => {
+            crate::journal::write(&format!(
+                "Проводник не отдал выделение: код {code}, окно класса «{}»",
+                window_class(window)
+            ));
+
+            Reading::ExplorerFailed
+        }
     }
+}
+
+fn window_class(window: HWND) -> String {
+    let mut name = [0u16; 128];
+
+    let length = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW(window, name.as_mut_ptr(), 128) };
+
+    String::from_utf16_lossy(&name[..length.max(0) as usize])
 }
 
 // Одно и то же имя без расширения может совпасть с несколькими файлами;

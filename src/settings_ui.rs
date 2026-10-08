@@ -180,6 +180,8 @@ enum Target {
     ResetParams,
     OpenLog,
     ChangeHotkey(Slot),
+    Autostart(bool),
+    Welcome,
     Tab(usize),
     Sections(usize),
     Row(usize),
@@ -249,6 +251,8 @@ struct State {
     fade: f32,
     fade_area: Area,
     capture: Option<Capture>,
+    // Запуск вместе с Windows (читается из реестра при открытии окна).
+    autostart: bool,
     category: usize,
     mouse: Option<(f32, f32)>,
     hover: HashMap<Target, f32>,
@@ -370,6 +374,13 @@ fn log_button_area(card: Area) -> Area {
         LOG_BUTTON_WIDTH,
         34.0,
     )
+}
+
+// Кнопка «Как пользоваться» в карточке «О программе».
+fn welcome_button_area() -> Area {
+    let card = Area::new(PANEL_X, param_area(1).y, PANEL_WIDTH, LOG_CARD_HEIGHT);
+
+    log_button_area(card)
 }
 
 fn group_extra(group: usize) -> Extra {
@@ -634,6 +645,18 @@ impl State {
             return Some(Target::ChangeHotkey(Slot::ALL[index]));
         }
 
+        if group_extra(self.group) == Extra::App {
+            for (choice, enabled) in [(0, true), (1, false)] {
+                if choice_area(0, choice, 2).contains(x, y) {
+                    return Some(Target::Autostart(enabled));
+                }
+            }
+
+            if welcome_button_area().contains(x, y) {
+                return Some(Target::Welcome);
+            }
+        }
+
         for (index, &id) in group_params(self.group).iter().enumerate() {
             let count = id.choices().len();
 
@@ -781,6 +804,19 @@ impl State {
                     config::reset_draft_hotkeys();
                 }
             }
+
+            // Применяется сразу: это не настройка из файла, а запись в реестре.
+            Some(Target::Autostart(enabled)) => {
+                if crate::autostart::set(enabled) {
+                    self.autostart = enabled;
+                } else {
+                    self.set_status("Не удалось изменить автозапуск", DANGER);
+                }
+            }
+
+            Some(Target::Welcome) => unsafe {
+                PostMessageW(self.hwnd, crate::instance::WM_USKKO_COMMAND, crate::instance::Command::Welcome as usize, 0);
+            },
 
             Some(Target::ChangeHotkey(slot)) => {
                 if self.capture.as_ref().is_some_and(|capture| capture.slot == slot) {
@@ -1545,7 +1581,7 @@ impl State {
                 pixmap,
                 &fonts.regular,
                 13.5,
-                "%LOCALAPPDATA%\\FileHalo\\журнал.txt",
+                "%LOCALAPPDATA%\\uskko\\журнал.txt",
                 card.x + PARAM_INSET,
                 card.y + 50.0,
                 TEXT_MUTED,
@@ -1565,6 +1601,96 @@ impl State {
         if group_extra(self.group) == Extra::Hotkeys {
             self.paint_hotkeys(pixmap, scale, fonts);
         }
+
+        if group_extra(self.group) == Extra::App {
+            self.paint_app(pixmap, scale, fonts);
+        }
+    }
+
+    fn paint_app(&self, pixmap: &mut Pixmap, scale: f32, fonts: &text::Fonts) {
+        let s = |value: f32| value * scale;
+
+        let area_path = |area: Area, radius: f32| {
+            render::rounded_rect(s(area.x), s(area.y), s(area.width), s(area.height), s(radius))
+        };
+
+        // Автозапуск.
+        let card = param_area(0);
+
+        render::fill(pixmap, &area_path(card, 14.0), CARD);
+        render::stroke(pixmap, &area_path(card, 14.0), BORDER, scale);
+
+        draw_left(pixmap, &fonts.semibold, s(16.0), "Запускать вместе с Windows", s(card.x + PARAM_INSET), s(card.y + 24.0), TEXT);
+
+        draw_left(
+            pixmap,
+            &fonts.regular,
+            s(13.5),
+            "Колесо будет готово сразу после входа в Windows",
+            s(card.x + PARAM_INSET),
+            s(card.y + 45.0),
+            TEXT_MUTED,
+        );
+
+        let selected = if self.autostart { 0 } else { 1 };
+
+        for (choice, label) in ["Да", "Нет"].into_iter().enumerate() {
+            let area = choice_area(0, choice, 2);
+
+            let amount = self.hover_of(Target::Autostart(choice == 0));
+
+            let fill = if choice == selected { ACCENT_DARK } else { mix(BACKGROUND, CARD_HOVER, amount) };
+
+            render::fill(pixmap, &area_path(area, 8.0), fill);
+
+            if choice != selected {
+                render::stroke(pixmap, &area_path(area, 8.0), BORDER, scale);
+            }
+
+            let color = if choice == selected { TEXT } else { mix(TEXT_MUTED, TEXT, amount) };
+
+            text::draw_centered(pixmap, &fonts.semibold, s(14.5), label, s(area.center_x()), s(area.center_y()), color);
+        }
+
+        // О программе.
+        let card = Area::new(PANEL_X, param_area(1).y, PANEL_WIDTH, LOG_CARD_HEIGHT);
+
+        render::fill(pixmap, &area_path(card, 14.0), CARD);
+        render::stroke(pixmap, &area_path(card, 14.0), BORDER, scale);
+
+        draw_left(
+            pixmap,
+            &fonts.semibold,
+            s(16.0),
+            &format!("{} {}", crate::app::NAME, crate::app::VERSION),
+            s(card.x + PARAM_INSET),
+            s(card.y + 26.0),
+            TEXT,
+        );
+
+        draw_left(
+            pixmap,
+            &fonts.regular,
+            s(13.5),
+            &format!("Издатель: {}", crate::app::PUBLISHER),
+            s(card.x + PARAM_INSET),
+            s(card.y + 50.0),
+            TEXT_MUTED,
+        );
+
+        let button = welcome_button_area();
+
+        render::fill(pixmap, &area_path(button, 8.0), mix(ACCENT_DARK, ACCENT, self.hover_of(Target::Welcome)));
+
+        text::draw_centered(
+            pixmap,
+            &fonts.semibold,
+            s(14.5),
+            "Как пользоваться",
+            s(button.center_x()),
+            s(button.center_y()),
+            TEXT,
+        );
     }
 
     fn paint_hotkeys(&self, pixmap: &mut Pixmap, scale: f32, fonts: &text::Fonts) {
@@ -2097,7 +2223,7 @@ impl SettingsUi {
             return None;
         }
 
-        let title: Vec<u16> = "FileHalo — настройки"
+        let title: Vec<u16> = format!("{} — настройки", crate::app::NAME)
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -2140,6 +2266,7 @@ impl SettingsUi {
                 fade: 1.0,
                 fade_area: content_area(),
                 capture: None,
+                autostart: false,
                 menu: None,
                 preview_hover: vec![0.0; MAX_SECTIONS],
                 preview_tilt: (0.0, 0.0),
@@ -2161,6 +2288,7 @@ impl SettingsUi {
                 with_state(|state| {
                     state.menu = None;
                     state.status = None;
+                    state.autostart = crate::autostart::is_enabled();
                 });
 
                 place_window(self.hwnd);

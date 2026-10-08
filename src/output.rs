@@ -239,7 +239,7 @@ fn temp_path(folder: &Path) -> PathBuf {
 
     let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-    folder.join(format!(".filehalo-{pid}-{id}.tmp"))
+    folder.join(format!(".uskko-{pid}-{id}.tmp"))
 }
 
 fn move_file(from: &Path, to: &Path, replace: bool) -> Result<(), String> {

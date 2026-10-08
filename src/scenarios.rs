@@ -52,12 +52,12 @@ impl TempDir {
         self.0.join(name)
     }
 
-    // Временных файлов программы (скрытых .filehalo-*) не осталось.
+    // Временных файлов программы (скрытых .uskko-*) не осталось.
     fn assert_no_leftovers(&self) {
         let leftovers: Vec<String> = std::fs::read_dir(&self.0)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(".filehalo"))
+            .filter(|name| name.starts_with(".uskko"))
             .collect();
 
         assert!(leftovers.is_empty(), "временные файлы остались: {leftovers:?}");

@@ -60,7 +60,7 @@ pub enum Step {
 
 // Копии файлов до изменения — в папке программы, не рядом с файлами.
 fn backup_folder() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("FileHalo").join("отмена"))
+    Some(crate::app::local_folder()?.join("отмена"))
 }
 
 // Копия файла перед изменением на месте.

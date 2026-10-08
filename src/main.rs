@@ -1,4 +1,11 @@
+// Готовая сборка — без окна консоли; отладочная оставляет его для вывода.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod actions;
+mod app;
+mod autostart;
+#[cfg(test)]
+mod brand;
 mod archive;
 mod clipboard;
 mod config;
@@ -12,6 +19,7 @@ mod foreground;
 mod heic;
 mod hotkeys;
 mod icons;
+mod instance;
 mod job_manager;
 mod journal;
 mod media;
@@ -28,7 +36,9 @@ mod scenarios;
 mod settings_ui;
 mod status_ui;
 mod text;
+mod tray;
 mod undo;
+mod welcome_ui;
 mod wheel;
 mod winrt;
 
@@ -47,7 +57,7 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, KillTimer, MSG,
-    PostThreadMessageW, SetTimer, TranslateMessage, WM_HOTKEY, WM_TIMER,
+    PostQuitMessage, PostThreadMessageW, SetTimer, TranslateMessage, WM_HOTKEY, WM_TIMER,
 };
 
 use hotkeys::Slot;
@@ -295,12 +305,28 @@ fn main() {
 
     journal::install_panic_hook();
 
-    journal::write(&format!("Запуск FileHalo {}", env!("CARGO_PKG_VERSION")));
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+
+    let flag = |name: &str| arguments.iter().any(|argument| argument == name);
+
+    // Программа уже работает — просим её показать настройки (или подсказку,
+    // если так просит установщик) и выходим.
+    if instance::acquire().is_none() {
+        let command = if flag("--welcome") { instance::Command::Welcome } else { instance::Command::Settings };
+
+        instance::send_to_running(command);
+
+        return;
+    }
+
+    app::migrate_old_folders();
+
+    journal::write(&format!("Запуск {} {}", app::NAME, app::VERSION));
 
     // Копии для «Отменить» от прошлого запуска уже не понадобятся.
     undo::clear_backups();
 
-    println!("FileHalo starting...");
+    println!("{} starting...", app::NAME);
 
 
     let config_path = match config::initialize() {
@@ -342,6 +368,20 @@ fn main() {
             return;
         };
 
+        let Some(welcome) = welcome_ui::WelcomeUi::create(instance) else {
+            eprintln!("Could not create welcome window.");
+
+            return;
+        };
+
+        let Some(control) = instance::create_window(instance) else {
+            eprintln!("Could not create control window.");
+
+            return;
+        };
+
+        tray::add(control);
+
         let hotkeys = config::hotkeys();
 
         println!("Hold: {}", hotkeys.wheel.label());
@@ -350,23 +390,28 @@ fn main() {
 
         let failed = register_hotkeys();
 
-        // Колесо не зарегистрировалось — скорее всего, программа уже
-        // запущена (или сочетание заняла другая).
-        if failed.contains(&Slot::Wheel) {
-            journal::write(&format!("Сочетание {} занято — выход", hotkeys.wheel.label()));
+        // Сочетание заняла другая программа: работаем дальше (настройки
+        // открываются из трея), но сразу говорим, что его нужно сменить.
+        for slot in &failed {
+            let name = hotkeys.get(*slot).label();
 
-            eprintln!("Could not register wheel hotkey.");
+            journal::write(&format!("Сочетание {name} занято другой программой"));
 
-            unregister_hotkeys();
-
-            return;
+            status_ui.finish(
+                status_ui::Outcome::Error,
+                format!("Сочетание {name} занято"),
+                Some("Выберите другое: значок uskko в трее → Настройки".to_string()),
+                true,
+                None,
+            );
         }
 
-        if failed.contains(&Slot::Settings) {
-            journal::write(&format!("Сочетание {} занято другой программой", hotkeys.settings.label()));
+        // Первый запуск (или установщик просит) — показываем, как пользоваться.
+        if !flag(autostart::FLAG) && (flag("--welcome") || !config::welcome_shown()) {
+            welcome.show();
         }
 
-        println!("FileHalo ready.");
+        println!("{} ready.", app::NAME);
 
         let mut message: MSG = zeroed();
 
@@ -576,6 +621,61 @@ fn main() {
             // -------------------------
 
             // -------------------------
+            // TRAY MENU AND OTHER COMMANDS
+            // -------------------------
+
+            if message.message == instance::WM_USKKO_COMMAND {
+                match instance::Command::from_code(message.wParam) {
+                    Some(instance::Command::Settings) => settings_ui.show(),
+
+                    Some(instance::Command::Welcome) => welcome.show(),
+
+                    Some(instance::Command::Journal) => journal::open(),
+
+                    Some(instance::Command::ToggleAutostart) => {
+                        let enabled = !autostart::is_enabled();
+
+                        if autostart::set(enabled) {
+                            status_ui.hint(
+                                if enabled { "Запуск вместе с Windows включён" } else { "Запуск вместе с Windows выключен" },
+                                "Изменить — в меню значка в трее",
+                            );
+                        }
+                    }
+
+                    Some(instance::Command::Exit) => PostQuitMessage(0),
+
+                    None => {}
+                }
+
+                continue;
+            }
+
+            // Окно «Как пользоваться» закрыли.
+            if message.message == welcome_ui::WM_WELCOME_CLOSED {
+                if !config::welcome_shown() {
+                    config::set_welcome_shown();
+
+                    tray::notify(
+                        control,
+                        &format!("{} работает здесь", app::NAME),
+                        &format!(
+                            "Колесо — {}. Меню — правой кнопкой по значку.",
+                            config::hotkeys().wheel.label()
+                        ),
+                    );
+                }
+
+                continue;
+            }
+
+            if message.message == welcome_ui::WM_WELCOME_SETTINGS {
+                settings_ui.show();
+
+                continue;
+            }
+
+            // -------------------------
             // HOTKEYS CHANGED IN SETTINGS
             // -------------------------
 
@@ -585,6 +685,9 @@ fn main() {
                     unregister_hotkeys();
                 } else {
                     let failed = register_hotkeys();
+
+                    // В подсказке у значка — актуальное сочетание.
+                    tray::refresh_tip(control);
 
                     if !failed.is_empty() {
                         let hotkeys = config::hotkeys();
@@ -839,6 +942,10 @@ fn main() {
             DispatchMessageW(&message);
         }
 
+        tray::remove(control);
+
         unregister_hotkeys();
+
+        journal::write("Выход");
     }
 }

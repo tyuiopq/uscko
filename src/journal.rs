@@ -23,7 +23,7 @@ static LOCK: Mutex<()> = Mutex::new(());
 
 pub fn path() -> Option<PathBuf> {
     PATH.get_or_init(|| {
-        let folder = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("FileHalo");
+        let folder = crate::app::local_folder()?;
 
         fs::create_dir_all(&folder).ok()?;
 
@@ -111,7 +111,7 @@ pub fn open() {
 
     // Пустого журнала может ещё не быть.
     if !path.exists() {
-        write("Журнал FileHalo");
+        write(&format!("Журнал {}", crate::app::NAME));
     }
 
     let wide = |text: &std::ffi::OsStr| -> Vec<u16> {

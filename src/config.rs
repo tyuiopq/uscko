@@ -1,4 +1,3 @@
-use std::env;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -199,6 +198,9 @@ pub struct AppConfig {
     pub params: Params,
 
     pub hotkeys: Hotkeys,
+
+    // Окно «Как пользоваться» уже показывали (при первом запуске).
+    pub welcome_shown: bool,
 }
 
 impl Default for AppConfig {
@@ -208,6 +210,7 @@ impl Default for AppConfig {
             wheel: WheelConfig::default(),
             params: Params::default(),
             hotkeys: Hotkeys::default(),
+            welcome_shown: false,
         }
     }
 }
@@ -427,9 +430,9 @@ impl Default for WheelConfig {
 }
 
 fn config_path() -> Result<PathBuf, String> {
-    let app_data = env::var_os("APPDATA").ok_or_else(|| "APPDATA is not available".to_string())?;
+    let folder = crate::app::roaming_folder().ok_or_else(|| "APPDATA is not available".to_string())?;
 
-    Ok(PathBuf::from(app_data).join("FileHalo").join("config.json"))
+    Ok(folder.join("config.json"))
 }
 
 fn with_extension_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -658,6 +661,34 @@ pub fn reset_draft_hotkeys() {
         && let Ok(mut draft) = draft.write()
     {
         draft.hotkeys = Hotkeys::default();
+    }
+}
+
+pub fn welcome_shown() -> bool {
+    CONFIG
+        .get()
+        .and_then(|config| config.read().ok().map(|config| config.welcome_shown))
+        .unwrap_or(true)
+}
+
+// Запоминает, что подсказку показали, — сразу на диске (не через «Сохранить»).
+pub fn set_welcome_shown() {
+    let (Some(config), Some(draft), Some(path)) = (CONFIG.get(), DRAFT.get(), CONFIG_PATH.get()) else {
+        return;
+    };
+
+    if let Ok(mut draft) = draft.write() {
+        draft.welcome_shown = true;
+    }
+
+    let Ok(mut config) = config.write() else {
+        return;
+    };
+
+    config.welcome_shown = true;
+
+    if let Err(error) = write_config(path, &config) {
+        eprintln!("{error}");
     }
 }
 

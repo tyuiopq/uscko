@@ -68,6 +68,8 @@ pub enum Extra {
     OpenLog,
     // Карточки горячих клавиш.
     Hotkeys,
+    // Запуск вместе с Windows и «О программе».
+    App,
 }
 
 pub const GROUPS: &[Group] = &[
@@ -110,6 +112,11 @@ pub const GROUPS: &[Group] = &[
         label: "Клавиши",
         params: &[],
         extra: Extra::Hotkeys,
+    },
+    Group {
+        label: "Программа",
+        params: &[],
+        extra: Extra::App,
     },
     Group {
         label: "Журнал",

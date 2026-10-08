@@ -13,7 +13,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use image::{DynamicImage, ImageEncoder, Rgb, RgbImage};
+use image::{DynamicImage, Rgb, RgbImage};
 use std::sync::RwLock;
 use lopdf::{Document, Object};
 

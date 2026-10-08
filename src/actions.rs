@@ -492,6 +492,23 @@ impl ActionId {
         self,
         inputs: &[PathBuf],
         params: &Params,
+        progress: impl FnMut(usize, usize),
+    ) -> ActionOutcome {
+        let outcome = self.run(inputs, params, progress);
+
+        // Результат из скачанного файла — тоже «из интернета». Переложенные
+        // в новую папку файлы сохраняют свои пометки сами.
+        if self != Self::IntoNewFolder {
+            crate::motw::propagate(inputs, &outcome.outputs);
+        }
+
+        outcome
+    }
+
+    fn run(
+        self,
+        inputs: &[PathBuf],
+        params: &Params,
         mut progress: impl FnMut(usize, usize),
     ) -> ActionOutcome {
         let total = inputs.len();

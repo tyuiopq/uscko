@@ -16,6 +16,7 @@ mod job_manager;
 mod journal;
 mod media;
 mod metadata;
+mod motw;
 mod output;
 mod params;
 mod rar;

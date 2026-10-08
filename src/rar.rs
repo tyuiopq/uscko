@@ -90,6 +90,31 @@ extern "C" fn callback(message: native::UINT, user_data: native::LPARAM, first: 
     }
 }
 
+// Sink живёт по сырому указателю: UnRAR меняет его из callback во время
+// своих вызовов, и в это время у Rust не должно быть ссылок на него. Сам
+// код обращается к нему только между вызовами UnRAR, через with().
+struct SinkPointer(*mut Sink);
+
+impl SinkPointer {
+    fn new() -> Self {
+        Self(Box::into_raw(Box::new(Sink::default())))
+    }
+
+    fn user_data(&self) -> native::LPARAM {
+        self.0 as native::LPARAM
+    }
+
+    fn with<R>(&self, work: impl FnOnce(&mut Sink) -> R) -> R {
+        work(unsafe { &mut *self.0 })
+    }
+}
+
+impl Drop for SinkPointer {
+    fn drop(&mut self) {
+        drop(unsafe { Box::from_raw(self.0) });
+    }
+}
+
 // Открытый архив; закрывается при выходе из области видимости.
 struct Handle(*const native::Handle);
 
@@ -183,7 +208,8 @@ fn file_time(low: u32, high: u32) -> Option<SystemTime> {
 // Распаковывает RAR в папку root. safe_path превращает имя из архива в
 // безопасный относительный путь (None — пропустить).
 pub fn extract(source: &Path, root: &Path, safe_path: impl Fn(&str) -> Option<PathBuf>) -> Result<(), String> {
-    let mut sink = Box::new(Sink::default());
+    // Объявлен раньше архива — значит, освободится позже: архив закрывается первым.
+    let sink = SinkPointer::new();
 
     let archive_name = wide(&first_volume(source));
 
@@ -198,7 +224,7 @@ pub fn extract(source: &Path, root: &Path, safe_path: impl Fn(&str) -> Option<Pa
         comment_state: 0,
         flags: 0,
         callback: Some(callback),
-        user_data: &mut *sink as *mut Sink as native::LPARAM,
+        user_data: sink.user_data(),
         op_flags: 0,
         comment_buffer_w: std::ptr::null_mut(),
         mark_of_the_web: std::ptr::null_mut(),
@@ -212,7 +238,7 @@ pub fn extract(source: &Path, root: &Path, safe_path: impl Fn(&str) -> Option<Pa
             drop(Handle(raw));
         }
 
-        return Err(describe(open.open_result as c_int, &sink));
+        return Err(sink.with(|sink| describe(open.open_result as c_int, sink)));
     }
 
     let handle = Handle(raw);
@@ -230,7 +256,7 @@ pub fn extract(source: &Path, root: &Path, safe_path: impl Fn(&str) -> Option<Pa
         }
 
         if code != native::ERAR_SUCCESS {
-            return Err(describe(code, &sink));
+            return Err(sink.with(|sink| describe(code, sink)));
         }
 
         let flags = header.flags;
@@ -248,10 +274,10 @@ pub fn extract(source: &Path, root: &Path, safe_path: impl Fn(&str) -> Option<Pa
         // Ссылки, жёсткие ссылки и копии файлов (redir) не создаём вовсе.
         let redirect = header.redir_type != 0;
 
-        let skip = |handle: &Handle, sink: &Sink| -> Result<(), String> {
+        let skip = |handle: &Handle, sink: &SinkPointer| -> Result<(), String> {
             let code = unsafe { native::RARProcessFileW(handle.0, native::RAR_SKIP, std::ptr::null(), std::ptr::null()) };
 
-            if code == native::ERAR_SUCCESS { Ok(()) } else { Err(describe(code, sink)) }
+            if code == native::ERAR_SUCCESS { Ok(()) } else { Err(sink.with(|sink| describe(code, sink))) }
         };
 
         match relative {
@@ -270,21 +296,25 @@ pub fn extract(source: &Path, root: &Path, safe_path: impl Fn(&str) -> Option<Pa
 
                 let file = File::create(&target).map_err(|error| errors::io("Не удалось распаковать", &error))?;
 
-                sink.file = Some(BufWriter::with_capacity(1 << 20, file));
+                let size = ((header.unp_size_high as u64) << 32) | header.unp_size as u64;
 
-                sink.remaining = ((header.unp_size_high as u64) << 32) | header.unp_size as u64;
+                sink.with(|sink| {
+                    sink.file = Some(BufWriter::with_capacity(1 << 20, file));
+
+                    sink.remaining = size;
+                });
 
                 // RAR_TEST: UnRAR проверяет и отдаёт данные в callback, сам не пишет.
                 let code = unsafe { native::RARProcessFileW(handle.0, native::RAR_TEST, std::ptr::null(), std::ptr::null()) };
 
-                let writer = sink.file.take();
+                let (writer, write_error) = sink.with(|sink| (sink.file.take(), sink.write_error.take()));
 
-                if let Some(error) = sink.write_error.take() {
+                if let Some(error) = write_error {
                     return Err(errors::io("Не удалось распаковать", &error));
                 }
 
                 if code != native::ERAR_SUCCESS {
-                    return Err(describe(code, &sink));
+                    return Err(sink.with(|sink| describe(code, sink)));
                 }
 
                 let file = writer

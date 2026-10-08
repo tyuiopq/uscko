@@ -853,6 +853,60 @@ fn rar_streams_are_not_written() {
     assert!(std::fs::File::open(PathBuf::from(stream)).is_err(), "поток NTFS распаковался");
 }
 
+// Пометка «файл из интернета» переходит на всё, что создало действие:
+// иначе exe из скачанного архива запустился бы без предупреждения SmartScreen.
+#[test]
+fn internet_mark_carries_over_to_results() {
+    let dir = TempDir::new("motw");
+
+    let mark = b"[ZoneTransfer]\r\nZoneId=3\r\n".to_vec();
+
+    let stream = |path: &Path| {
+        let mut stream = path.as_os_str().to_os_string();
+
+        stream.push(":Zone.Identifier");
+
+        PathBuf::from(stream)
+    };
+
+    // Архив из интернета: распакованные файлы помечены.
+    let source = dir.join("скачано");
+
+    copy_tree(&fixtures().join("expected"), &source);
+
+    let zip = single_output(run(ActionId::CreateZip, &[source.clone()]));
+
+    std::fs::remove_dir_all(&source).unwrap();
+
+    std::fs::write(stream(&zip), &mark).unwrap();
+
+    let folder = single_output(run(ActionId::ExtractArchive, &[zip]));
+
+    for file in ["Папка/текст.txt", "данные.bin"] {
+        assert_eq!(std::fs::read(stream(&folder.join(file))).unwrap(), mark, "{file}");
+    }
+
+    // Картинка из интернета: результат конвертации помечен.
+    let png = dir.join("фото.png");
+
+    photo(50, 50).save(&png).unwrap();
+
+    std::fs::write(stream(&png), &mark).unwrap();
+
+    let jpg = single_output(run(ActionId::ConvertToJpeg, &[png.clone()]));
+
+    assert_eq!(std::fs::read(stream(&jpg)).unwrap(), mark);
+
+    // «В новую папку» не помечает чужие файлы.
+    let local = dir.join("свой.txt");
+
+    std::fs::write(&local, b"local").unwrap();
+
+    let outcome = run(ActionId::IntoNewFolder, &[png, local]);
+
+    assert!(std::fs::read(stream(&outcome.outputs[0].join("свой.txt"))).is_err());
+}
+
 #[test]
 fn zip_roundtrip_keeps_everything() {
     let dir = TempDir::new("zip");

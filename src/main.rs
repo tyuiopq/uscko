@@ -20,6 +20,8 @@ mod output;
 mod params;
 mod pdf;
 mod render;
+#[cfg(test)]
+mod scenarios;
 mod settings_ui;
 mod status_ui;
 mod text;

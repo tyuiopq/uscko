@@ -577,3 +577,65 @@ pub fn merge_audio(files: &[PathBuf], params: &Params) -> Result<PathBuf, String
         render(&composition, temp, &profile)
     })
 }
+
+// Для тестов: ролик заданного размера и длины (заливка цветом), со звуком
+// из audio, если он задан, и размер кадра готового файла.
+#[cfg(test)]
+pub mod testing {
+    use super::*;
+
+    pub fn make_video(target: &Path, size: (u32, u32), length: f64, audio: Option<&Path>) -> Result<(), String> {
+        let _com = winrt::ComScope::new();
+
+        let failed = |error: windows::core::Error| winrt_error("test video", error);
+
+        let composition = MediaComposition::new().map_err(failed)?;
+
+        let color = windows::UI::Color { A: 255, R: 40, G: 120, B: 200 };
+
+        let clip = MediaClip::CreateFromColor(color, span(length)).map_err(failed)?;
+
+        composition.Clips().and_then(|clips| clips.Append(&clip)).map_err(failed)?;
+
+        if let Some(audio) = audio {
+            let track = BackgroundAudioTrack::CreateFromFileAsync(&winrt::storage_file(audio)?)
+                .and_then(|operation| operation.join())
+                .map_err(failed)?;
+
+            composition
+                .BackgroundAudioTracks()
+                .and_then(|tracks| tracks.Append(&track))
+                .map_err(failed)?;
+        }
+
+        let info = VideoInfo {
+            width: size.0,
+            height: size.1,
+            fps: (30, 1),
+            has_audio: audio.is_some(),
+        };
+
+        let profile = video_profile(VideoFormat::Mp4, &info, size, 0.3)?;
+
+        std::fs::File::create(target).map_err(|error| error.to_string())?;
+
+        render(&composition, target, &profile)
+    }
+
+    pub fn frame_size(path: &Path) -> Result<(u32, u32), String> {
+        let _com = winrt::ComScope::new();
+
+        let info = video_info(&winrt::storage_file(path)?)?;
+
+        Ok((info.width, info.height))
+    }
+
+    pub fn has_audio(path: &Path) -> bool {
+        let _com = winrt::ComScope::new();
+
+        winrt::storage_file(path)
+            .and_then(|file| video_info(&file))
+            .map(|info| info.has_audio)
+            .unwrap_or(false)
+    }
+}

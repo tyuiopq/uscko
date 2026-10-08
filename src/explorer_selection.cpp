@@ -138,8 +138,26 @@ IShellBrowser* desktop_browser(IShellWindows* shell_windows) {
     return browser;
 }
 
-// Вызывает visit(browser) для каждого окна и вкладки Проводника.
-// visit возвращает false, чтобы остановить перебор.
+// Окно верхнего уровня, которому принадлежит вкладка (по словам самого
+// Проводника).
+HWND top_level_of(IDispatch* dispatch) {
+    IWebBrowserApp* app = nullptr;
+
+    if (FAILED(dispatch->QueryInterface(IID_PPV_ARGS(&app)))) {
+        return nullptr;
+    }
+
+    SHANDLE_PTR handle = 0;
+
+    HRESULT hr = app->get_HWND(&handle);
+
+    release(app);
+
+    return SUCCEEDED(hr) ? reinterpret_cast<HWND>(handle) : nullptr;
+}
+
+// Вызывает visit(browser, окно верхнего уровня) для каждого окна и вкладки
+// Проводника. visit возвращает false, чтобы остановить перебор.
 template <typename Visit>
 void for_each_explorer_browser(IShellWindows* shell_windows, Visit visit) {
     long window_count = 0;
@@ -161,6 +179,8 @@ void for_each_explorer_browser(IShellWindows* shell_windows, Visit visit) {
             continue;
         }
 
+        HWND top_level = top_level_of(dispatch);
+
         IShellBrowser* browser = shell_browser_from(dispatch);
 
         release(dispatch);
@@ -169,7 +189,7 @@ void for_each_explorer_browser(IShellWindows* shell_windows, Visit visit) {
             continue;
         }
 
-        bool keep_going = visit(browser);
+        bool keep_going = visit(browser, top_level);
 
         release(browser);
 
@@ -179,37 +199,53 @@ void for_each_explorer_browser(IShellWindows* shell_windows, Visit visit) {
     }
 }
 
-// Активная вкладка окна Проводника, которое сейчас на переднем плане.
+// Активная вкладка окна Проводника foreground. Кандидаты — вкладки этого
+// окна (по словам Проводника или по родителю окна вкладки); из них лучшая:
+// совпадающая с первым ShellTabWindowClass (так в Windows 11 выглядит
+// активная вкладка), затем видимая, затем любая.
 IShellBrowser* foreground_explorer_browser(IShellWindows* shell_windows, HWND foreground) {
-    // В Windows 11 у всех вкладок одного окна общий HWND. Активная вкладка —
-    // первый дочерний ShellTabWindowClass, его и сравниваем с окном вкладки.
-    HWND active_tab = FindWindowExW(foreground, nullptr, L"ShellTabWindowClass", nullptr);
+    HWND first_tab = FindWindowExW(foreground, nullptr, L"ShellTabWindowClass", nullptr);
 
-    IShellBrowser* found = nullptr;
+    IShellBrowser* best = nullptr;
 
-    for_each_explorer_browser(shell_windows, [&](IShellBrowser* browser) {
+    int best_score = 0;
+
+    for_each_explorer_browser(shell_windows, [&](IShellBrowser* browser, HWND top_level) {
         HWND window = nullptr;
 
         if (FAILED(browser->GetWindow(&window))) {
+            window = nullptr;
+        }
+
+        bool belongs = top_level == foreground
+            || (window != nullptr && GetAncestor(window, GA_ROOT) == foreground);
+
+        if (!belongs) {
             return true;
         }
 
-        bool matches = active_tab != nullptr
-            ? window == active_tab
-            : GetAncestor(window, GA_ROOT) == foreground;
+        int score = 1;
 
-        if (!matches) {
-            return true;
+        if (window != nullptr && window == first_tab) {
+            score = 3;
+        } else if (window != nullptr && IsWindowVisible(window)) {
+            score = 2;
         }
 
-        browser->AddRef();
+        if (score > best_score) {
+            release(best);
 
-        found = browser;
+            browser->AddRef();
 
-        return false;
+            best = browser;
+
+            best_score = score;
+        }
+
+        return true;
     });
 
-    return found;
+    return best;
 }
 
 BOOL CALLBACK find_top_explorer(HWND window, LPARAM found) {
@@ -489,7 +525,7 @@ int filehalo_select_files(const wchar_t* folder, const wchar_t* paths, int edit)
 
     int selected_count = 0;
 
-    for_each_explorer_browser(shell_windows, [&](IShellBrowser* browser) {
+    for_each_explorer_browser(shell_windows, [&](IShellBrowser* browser, HWND) {
         if (select_in_browser(browser, folder, paths, edit != 0)) {
             ++selected_count;
         }

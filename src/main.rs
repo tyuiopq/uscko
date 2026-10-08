@@ -20,6 +20,7 @@ mod output;
 mod params;
 mod pdf;
 mod render;
+mod selection;
 #[cfg(test)]
 mod scenarios;
 mod settings_ui;
@@ -40,12 +41,22 @@ use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
 
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, MSG, SetTimer, TranslateMessage,
-    WM_HOTKEY, WM_TIMER,
+    DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, KillTimer, MSG,
+    PostThreadMessageW, SetTimer, TranslateMessage, WM_HOTKEY, WM_TIMER,
 };
 
 use hotkeys::Slot;
+use selection::{Reading, Source};
+
+// Выделение прочитано в фоновом потоке; lParam — Box<(номер запроса, Reading)>.
+const WM_SELECTION_READY: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 6;
+
+// Сколько ждать ответа Проводника или чужого диалога.
+const READING_TIMER_ID: usize = 4;
+const READING_TIMEOUT_MS: u32 = 2500;
 
 // Кадр анимации колеса (~60 к/с). Таймер идёт, пока колесо видно.
 const FRAME_TIMER_ID: usize = 1;
@@ -353,6 +364,14 @@ fn main() {
 
         let mut active_selection: Option<Selection> = None;
 
+        // Откуда взято выделение, с которым открыто колесо.
+        let mut active_source = Source::Explorer;
+
+        // Номер запроса чтения выделения, ответа на который ещё ждём.
+        let mut reading: Option<u32> = None;
+
+        let mut readings_started: u32 = 0;
+
         let mut last_slot: Option<usize> = None;
 
         // Результаты, которые ещё нужно выделить в Проводнике:
@@ -380,7 +399,7 @@ fn main() {
             // -------------------------
 
             if message.message == job_manager::WM_FILEHALO_JOB_DONE {
-                if let Some(job_manager::JobResult { action, mut outcome }) = job_manager::take_result()
+                if let Some(job_manager::JobResult { action, mut outcome, source }) = job_manager::take_result()
                 {
                     println!("FINISHED: {}", action.title(&config::params()));
 
@@ -435,7 +454,12 @@ fn main() {
                         report.button,
                     );
 
-                    if !outcome.outputs.is_empty() {
+                    // Действие из окна «Открыть»: результат сразу в поле «Имя файла».
+                    if let Source::Dialog(dialog) = source
+                        && !outcome.outputs.is_empty()
+                    {
+                        selection::put_into_dialog(dialog, &outcome.outputs);
+                    } else if !outcome.outputs.is_empty() {
                         if explorer_selection::select_files(&outcome.outputs, outcome.rename) {
                             pending_select = None;
                         } else {
@@ -578,28 +602,103 @@ fn main() {
             // OPEN WHEEL
             // -------------------------
 
-            if message.message == WM_HOTKEY && message.wParam == Slot::Wheel.id() as usize && !holding {
-                // Колесо работает с выделенным в Проводнике. Иначе — подсказка
-                // у курсора, чтобы было понятно, почему ничего не открылось.
-                if !foreground::foreground_is_explorer() {
-                    status_ui.hint(
-                        "Колесо работает в Проводнике",
-                        "Выделите файлы в папке или на рабочем столе",
-                    );
+            // Нажали сочетание колеса: выделение читается в фоновом потоке,
+            // колесо откроется, когда оно будет готово (если клавиши ещё держат).
+            if message.message == WM_HOTKEY
+                && message.wParam == Slot::Wheel.id() as usize
+                && !holding
+                && reading.is_none()
+            {
+                readings_started = readings_started.wrapping_add(1);
 
+                let request = readings_started;
+
+                reading = Some(request);
+
+                let foreground = GetForegroundWindow() as isize;
+
+                let main_thread = GetCurrentThreadId();
+
+                std::thread::spawn(move || {
+                    let result = Box::new((request, selection::read(foreground)));
+
+                    let pointer = Box::into_raw(result);
+
+                    if PostThreadMessageW(main_thread, WM_SELECTION_READY, 0, pointer as isize) == 0 {
+                        drop(Box::from_raw(pointer));
+                    }
+                });
+
+                SetTimer(wheel.hwnd(), READING_TIMER_ID, READING_TIMEOUT_MS, None);
+
+                continue;
+            }
+
+            // Проводник или диалог так и не ответил.
+            if message.message == WM_TIMER
+                && message.hwnd == wheel.hwnd()
+                && message.wParam == READING_TIMER_ID
+            {
+                KillTimer(wheel.hwnd(), READING_TIMER_ID);
+
+                if reading.take().is_some() {
+                    journal::write("Проводник не ответил на запрос выделения");
+
+                    status_ui.hint("Окно с файлами не отвечает", "Подождите пару секунд и попробуйте снова");
+                }
+
+                continue;
+            }
+
+            if message.message == WM_SELECTION_READY && message.hwnd.is_null() {
+                let (request, result) = *Box::from_raw(message.lParam as *mut (u32, Reading));
+
+                // Ответ на запрос, который уже не ждём (тайм-аут).
+                if reading != Some(request) {
                     continue;
                 }
 
-                let selection = Selection::new(explorer_selection::selected_paths());
+                reading = None;
 
-                if selection.files.is_empty() {
-                    status_ui.hint(
-                        "Ничего не выделено",
-                        &format!("Выделите файлы и нажмите {}", config::hotkeys().wheel.label()),
-                    );
+                KillTimer(wheel.hwnd(), READING_TIMER_ID);
 
+                let hotkey = config::hotkeys().wheel.label();
+
+                let (files, source) = match result {
+                    Reading::Files(files, source) => (files, source),
+
+                    Reading::NothingSelected => {
+                        status_ui.hint("Ничего не выделено", &format!("Выделите файлы и нажмите {hotkey}"));
+
+                        continue;
+                    }
+
+                    Reading::UnknownFolder => {
+                        status_ui.hint("Здесь не папка на диске", "Откройте в окне обычную папку и выделите файлы");
+
+                        continue;
+                    }
+
+                    // Колесо работает с выделенным в Проводнике и в окнах
+                    // «Открыть»/«Сохранить». Иначе — подсказка у курсора.
+                    Reading::NotSupported => {
+                        status_ui.hint(
+                            "Колесо работает с файлами",
+                            "В Проводнике, на рабочем столе или в окне «Открыть»",
+                        );
+
+                        continue;
+                    }
+                };
+
+                // Клавиши уже отпустили, пока читали выделение, — колесо не нужно.
+                if !trigger_is_held() {
                     continue;
                 }
+
+                let selection = Selection::new(files);
+
+                active_source = source;
 
                 let Some(category) = Category::of(&selection) else {
                     println!("Unsupported selection.");
@@ -683,7 +782,7 @@ fn main() {
 
                                 // Пока идёт предыдущая задача, новая ждёт в очереди;
                                 // окно статуса показывает, сколько ещё ждёт.
-                                let waiting = job_manager::enqueue(status_ui.hwnd(), action, inputs);
+                                let waiting = job_manager::enqueue(status_ui.hwnd(), action, inputs, active_source);
 
                                 if waiting == 0 {
                                     status_ui.begin_pending();

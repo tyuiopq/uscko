@@ -2,28 +2,23 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 
 use windows_sys::Win32::{
-    Foundation::CloseHandle,
+    Foundation::{CloseHandle, HWND},
     System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     },
-    UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
+    UI::WindowsAndMessaging::GetWindowThreadProcessId,
 };
 
-pub struct ForegroundProcess {
-    pub exe_name: String,
-}
+// Имя exe процесса, которому принадлежит окно («explorer.exe»).
+fn process_name(window: HWND) -> Option<String> {
+    if window.is_null() {
+        return None;
+    }
 
-pub fn get_foreground_process() -> Option<ForegroundProcess> {
     unsafe {
-        let hwnd = GetForegroundWindow();
-
-        if hwnd.is_null() {
-            return None;
-        }
-
         let mut pid: u32 = 0;
 
-        let thread_id = GetWindowThreadProcessId(hwnd, &mut pid);
+        let thread_id = GetWindowThreadProcessId(window, &mut pid);
 
         if thread_id == 0 || pid == 0 {
             return None;
@@ -50,19 +45,15 @@ pub fn get_foreground_process() -> Option<ForegroundProcess> {
 
         buffer.truncate(size as usize);
 
-        let exe_path = OsString::from_wide(&buffer).to_string_lossy().into_owned();
+        let exe_path = OsString::from_wide(&buffer);
 
-        let exe_name = std::path::Path::new(&exe_path)
+        std::path::Path::new(&exe_path)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        Some(ForegroundProcess { exe_name })
     }
 }
 
-pub fn foreground_is_explorer() -> bool {
-    get_foreground_process()
-        .map(|process| process.exe_name.eq_ignore_ascii_case("explorer.exe"))
-        .unwrap_or(false)
+// Окно Проводника или рабочий стол.
+pub fn is_explorer_window(window: HWND) -> bool {
+    process_name(window).is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"))
 }

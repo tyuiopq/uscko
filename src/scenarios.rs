@@ -875,9 +875,11 @@ fn queue_runs_in_order_and_cancel_cleans_up() {
     media::testing::make_video(&video, (1920, 1080), 20.0, None).unwrap();
 
     // Первая задача — долгая, вторая ждёт в очереди.
-    job_manager::enqueue(std::ptr::null_mut(), ActionId::ConvertToWmv, vec![video.clone()]);
+    let source = crate::selection::Source::Explorer;
 
-    let waiting = job_manager::enqueue(std::ptr::null_mut(), ActionId::ConvertToWmv, vec![video.clone()]);
+    job_manager::enqueue(std::ptr::null_mut(), ActionId::ConvertToWmv, vec![video.clone()], source);
+
+    let waiting = job_manager::enqueue(std::ptr::null_mut(), ActionId::ConvertToWmv, vec![video.clone()], source);
 
     assert!(waiting >= 1);
 
@@ -975,4 +977,233 @@ fn outputs_never_overwrite_existing_files() {
 
     assert_eq!(file_name(&jpg), "x (1).jpg");
     assert_eq!(std::fs::read(dir.join("x.jpg")).unwrap(), b"already here");
+}
+
+// ---------------------------------------------------------------------------
+// Окна «Открыть» и «Сохранить»
+// ---------------------------------------------------------------------------
+
+// Настоящий диалог Windows в отдельном потоке. Окно сразу уводится за край
+// экрана, файлы в нём выделяются через UI Automation — как это сделал бы
+// пользователь мышью.
+mod dialogs {
+    use super::*;
+
+    use windows::Win32::Foundation::HWND as WinHwnd;
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationSelectionItemPattern, TreeScope_Descendants,
+        UIA_ListItemControlTypeId, UIA_SelectionItemPatternId,
+    };
+    use windows::Win32::UI::Shell::{
+        FOS_ALLOWMULTISELECT, FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog,
+        IShellItem, SHCreateItemFromParsingName,
+    };
+    use windows::core::{HSTRING, Interface};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowExW, FindWindowW, GetDlgItem, GetWindowTextW, HWND_TOP, PostMessageW, SWP_NOACTIVATE,
+        SWP_NOSIZE, SetWindowPos, WM_CLOSE,
+    };
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    // Показывает диалог в своём потоке; возвращает его окно и поток.
+    fn show(save: bool, folder: &Path, title: &str) -> (isize, std::thread::JoinHandle<()>) {
+        let folder = folder.to_path_buf();
+
+        let title_text = title.to_string();
+
+        let thread = std::thread::spawn(move || unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+            let dialog: IFileDialog = if save {
+                CoCreateInstance::<_, IFileSaveDialog>(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).unwrap().cast().unwrap()
+            } else {
+                CoCreateInstance::<_, IFileOpenDialog>(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).unwrap().cast().unwrap()
+            };
+
+            dialog.SetTitle(&HSTRING::from(title_text.as_str())).unwrap();
+
+            let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(folder.as_os_str()), None).unwrap();
+
+            dialog.SetFolder(&item).unwrap();
+
+            if !save {
+                dialog.SetOptions(dialog.GetOptions().unwrap() | FOS_ALLOWMULTISELECT).unwrap();
+            }
+
+            // Закрытие окна — «Отмена», это не ошибка.
+            let _ = dialog.Show(None);
+        });
+
+        let title = wide(title);
+
+        let started = std::time::Instant::now();
+
+        let window = loop {
+            let window = unsafe { FindWindowW(wide("#32770").as_ptr(), title.as_ptr()) };
+
+            if !window.is_null() {
+                break window;
+            }
+
+            assert!(started.elapsed().as_secs() < 10, "диалог не появился");
+
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        // За край экрана, без фокуса: тест не должен мешать работе.
+        unsafe {
+            SetWindowPos(window, HWND_TOP, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+
+        (window as isize, thread)
+    }
+
+    // Выделяет в списке файлов диалога элементы, имена которых начинаются с stems.
+    fn select(window: isize, stems: &[&str]) {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+            let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).unwrap();
+
+            let root = automation.ElementFromHandle(WinHwnd(window as _)).unwrap();
+
+            let condition = automation.CreateTrueCondition().unwrap();
+
+            let started = std::time::Instant::now();
+
+            // Список заполняется не сразу.
+            let items = loop {
+                let items = root.FindAll(TreeScope_Descendants, &condition).unwrap();
+
+                let mut found = Vec::new();
+
+                for index in 0..items.Length().unwrap() {
+                    let element = items.GetElement(index).unwrap();
+
+                    if element.CurrentControlType().unwrap() != UIA_ListItemControlTypeId {
+                        continue;
+                    }
+
+                    let name = element.CurrentName().unwrap().to_string();
+
+                    if stems.iter().any(|stem| name.starts_with(stem)) {
+                        found.push(element);
+                    }
+                }
+
+                if found.len() == stems.len() {
+                    break found;
+                }
+
+                assert!(started.elapsed().as_secs() < 10, "файлы в диалоге не появились");
+
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            };
+
+            for (index, element) in items.iter().enumerate() {
+                let pattern: IUIAutomationSelectionItemPattern =
+                    element.GetCurrentPatternAs(UIA_SelectionItemPatternId).unwrap();
+
+                if index == 0 {
+                    pattern.Select().unwrap();
+                } else {
+                    pattern.AddToSelection().unwrap();
+                }
+            }
+        }
+    }
+
+    fn file_name_box(window: isize) -> String {
+        unsafe {
+            let combo = GetDlgItem(window as _, 1148);
+
+            let inner = FindWindowExW(combo, std::ptr::null_mut(), wide("ComboBox").as_ptr(), std::ptr::null());
+
+            let edit = FindWindowExW(inner, std::ptr::null_mut(), wide("Edit").as_ptr(), std::ptr::null());
+
+            let mut buffer = [0u16; 512];
+
+            let length = GetWindowTextW(edit, buffer.as_mut_ptr(), buffer.len() as i32);
+
+            String::from_utf16_lossy(&buffer[..length as usize])
+        }
+    }
+
+    fn close(window: isize, thread: std::thread::JoinHandle<()>) {
+        unsafe {
+            PostMessageW(window as _, WM_CLOSE, 0, 0);
+        }
+
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn open_dialog_selection_and_result() {
+        let dir = TempDir::new("dialog");
+
+        for name in ["отчёт.png", "схема.png", "лишний.png"] {
+            photo(60, 40).save(dir.join(name)).unwrap();
+        }
+
+        let (window, thread) = show(false, &dir.0, "FileHalo — проверка окна «Открыть»");
+
+        select(window, &["отчёт", "схема"]);
+
+        let reading = crate::selection::read(window);
+
+        let result = match reading {
+            crate::selection::Reading::Files(mut files, source) => {
+                files.sort();
+
+                assert_eq!(source, crate::selection::Source::Dialog(window));
+
+                files
+            }
+
+            _ => {
+                close(window, thread);
+
+                panic!("выделение в диалоге не прочитано");
+            }
+        };
+
+        // TEMP может быть записан коротким именем (вида C:\Users\08A4~1), а диалог
+        // отдаёт полное — сравниваем настоящие пути.
+        let real = |paths: Vec<PathBuf>| -> Vec<PathBuf> {
+            let mut paths: Vec<PathBuf> = paths.iter().map(|path| std::fs::canonicalize(path).unwrap()).collect();
+
+            paths.sort();
+
+            paths
+        };
+
+        assert_eq!(real(result), real(vec![dir.join("отчёт.png"), dir.join("схема.png")]));
+
+        // Результат действия — в поле «Имя файла».
+        assert!(crate::selection::put_into_dialog(window, &[dir.join("отчёт.pdf")]));
+
+        assert_eq!(file_name_box(window), "отчёт.pdf");
+
+        close(window, thread);
+    }
+
+    #[test]
+    fn save_dialog_is_not_filled_in() {
+        let dir = TempDir::new("savedialog");
+
+        photo(60, 40).save(dir.join("x.png")).unwrap();
+
+        let (window, thread) = show(true, &dir.0, "FileHalo — проверка окна «Сохранить»");
+
+        // Подстановка имени в «Сохранить» могла бы привести к перезаписи.
+        assert!(!crate::selection::put_into_dialog(window, &[dir.join("x.pdf")]));
+
+        close(window, thread);
+    }
 }

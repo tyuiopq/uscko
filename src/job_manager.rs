@@ -18,6 +18,7 @@ use windows_sys::Win32::{
 
 use crate::actions::{ActionId, ActionOutcome};
 use crate::params::Params;
+use crate::selection::Source;
 use crate::{config, journal};
 
 pub const WM_FILEHALO_JOB_DONE: u32 = WM_APP + 1;
@@ -28,6 +29,8 @@ pub const CANCELLED: &str = "Отменено";
 struct Job {
     action: ActionId,
     inputs: Vec<PathBuf>,
+    // Откуда взято выделение: результат вернётся туда же.
+    source: Source,
     // Параметры на момент запуска: правка настроек не меняет задачу,
     // которая уже стоит в очереди.
     params: Params,
@@ -36,6 +39,7 @@ struct Job {
 pub struct JobResult {
     pub action: ActionId,
     pub outcome: ActionOutcome,
+    pub source: Source,
 }
 
 // Рабочий поток запущен (есть текущая задача).
@@ -106,7 +110,7 @@ pub fn check_cancelled() -> Result<(), String> {
 
 // Ставит задачу в очередь. Возвращает 0, если она начнётся сразу, иначе —
 // сколько задач (с текущей) примерно впереди.
-pub fn enqueue(notify_window: HWND, action: ActionId, inputs: Vec<PathBuf>) -> usize {
+pub fn enqueue(notify_window: HWND, action: ActionId, inputs: Vec<PathBuf>, source: Source) -> usize {
     NOTIFY_WINDOW.store(notify_window as isize, Ordering::Relaxed);
 
     let Ok(mut queue) = QUEUE.lock() else {
@@ -116,6 +120,7 @@ pub fn enqueue(notify_window: HWND, action: ActionId, inputs: Vec<PathBuf>) -> u
     queue.push_back(Job {
         action,
         inputs,
+        source,
         params: config::params(),
     });
 
@@ -169,6 +174,7 @@ fn worker() {
             results.push_back(JobResult {
                 action: job.action,
                 outcome,
+                source: job.source,
             });
         }
 

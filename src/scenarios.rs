@@ -1272,26 +1272,36 @@ mod dialogs {
 
             let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).unwrap();
 
-            let root = automation.ElementFromHandle(WinHwnd(window as _)).unwrap();
-
             let condition = automation.CreateTrueCondition().unwrap();
 
             let started = std::time::Instant::now();
 
-            // Список заполняется не сразу.
+            // Окно и список создаются и заполняются не сразу.
             let items = loop {
-                let items = root.FindAll(TreeScope_Descendants, &condition).unwrap();
+                assert!(started.elapsed().as_secs() < 10, "файлы в диалоге не появились");
+
+                let Ok(items) = automation
+                    .ElementFromHandle(WinHwnd(file_view(window) as _))
+                    .and_then(|root| root.FindAll(TreeScope_Descendants, &condition))
+                else {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+
+                    continue;
+                };
 
                 let mut found = Vec::new();
 
                 for index in 0..items.Length().unwrap() {
-                    let element = items.GetElement(index).unwrap();
+                    // Пока список перестраивается, элементы могут исчезать.
+                    let Ok(element) = items.GetElement(index) else {
+                        continue;
+                    };
 
-                    if element.CurrentControlType().unwrap() != UIA_ListItemControlTypeId {
+                    if element.CurrentControlType().ok() != Some(UIA_ListItemControlTypeId) {
                         continue;
                     }
 
-                    let name = element.CurrentName().unwrap().to_string();
+                    let name = element.CurrentName().map(|name| name.to_string()).unwrap_or_default();
 
                     if stems.iter().any(|stem| name.starts_with(stem)) {
                         found.push(element);
@@ -1342,6 +1352,193 @@ mod dialogs {
         }
 
         thread.join().unwrap();
+    }
+
+    // Диалог в другом процессе (PowerShell + WinForms) — как в настоящих
+    // программах. Окно сразу уводится за край экрана.
+    fn foreign_dialog(save: bool, folder: &Path, title: &str) -> (isize, std::process::Child) {
+        let kind = if save { "SaveFileDialog" } else { "OpenFileDialog" };
+
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.{kind}; $d.Title = '{title}'; $d.InitialDirectory = '{}'; [void]$d.ShowDialog()",
+            folder.display()
+        );
+
+        let child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-STA", "-Command", &script])
+            .spawn()
+            .unwrap();
+
+        let title = wide(title);
+
+        let started = std::time::Instant::now();
+
+        let window = loop {
+            let window = unsafe { FindWindowW(wide("#32770").as_ptr(), title.as_ptr()) };
+
+            if !window.is_null() {
+                break window;
+            }
+
+            assert!(started.elapsed().as_secs() < 30, "диалог не появился");
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        unsafe {
+            SetWindowPos(window, HWND_TOP, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+
+        (window as isize, child)
+    }
+
+    // Список файлов диалога (а не панель навигации и прочие списки).
+    fn file_view(window: isize) -> isize {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetClassNameW};
+
+        unsafe extern "system" fn visit(child: windows_sys::Win32::Foundation::HWND, found: isize) -> i32 {
+            let mut name = [0u16; 64];
+
+            let length = unsafe { GetClassNameW(child, name.as_mut_ptr(), 64) };
+
+            if String::from_utf16_lossy(&name[..length as usize]) == "SHELLDLL_DefView" {
+                unsafe { *(found as *mut isize) = child as isize };
+
+                return 0;
+            }
+
+            1
+        }
+
+        let mut found: isize = 0;
+
+        unsafe {
+            EnumChildWindows(window as _, Some(visit), &mut found as *mut isize as isize);
+        }
+
+        // 0 — список ещё не создан.
+        found
+    }
+
+    // Имена выделенных элементов в списке файлов диалога.
+    fn selected_in_list(window: isize) -> Vec<String> {
+        use windows::Win32::UI::Accessibility::{IUIAutomationSelectionPattern, UIA_ListControlTypeId, UIA_SelectionPatternId};
+
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+            let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).unwrap();
+
+            let root = automation.ElementFromHandle(WinHwnd(file_view(window) as _)).unwrap();
+
+            let all = root.FindAll(TreeScope_Descendants, &automation.CreateTrueCondition().unwrap()).unwrap();
+
+            for index in 0..all.Length().unwrap() {
+                let element = all.GetElement(index).unwrap();
+
+                if element.CurrentControlType().unwrap() != UIA_ListControlTypeId {
+                    continue;
+                }
+
+                let Ok(pattern) = element.GetCurrentPatternAs::<IUIAutomationSelectionPattern>(UIA_SelectionPatternId) else {
+                    continue;
+                };
+
+                let selected = pattern.GetCurrentSelection().unwrap();
+
+                return (0..selected.Length().unwrap())
+                    .map(|index| selected.GetElement(index).unwrap().CurrentName().unwrap().to_string())
+                    .collect();
+            }
+
+            Vec::new()
+        }
+    }
+
+    // Текст поля «Имя файла» окна «Открыть» в чужом процессе.
+    fn foreign_file_name_box(window: isize) -> String {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_GETTEXT};
+
+        unsafe {
+            let combo = GetDlgItem(window as _, 1148);
+
+            let inner = FindWindowExW(combo, std::ptr::null_mut(), wide("ComboBox").as_ptr(), std::ptr::null());
+
+            let edit = FindWindowExW(inner, std::ptr::null_mut(), wide("Edit").as_ptr(), std::ptr::null());
+
+            let mut buffer = [0u16; 512];
+
+            let length = SendMessageW(edit, WM_GETTEXT, buffer.len(), buffer.as_mut_ptr() as isize);
+
+            String::from_utf16_lossy(&buffer[..length.max(0) as usize])
+        }
+    }
+
+    fn read_files(window: isize) -> Vec<PathBuf> {
+        match crate::selection::read(window) {
+            crate::selection::Reading::Files(files, _) => files,
+            _ => panic!("выделение в диалоге не прочитано"),
+        }
+    }
+
+    #[test]
+    fn result_appears_selected_in_foreign_open_dialog() {
+        let dir = TempDir::new("foreignopen");
+
+        photo(60, 40).save(dir.join("снимок.png")).unwrap();
+
+        let (window, mut child) = foreign_dialog(false, &dir.0, "FileHalo — чужое окно «Открыть»");
+
+        select(window, &["снимок"]);
+
+        let output = single_output(run(ActionId::ConvertToJpeg, &read_files(window)));
+
+        crate::selection::deliver_to_dialog(window, vec![output.clone()]).join().unwrap();
+
+        let selected = selected_in_list(window);
+
+        let name_box = foreign_file_name_box(window);
+
+        unsafe {
+            PostMessageW(window as _, WM_CLOSE, 0, 0);
+        }
+
+        let _ = child.wait();
+
+        // Выделен новый файл (с расширением или без — как настроено в Windows).
+        assert_eq!(selected.len(), 1, "{selected:?}");
+        assert!(selected[0].starts_with("снимок") && selected[0] != "снимок.png", "{selected:?}");
+
+        // Поле «Имя файла» окно заполнило само — именем нового файла.
+        assert!(name_box.starts_with("снимок") && name_box != "снимок.png", "{name_box}");
+    }
+
+    #[test]
+    fn result_is_shown_but_not_selected_in_foreign_save_dialog() {
+        let dir = TempDir::new("foreignsave");
+
+        photo(60, 40).save(dir.join("кадр.png")).unwrap();
+
+        let (window, mut child) = foreign_dialog(true, &dir.0, "FileHalo — чужое окно «Сохранить»");
+
+        select(window, &["кадр"]);
+
+        let before = selected_in_list(window);
+
+        let output = single_output(run(ActionId::ConvertToJpeg, &read_files(window)));
+
+        crate::selection::deliver_to_dialog(window, vec![output]).join().unwrap();
+
+        let after = selected_in_list(window);
+
+        unsafe {
+            PostMessageW(window as _, WM_CLOSE, 0, 0);
+        }
+
+        let _ = child.wait();
+
+        // Выделение не тронуто: новый файл не подставится как имя для сохранения.
+        assert_eq!(before, after);
     }
 
     #[test]

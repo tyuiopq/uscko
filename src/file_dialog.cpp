@@ -351,6 +351,39 @@ IShellFolder* bind_folder(const wchar_t* path) {
     return folder;
 }
 
+const wchar_t* file_name_of_path(const wchar_t* path) {
+    const wchar_t* slash = wcsrchr(path, L'\\');
+
+    return slash != nullptr ? slash + 1 : path;
+}
+
+// Одна и та же папка (без учёта регистра, коротких имён 8.3 и «\» в конце).
+bool same_folder(const wchar_t* left, const wchar_t* right) {
+    wchar_t left_long[PATH_CAPACITY] = {};
+    wchar_t right_long[PATH_CAPACITY] = {};
+
+    if (GetLongPathNameW(left, left_long, PATH_CAPACITY) == 0) {
+        wcsncpy_s(left_long, PATH_CAPACITY, left, _TRUNCATE);
+    }
+
+    if (GetLongPathNameW(right, right_long, PATH_CAPACITY) == 0) {
+        wcsncpy_s(right_long, PATH_CAPACITY, right, _TRUNCATE);
+    }
+
+    size_t left_length = wcslen(left_long);
+    size_t right_length = wcslen(right_long);
+
+    if (left_length > 0 && left_long[left_length - 1] == L'\\') {
+        left_long[left_length - 1] = L'\0';
+    }
+
+    if (right_length > 0 && right_long[right_length - 1] == L'\\') {
+        right_long[right_length - 1] = L'\0';
+    }
+
+    return CompareStringOrdinal(left_long, -1, right_long, -1, TRUE) == CSTR_EQUAL;
+}
+
 // Поле «Имя файла» современного окна «Открыть». В «Сохранить как» его нет на
 // этом месте; старые диалоги (без DirectUI) тоже пропускаем: у их «Сохранить»
 // то же поле, и подставленное имя привело бы к перезаписи.
@@ -467,4 +500,212 @@ int filehalo_dialog_set_file_name(HWND dialog, const wchar_t* text) {
     );
 
     return sent != 0 && result != 0;
+}
+
+namespace {
+
+// Как папка показывает файл path (с расширением или без — по настройке).
+bool shown_name(IShellFolder* folder, const wchar_t* path, wchar_t* output) {
+    PIDLIST_RELATIVE child = nullptr;
+
+    if (FAILED(folder->ParseDisplayName(nullptr, nullptr, const_cast<LPWSTR>(file_name_of_path(path)), nullptr, &child, nullptr))) {
+        return false;
+    }
+
+    STRRET value = {};
+
+    bool ok = SUCCEEDED(folder->GetDisplayNameOf(reinterpret_cast<PCUITEMID_CHILD>(child), SHGDN_INFOLDER, &value))
+        && SUCCEEDED(StrRetToBufW(&value, reinterpret_cast<PCUITEMID_CHILD>(child), output, PATH_CAPACITY));
+
+    CoTaskMemFree(child);
+
+    return ok;
+}
+
+}  // namespace
+
+// Окно «Открыть» (а не «Сохранить»): в него можно подставлять имя файла.
+extern "C"
+int filehalo_dialog_is_open(HWND dialog) {
+    return IsWindow(dialog) && open_dialog_file_name(dialog) != nullptr;
+}
+
+// Показывает новые файлы в списке диалога: прокручивает к ним, а если
+// select — ещё и выделяет. paths — полные пути через '\0', в конце пустая
+// строка. 2 — все файлы показаны (и выделены, если select); 1 — показывать
+// не нужно или нельзя (диалог показывает другую папку, имена неоднозначны);
+// 0 — файлов ещё нет в списке (диалог не обновился); -1 — диалога больше нет.
+extern "C"
+int filehalo_dialog_show_files(HWND dialog, const wchar_t* paths, int select) {
+    if (!IsWindow(dialog) || !filehalo_is_file_dialog(dialog)) {
+        return -1;
+    }
+
+    if (paths == nullptr || *paths == L'\0') {
+        return 1;
+    }
+
+    ComScope com;
+
+    wchar_t folder_path[PATH_CAPACITY] = {};
+
+    if (!dialog_folder(dialog, folder_path)) {
+        return 1;
+    }
+
+    // Файлы не в той папке, что открыта в диалоге (её успели сменить) —
+    // показывать нечего.
+    wchar_t parent[PATH_CAPACITY] = {};
+
+    wcsncpy_s(parent, PATH_CAPACITY, paths, _TRUNCATE);
+
+    wchar_t* slash = wcsrchr(parent, L'\\');
+
+    if (slash != nullptr) {
+        *slash = L'\0';
+    }
+
+    if (!same_folder(parent, folder_path)) {
+        return 1;
+    }
+
+    IShellFolder* folder = bind_folder(folder_path);
+
+    if (folder == nullptr) {
+        return 1;
+    }
+
+    HWND view = find_descendant(dialog, L"SHELLDLL_DefView");
+
+    IUIAutomation* automation = nullptr;
+    IUIAutomationElement* root = nullptr;
+    IUIAutomationCondition* is_list = nullptr;
+    IUIAutomationElement* list = nullptr;
+    IUIAutomationCondition* is_item = nullptr;
+    IUIAutomationElementArray* items = nullptr;
+
+    VARIANT list_type;
+    VariantInit(&list_type);
+    list_type.vt = VT_I4;
+    list_type.lVal = UIA_ListControlTypeId;
+
+    VARIANT item_type;
+    VariantInit(&item_type);
+    item_type.vt = VT_I4;
+    item_type.lVal = UIA_ListItemControlTypeId;
+
+    int length = 0;
+
+    bool ok = view != nullptr
+        && SUCCEEDED(CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&automation)))
+        && SUCCEEDED(automation->ElementFromHandle(view, &root))
+        && SUCCEEDED(automation->CreatePropertyCondition(UIA_ControlTypePropertyId, list_type, &is_list))
+        && SUCCEEDED(root->FindFirst(TreeScope_Subtree, is_list, &list)) && list != nullptr
+        && SUCCEEDED(automation->CreatePropertyCondition(UIA_ControlTypePropertyId, item_type, &is_item))
+        && SUCCEEDED(list->FindAll(TreeScope_Children, is_item, &items)) && items != nullptr
+        && SUCCEEDED(items->get_Length(&length));
+
+    int result = ok ? 2 : 0;
+
+    bool first = true;
+
+    for (const wchar_t* path = paths; ok && *path != L'\0'; path += wcslen(path) + 1) {
+        wchar_t name[PATH_CAPACITY] = {};
+
+        if (!shown_name(folder, path, name)) {
+            continue;
+        }
+
+        IUIAutomationElement* match = nullptr;
+
+        int matches = 0;
+
+        for (int index = 0; index < length; ++index) {
+            IUIAutomationElement* element = nullptr;
+
+            if (FAILED(items->GetElement(index, &element)) || element == nullptr) {
+                continue;
+            }
+
+            BSTR item_name = nullptr;
+
+            bool same = SUCCEEDED(element->get_CurrentName(&item_name)) && item_name != nullptr
+                && CompareStringOrdinal(item_name, -1, name, -1, TRUE) == CSTR_EQUAL;
+
+            SysFreeString(item_name);
+
+            if (same && ++matches == 1) {
+                match = element;
+            } else {
+                release(element);
+            }
+        }
+
+        // Ещё не появился в списке — попробуем позже.
+        if (matches == 0) {
+            result = 0;
+
+            break;
+        }
+
+        // Несколько элементов с таким именем (скрыты расширения): не угадываем.
+        if (matches > 1) {
+            result = 1;
+        }
+
+        if (matches == 1) {
+            if (select) {
+                IUIAutomationSelectionItemPattern* selection = nullptr;
+
+                if (SUCCEEDED(match->GetCurrentPatternAs(UIA_SelectionItemPatternId, IID_PPV_ARGS(&selection))) && selection != nullptr) {
+                    if (first) {
+                        selection->Select();
+                    } else {
+                        selection->AddToSelection();
+                    }
+                }
+
+                release(selection);
+            }
+
+            if (first) {
+                IUIAutomationScrollItemPattern* scroll = nullptr;
+
+                if (SUCCEEDED(match->GetCurrentPatternAs(UIA_ScrollItemPatternId, IID_PPV_ARGS(&scroll))) && scroll != nullptr) {
+                    scroll->ScrollIntoView();
+                }
+
+                release(scroll);
+            }
+
+            first = false;
+        }
+
+        release(match);
+    }
+
+    release(items);
+    release(is_item);
+    release(list);
+    release(is_list);
+    release(root);
+    release(automation);
+    release(folder);
+
+    return result;
+}
+
+// Просит список файлов диалога перечитать папку (как F5).
+extern "C"
+void filehalo_dialog_refresh(HWND dialog) {
+    HWND view = find_descendant(dialog, L"SHELLDLL_DefView");
+
+    HWND items = view != nullptr ? FindWindowExW(view, nullptr, L"DirectUIHWND", nullptr) : nullptr;
+
+    HWND target = items != nullptr ? items : view;
+
+    if (target != nullptr) {
+        PostMessageW(target, WM_KEYDOWN, VK_F5, 0);
+        PostMessageW(target, WM_KEYUP, VK_F5, static_cast<LPARAM>(0xC0000001));
+    }
 }

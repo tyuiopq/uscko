@@ -20,6 +20,12 @@ unsafe extern "C" {
     fn filehalo_dialog_selection(dialog: HWND, callback: PathCallback, context: *mut c_void) -> i32;
 
     fn filehalo_dialog_set_file_name(dialog: HWND, text: *const u16) -> i32;
+
+    fn filehalo_dialog_is_open(dialog: HWND) -> i32;
+
+    fn filehalo_dialog_show_files(dialog: HWND, paths: *const u16, select: i32) -> i32;
+
+    fn filehalo_dialog_refresh(dialog: HWND);
 }
 
 unsafe extern "C" fn collect_path(context: *mut c_void, path: *const u16) {
@@ -125,6 +131,70 @@ pub fn put_into_dialog(dialog: isize, outputs: &[PathBuf]) -> bool {
         .collect();
 
     unsafe { filehalo_dialog_set_file_name(dialog as HWND, text.as_ptr()) != 0 }
+}
+
+// Результат действия, запущенного из окна «Открыть»/«Сохранить», — в том же
+// окне, как в Проводнике: список прокручивается к новым файлам, в «Открыть»
+// они выделяются и попадают в поле «Имя файла». В «Сохранить» ничего не
+// выделяется: имя попало бы в поле и при сохранении перезаписало бы результат.
+//
+// Окно замечает новые файлы не сразу, поэтому пробуем несколько раз; если
+// само не обновилось — просим обновиться (как F5). Всё в фоновом потоке:
+// зависшая чужая программа не должна подвесить FileHalo.
+pub fn deliver_to_dialog(dialog: isize, outputs: Vec<PathBuf>) -> std::thread::JoinHandle<()> {
+    const ATTEMPTS: u32 = 40;
+    const REFRESH_AT: u32 = 12;
+    const PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
+    std::thread::spawn(move || {
+        if outputs.is_empty() {
+            return;
+        }
+
+        let window = dialog as HWND;
+
+        let open = unsafe { filehalo_dialog_is_open(window) } != 0;
+
+        let mut list: Vec<u16> = Vec::new();
+
+        for path in &outputs {
+            list.extend(path.as_os_str().encode_wide());
+            list.push(0);
+        }
+
+        list.push(0);
+
+        let mut shown = false;
+
+        for attempt in 0..ATTEMPTS {
+            match unsafe { filehalo_dialog_show_files(window, list.as_ptr(), open as i32) } {
+                2 => {
+                    shown = true;
+
+                    break;
+                }
+
+                1 => break,
+
+                // Окно уже закрыли.
+                -1 => return,
+
+                _ => {}
+            }
+
+            if attempt == REFRESH_AT {
+                unsafe { filehalo_dialog_refresh(window) };
+            }
+
+            std::thread::sleep(PAUSE);
+        }
+
+        // Выделенный файл окно само вписало в поле «Имя файла» (а запись в
+        // поле сняла бы выделение). Не получилось выделить — пишем путь.
+        if open && !shown {
+            put_into_dialog(dialog, &outputs);
+        }
+    })
 }
 
 #[cfg(test)]

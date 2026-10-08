@@ -460,11 +460,11 @@ fn main() {
                         report.button,
                     );
 
-                    // Действие из окна «Открыть»: результат сразу в поле «Имя файла».
+                    // Действие из окна «Открыть»/«Сохранить»: результат показывается там же.
                     if let Source::Dialog(dialog) = source
                         && !outcome.outputs.is_empty()
                     {
-                        selection::put_into_dialog(dialog, &outcome.outputs);
+                        selection::deliver_to_dialog(dialog, outcome.outputs.clone());
                     } else if !outcome.outputs.is_empty() {
                         if explorer_selection::select_files(&outcome.outputs, outcome.rename) {
                             pending_select = None;

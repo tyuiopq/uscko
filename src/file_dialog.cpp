@@ -161,19 +161,19 @@ bool dialog_folder(HWND dialog, wchar_t* output) {
 }
 
 // Видимые имена выделенных элементов в списке файлов диалога, в порядке
-// показа. Для каждого вызывает visit(name).
-template <typename Visit>
-bool for_each_selected_name(HWND dialog, Visit visit) {
+// показа. Возвращает массив строк (освобождать free_names) и их число.
+BSTR* selected_names(HWND dialog, int* count) {
+    *count = 0;
     HWND view = find_descendant(dialog, L"SHELLDLL_DefView");
 
     if (view == nullptr) {
-        return false;
+        return nullptr;
     }
 
     IUIAutomation* automation = nullptr;
 
     if (FAILED(CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&automation)))) {
-        return false;
+        return nullptr;
     }
 
     IUIAutomationElement* root = nullptr;
@@ -194,10 +194,14 @@ bool for_each_selected_name(HWND dialog, Visit visit) {
         && SUCCEEDED(list->GetCurrentPatternAs(UIA_SelectionPatternId, IID_PPV_ARGS(&selection))) && selection != nullptr
         && SUCCEEDED(selection->GetCurrentSelection(&selected)) && selected != nullptr;
 
+    BSTR* names = nullptr;
+
     if (ok) {
         int length = 0;
 
         selected->get_Length(&length);
+
+        names = new BSTR[length > 0 ? length : 1]();
 
         for (int index = 0; index < length; ++index) {
             IUIAutomationElement* element = nullptr;
@@ -209,10 +213,11 @@ bool for_each_selected_name(HWND dialog, Visit visit) {
             BSTR name = nullptr;
 
             if (SUCCEEDED(element->get_CurrentName(&name)) && name != nullptr && *name != L'\0') {
-                visit(name);
+                names[(*count)++] = name;
+            } else {
+                SysFreeString(name);
             }
 
-            SysFreeString(name);
             release(element);
         }
     }
@@ -224,7 +229,15 @@ bool for_each_selected_name(HWND dialog, Visit visit) {
     release(root);
     release(automation);
 
-    return ok;
+    return names;
+}
+
+void free_names(BSTR* names, int count) {
+    for (int index = 0; index < count; ++index) {
+        SysFreeString(names[index]);
+    }
+
+    delete[] names;
 }
 
 // Полный путь элемента папки (относительный PIDL).
@@ -238,37 +251,46 @@ bool child_path(IShellFolder* folder, PCUITEMID_CHILD child, wchar_t* output) {
     return SUCCEEDED(StrRetToBufW(&value, child, output, PATH_CAPACITY));
 }
 
-// Видимое имя -> файлы папки. Если расширения скрыты, «фото» может
-// означать и «фото.jpg», и «фото.png»: тогда подходят оба.
-template <typename Visit>
-int resolve_name(IShellFolder* folder, const wchar_t* name, Visit visit) {
-    // Расширения показаны — имя и есть имя файла.
-    PIDLIST_RELATIVE parsed = nullptr;
+// Выделенные имена -> полные пути. Если расширения показаны, имя и есть имя
+// файла. Если скрыты, «фото» ищется среди того, как папка показывает свои
+// файлы (папка перебирается один раз на всё выделение).
+//
+// Возвращает false, если какое-то имя подходит к нескольким файлам
+// («фото.jpg» и «фото.png» при скрытых расширениях): угадывать нельзя —
+// обработался бы и невыделенный файл.
+bool resolve_names(IShellFolder* folder, BSTR* names, int count, wchar_t* paths, int* matches) {
+    bool need_enumeration = false;
 
-    if (SUCCEEDED(folder->ParseDisplayName(nullptr, nullptr, const_cast<LPWSTR>(name), nullptr, &parsed, nullptr))) {
-        wchar_t path[PATH_CAPACITY] = {};
+    for (int index = 0; index < count; ++index) {
+        wchar_t* path = paths + index * PATH_CAPACITY;
 
-        bool ok = child_path(folder, reinterpret_cast<PCUITEMID_CHILD>(parsed), path);
+        PIDLIST_RELATIVE parsed = nullptr;
 
-        CoTaskMemFree(parsed);
+        if (SUCCEEDED(folder->ParseDisplayName(nullptr, nullptr, names[index], nullptr, &parsed, nullptr))) {
+            if (child_path(folder, reinterpret_cast<PCUITEMID_CHILD>(parsed), path)) {
+                matches[index] = 1;
+            }
 
-        if (ok) {
-            visit(path);
-
-            return 1;
+            CoTaskMemFree(parsed);
         }
+
+        need_enumeration |= matches[index] == 0;
     }
 
-    // Иначе сравниваем с тем, как имена показывает папка.
+    if (!need_enumeration) {
+        return true;
+    }
+
     IEnumIDList* items = nullptr;
 
     SHCONTF flags = SHCONTF_FOLDERS | SHCONTF_NONFOLDERS | SHCONTF_INCLUDEHIDDEN;
 
     if (FAILED(folder->EnumObjects(nullptr, flags, &items)) || items == nullptr) {
-        return 0;
+        return true;
     }
 
-    int found = 0;
+    // Счётчики только для имён, которые не нашлись напрямую.
+    int* shown_matches = new int[count]();
 
     PITEMID_CHILD child = nullptr;
 
@@ -277,16 +299,20 @@ int resolve_name(IShellFolder* folder, const wchar_t* name, Visit visit) {
 
         wchar_t shown_name[PATH_CAPACITY] = {};
 
-        bool same = SUCCEEDED(folder->GetDisplayNameOf(child, SHGDN_INFOLDER, &shown))
-            && SUCCEEDED(StrRetToBufW(&shown, child, shown_name, PATH_CAPACITY))
-            && CompareStringOrdinal(shown_name, -1, name, -1, TRUE) == CSTR_EQUAL;
+        if (SUCCEEDED(folder->GetDisplayNameOf(child, SHGDN_INFOLDER, &shown))
+            && SUCCEEDED(StrRetToBufW(&shown, child, shown_name, PATH_CAPACITY)))
+        {
+            for (int index = 0; index < count; ++index) {
+                if (matches[index] != 0
+                    || CompareStringOrdinal(shown_name, -1, names[index], -1, TRUE) != CSTR_EQUAL)
+                {
+                    continue;
+                }
 
-        wchar_t path[PATH_CAPACITY] = {};
-
-        if (same && child_path(folder, child, path)) {
-            visit(path);
-
-            ++found;
+                if (++shown_matches[index] == 1) {
+                    child_path(folder, child, paths + index * PATH_CAPACITY);
+                }
+            }
         }
 
         CoTaskMemFree(child);
@@ -294,7 +320,19 @@ int resolve_name(IShellFolder* folder, const wchar_t* name, Visit visit) {
 
     release(items);
 
-    return found;
+    bool unambiguous = true;
+
+    for (int index = 0; index < count; ++index) {
+        if (matches[index] == 0) {
+            matches[index] = shown_matches[index];
+        }
+
+        unambiguous &= matches[index] <= 1;
+    }
+
+    delete[] shown_matches;
+
+    return unambiguous;
 }
 
 IShellFolder* bind_folder(const wchar_t* path) {
@@ -313,10 +351,15 @@ IShellFolder* bind_folder(const wchar_t* path) {
     return folder;
 }
 
-// Поле «Имя файла» окна «Открыть». В «Сохранить как» его нет на этом месте —
-// туда ничего не пишем, чтобы не подставить имя для перезаписи.
+// Поле «Имя файла» современного окна «Открыть». В «Сохранить как» его нет на
+// этом месте; старые диалоги (без DirectUI) тоже пропускаем: у их «Сохранить»
+// то же поле, и подставленное имя привело бы к перезаписи.
 HWND open_dialog_file_name(HWND dialog) {
     const int FILE_NAME_COMBO = 1148;
+
+    if (find_descendant(dialog, L"DUIViewWndClassName") == nullptr) {
+        return nullptr;
+    }
 
     HWND combo = GetDlgItem(dialog, FILE_NAME_COMBO);
 
@@ -339,7 +382,8 @@ int filehalo_is_file_dialog(HWND window) {
 
 // Выделенные файлы в диалоге. Для каждого пути вызывает callback.
 // Возвращает число путей; -1 — не удалось понять, какая папка открыта
-// (например, «Библиотеки» или «Этот компьютер»).
+// (например, «Библиотеки» или «Этот компьютер»); -2 — имя подходит к
+// нескольким файлам (скрыты расширения), какой выделен — не понять.
 extern "C"
 int filehalo_dialog_selection(HWND dialog, PathCallback callback, void* context) {
     if (callback == nullptr || !filehalo_is_file_dialog(dialog)) {
@@ -362,15 +406,38 @@ int filehalo_dialog_selection(HWND dialog, PathCallback callback, void* context)
 
     int count = 0;
 
-    for_each_selected_name(dialog, [&](const wchar_t* name) {
-        count += resolve_name(folder, name, [&](const wchar_t* path) {
-            callback(context, path);
-        });
-    });
+    BSTR* names = selected_names(dialog, &count);
+
+    int result = 0;
+
+    if (names != nullptr && count > 0) {
+        wchar_t* paths = new wchar_t[static_cast<size_t>(count) * PATH_CAPACITY]();
+
+        int* matches = new int[count]();
+
+        if (resolve_names(folder, names, count, paths, matches)) {
+            for (int index = 0; index < count; ++index) {
+                if (matches[index] == 1) {
+                    callback(context, paths + index * PATH_CAPACITY);
+
+                    ++result;
+                }
+            }
+        } else {
+            result = -2;
+        }
+
+        delete[] matches;
+        delete[] paths;
+    }
+
+    if (names != nullptr) {
+        free_names(names, count);
+    }
 
     release(folder);
 
-    return count;
+    return result;
 }
 
 // Подставляет text в поле «Имя файла» окна «Открыть». 1 — получилось.

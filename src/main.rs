@@ -51,8 +51,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use hotkeys::Slot;
 use selection::{Reading, Source};
 
-// Выделение прочитано в фоновом потоке; lParam — Box<(номер запроса, Reading)>.
+// Выделение прочитано в фоновом потоке (wParam — номер запроса). Сам
+// результат лежит в READY: сообщение потока может потеряться, если главный
+// поток в этот момент во «вложенном» цикле (перетаскивают окно настроек).
 const WM_SELECTION_READY: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 6;
+
+static READY: std::sync::Mutex<Option<(u32, Reading)>> = std::sync::Mutex::new(None);
 
 // Сколько ждать ответа Проводника или чужого диалога.
 const READING_TIMER_ID: usize = 4;
@@ -367,8 +371,9 @@ fn main() {
         // Откуда взято выделение, с которым открыто колесо.
         let mut active_source = Source::Explorer;
 
-        // Номер запроса чтения выделения, ответа на который ещё ждём.
-        let mut reading: Option<u32> = None;
+        // Запрос чтения выделения, ответа на который ещё ждём: номер и время.
+        // Просроченный запрос не мешает новому нажатию.
+        let mut reading: Option<(u32, std::time::Instant)> = None;
 
         let mut readings_started: u32 = 0;
 
@@ -607,26 +612,28 @@ fn main() {
             if message.message == WM_HOTKEY
                 && message.wParam == Slot::Wheel.id() as usize
                 && !holding
-                && reading.is_none()
+                && reading.is_none_or(|(_, started)| {
+                    started.elapsed().as_millis() > READING_TIMEOUT_MS as u128
+                })
             {
                 readings_started = readings_started.wrapping_add(1);
 
                 let request = readings_started;
 
-                reading = Some(request);
+                reading = Some((request, std::time::Instant::now()));
 
                 let foreground = GetForegroundWindow() as isize;
 
                 let main_thread = GetCurrentThreadId();
 
                 std::thread::spawn(move || {
-                    let result = Box::new((request, selection::read(foreground)));
+                    let result = selection::read(foreground);
 
-                    let pointer = Box::into_raw(result);
-
-                    if PostThreadMessageW(main_thread, WM_SELECTION_READY, 0, pointer as isize) == 0 {
-                        drop(Box::from_raw(pointer));
+                    if let Ok(mut ready) = READY.lock() {
+                        *ready = Some((request, result));
                     }
+
+                    PostThreadMessageW(main_thread, WM_SELECTION_READY, request as usize, 0);
                 });
 
                 SetTimer(wheel.hwnd(), READING_TIMER_ID, READING_TIMEOUT_MS, None);
@@ -651,10 +658,12 @@ fn main() {
             }
 
             if message.message == WM_SELECTION_READY && message.hwnd.is_null() {
-                let (request, result) = *Box::from_raw(message.lParam as *mut (u32, Reading));
+                let Some((request, result)) = READY.lock().ok().and_then(|mut ready| ready.take()) else {
+                    continue;
+                };
 
                 // Ответ на запрос, который уже не ждём (тайм-аут).
-                if reading != Some(request) {
+                if reading.map(|(waiting, _)| waiting) != Some(request) {
                     continue;
                 }
 
@@ -669,6 +678,15 @@ fn main() {
 
                     Reading::NothingSelected => {
                         status_ui.hint("Ничего не выделено", &format!("Выделите файлы и нажмите {hotkey}"));
+
+                        continue;
+                    }
+
+                    Reading::Ambiguous => {
+                        status_ui.hint(
+                            "Несколько файлов с таким именем",
+                            "Включите показ расширений или выделите в Проводнике",
+                        );
 
                         continue;
                     }

@@ -378,13 +378,32 @@ fn extract_zip(source: &Path, root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// Ошибка 7z для пользователя и журнала. В тексте ошибок библиотеки бывают
+// имена файлов архива — в журнал (по умолчанию «без имён файлов») пишется
+// только суть. Отмена посреди работы — не ошибка.
+fn seven_zip_error(message: &str, error: sevenz_rust2::Error) -> String {
+    use sevenz_rust2::Error;
+
+    if job_manager::is_cancelled() {
+        return job_manager::CANCELLED.to_string();
+    }
+
+    match error {
+        Error::Io(io, _) | Error::FileOpen(io, _) | Error::MaybeBadPassword(io) => errors::io(message, &io),
+
+        Error::Other(_) | Error::Unsupported(_) => errors::fail(message, "ошибка формата 7z"),
+
+        other => errors::fail(message, format!("{other:?}")),
+    }
+}
+
 fn extract_seven_zip(source: &Path, root: &Path) -> Result<(), String> {
     use sevenz_rust2::{ArchiveReader, Error, Password};
 
     let describe = |error: Error| match error {
         Error::PasswordRequired | Error::MaybeBadPassword(_) => PASSWORD_PROTECTED.to_string(),
 
-        error => errors::fail("Архив повреждён или это не 7z", error),
+        error => seven_zip_error("Архив повреждён или это не 7z", error),
     };
 
     let mut archive = ArchiveReader::open(source, Password::empty()).map_err(describe)?;
@@ -427,15 +446,16 @@ fn extract_seven_zip(source: &Path, root: &Path) -> Result<(), String> {
     }
 }
 
-// Ссылка (symlink) внутри RAR: атрибут Windows «точка повторной обработки»
-// или тип «ссылка» в правах Unix. Такие не распаковываем: ссылка может
-// вести куда угодно за пределы папки.
-fn is_rar_link(attributes: u32) -> bool {
-    const REPARSE_POINT: u32 = 0x400;
-    const UNIX_TYPE_MASK: u32 = 0o170000;
-    const UNIX_SYMLINK: u32 = 0o120000;
+// Получилась ли на месте распакованного файла ссылка (symlink или точка
+// соединения). Такие не оставляем: ссылка может вести куда угодно за
+// пределы папки, а следующие файлы архива записались бы через неё.
+fn is_link(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
 
-    attributes & REPARSE_POINT != 0 || attributes & UNIX_TYPE_MASK == UNIX_SYMLINK
+    const REPARSE_POINT: u32 = 0x400;
+
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink() || metadata.file_attributes() & REPARSE_POINT != 0)
 }
 
 fn extract_rar(source: &Path, root: &Path) -> Result<(), String> {
@@ -480,18 +500,26 @@ fn extract_rar(source: &Path, root: &Path) -> Result<(), String> {
                 header.skip().map_err(describe)?
             }
 
-            Some(relative) if !is_rar_link(entry.file_attr) => {
+            Some(relative) => {
                 let target = root.join(relative);
 
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent).map_err(|error| errors::io("Не удалось распаковать", &error))?;
                 }
 
-                header.extract_to(&target).map_err(describe)?
+                let next = header.extract_to(&target).map_err(describe)?;
+
+                if is_link(&target) {
+                    let _ = fs::remove_file(&target).or_else(|_| fs::remove_dir(&target));
+
+                    crate::journal::write("    пропущена ссылка из архива");
+                }
+
+                next
             }
 
-            _ => {
-                crate::journal::write("    пропущен файл архива с небезопасным путём или ссылка");
+            None => {
+                crate::journal::write("    пропущен файл архива с небезопасным путём");
 
                 header.skip().map_err(describe)?
             }
@@ -675,7 +703,7 @@ impl Read for LazyFile {
 fn pack_seven_zip<W: Write + std::io::Seek>(root: &Path, writer: W) -> Result<(), String> {
     use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader};
 
-    let failed = |error: sevenz_rust2::Error| errors::fail("Не удалось записать 7z", error);
+    let failed = |error: sevenz_rust2::Error| seven_zip_error("Не удалось записать 7z", error);
 
     let entries = collect_entries(root)?;
 

@@ -45,6 +45,8 @@ pub enum Reading {
     NothingSelected,
     // Диалог показывает не папку на диске («Этот компьютер», «Библиотеки»).
     UnknownFolder,
+    // Расширения скрыты, и выделенное имя подходит к нескольким файлам.
+    Ambiguous,
     // На переднем плане не Проводник и не диалог с файлами.
     NotSupported,
 }
@@ -62,6 +64,7 @@ pub fn read(foreground_window: isize) -> Reading {
         let source = Source::Dialog(foreground_window);
 
         return match count {
+            -2 => Reading::Ambiguous,
             ..0 => Reading::UnknownFolder,
             0 => Reading::NothingSelected,
             _ => Reading::Files(dedup(paths), source),
@@ -72,7 +75,7 @@ pub fn read(foreground_window: isize) -> Reading {
         return Reading::NotSupported;
     }
 
-    match explorer_selection::selected_paths() {
+    match explorer_selection::selected_paths(window) {
         paths if paths.is_empty() => Reading::NothingSelected,
         paths => Reading::Files(paths, Source::Explorer),
     }
@@ -92,19 +95,21 @@ fn dedup(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     unique
 }
 
-// Текст для поля «Имя файла»: одно имя как есть, несколько — в кавычках
-// через пробел (так диалог понимает множественный выбор).
+// Текст для поля «Имя файла». Один результат — полным путём: пока шла
+// задача, в диалоге могли открыть другую папку. Несколько — именами в
+// кавычках через пробел (так диалог понимает множественный выбор).
 pub fn file_name_text(outputs: &[PathBuf]) -> String {
+    if let [single] = outputs {
+        return single.display().to_string();
+    }
+
     let names: Vec<String> = outputs
         .iter()
         .filter_map(|path| path.file_name())
         .map(|name| name.to_string_lossy().into_owned())
         .collect();
 
-    match names.as_slice() {
-        [single] => single.clone(),
-        names => names.iter().map(|name| format!("\"{name}\"")).collect::<Vec<_>>().join(" "),
-    }
+    names.iter().map(|name| format!("\"{name}\"")).collect::<Vec<_>>().join(" ")
 }
 
 // Подставляет результаты в поле «Имя файла» окна «Открыть», чтобы осталось
@@ -128,7 +133,7 @@ mod tests {
 
     #[test]
     fn file_name_text_quotes_several_names() {
-        assert_eq!(file_name_text(&[PathBuf::from(r"C:\a\фото.pdf")]), "фото.pdf");
+        assert_eq!(file_name_text(&[PathBuf::from(r"C:\a\фото.pdf")]), r"C:\a\фото.pdf");
 
         assert_eq!(
             file_name_text(&[PathBuf::from(r"C:\a\1.jpg"), PathBuf::from(r"C:\a\2.jpg")]),

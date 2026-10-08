@@ -564,6 +564,125 @@ fn merged_pdf_has_bookmark_per_file_and_keeps_old_ones() {
     assert_eq!(std::fs::read_dir(pages).unwrap().count(), 3);
 }
 
+// PDF из двух страниц, где закладка и ссылка ведут на вторую страницу по
+// имени: «target» (словарь Dests) и «strdest» (дерево Names) — как у LaTeX.
+fn named_destination_pdf(path: &Path) {
+    use lopdf::{Stream, dictionary};
+
+    let mut document = Document::with_version("1.7");
+
+    let pages_id = document.new_object_id();
+
+    let page = |document: &mut Document, annotations: Vec<Object>| {
+        let content = document.add_object(Stream::new(dictionary! {}, b"0 0 m".to_vec()));
+
+        document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+            "Contents" => content,
+            "Annots" => annotations,
+        })
+    };
+
+    let link = document.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Link",
+        "Rect" => vec![0.into(), 0.into(), 50.into(), 50.into()],
+        "A" => dictionary! { "S" => "GoTo", "D" => Object::string_literal("strdest") },
+    });
+
+    let first = page(&mut document, vec![link.into()]);
+    let second = page(&mut document, vec![]);
+
+    document.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![first.into(), second.into()], "Count" => 2 }),
+    );
+
+    let destination = vec![Object::Reference(second), Object::Name(b"Fit".to_vec())];
+
+    let outline_id = document.new_object_id();
+
+    let item = document.add_object(dictionary! {
+        "Title" => Object::string_literal("Глава"),
+        "Parent" => outline_id,
+        "Dest" => Object::Name(b"target".to_vec()),
+    });
+
+    document.objects.insert(
+        outline_id,
+        Object::Dictionary(dictionary! { "Type" => "Outlines", "First" => item, "Last" => item, "Count" => 1 }),
+    );
+
+    let catalog = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+        "Outlines" => outline_id,
+        "Dests" => dictionary! { "target" => destination.clone() },
+        "Names" => dictionary! { "Dests" => dictionary! { "Names" => vec![Object::string_literal("strdest"), destination.into()] } },
+    });
+
+    document.trailer.set("Root", catalog);
+
+    document.save(path).unwrap();
+}
+
+#[test]
+fn merged_pdf_links_stay_inside_their_file() {
+    let dir = TempDir::new("pdfnames");
+
+    let first = dir.join("первый.pdf");
+    let second = dir.join("второй.pdf");
+
+    named_destination_pdf(&first);
+    named_destination_pdf(&second);
+
+    let merged = single_output(run(ActionId::MergePdfs, &[first, second]));
+
+    let document = Document::load(&merged).unwrap();
+
+    let pages: Vec<lopdf::ObjectId> = document.get_pages().into_values().collect();
+
+    assert_eq!(pages.len(), 4);
+
+    let target_page = |destination: &Object| destination.as_array().unwrap()[0].as_reference().unwrap();
+
+    // Закладки «Глава» внутри закладок файлов: каждая — на 2-ю страницу своего файла.
+    let root = document.catalog().unwrap().get(b"Outlines").unwrap().as_reference().unwrap();
+
+    let mut file_item = document.get_dictionary(root).unwrap().get(b"First").unwrap().as_reference().ok();
+
+    let mut chapter_targets = Vec::new();
+
+    while let Some(id) = file_item {
+        let item = document.get_dictionary(id).unwrap();
+
+        let chapter = document.get_dictionary(item.get(b"First").unwrap().as_reference().unwrap()).unwrap();
+
+        chapter_targets.push(target_page(chapter.get(b"Dest").unwrap()));
+
+        file_item = item.get(b"Next").and_then(Object::as_reference).ok();
+    }
+
+    assert_eq!(chapter_targets, vec![pages[1], pages[3]]);
+
+    // Ссылки на 1-й странице каждого файла — на 2-ю страницу того же файла.
+    let mut link_targets = Vec::new();
+
+    for page in [pages[0], pages[2]] {
+        let annotations = document.get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap();
+
+        let link = document.get_dictionary(annotations[0].as_reference().unwrap()).unwrap();
+
+        let action = link.get(b"A").unwrap().as_dict().unwrap();
+
+        link_targets.push(target_page(action.get(b"D").unwrap()));
+    }
+
+    assert_eq!(link_targets, vec![pages[1], pages[3]]);
+}
+
 #[test]
 fn pdf_pages_follow_dpi_and_format() {
     let dir = TempDir::new("pages");
@@ -675,6 +794,45 @@ fn password_archives_are_explained() {
     }
 
     dir.assert_no_leftovers();
+}
+
+// Точка соединения (junction) в RAR ведёт в чужую папку: после распаковки
+// её не должно остаться, иначе через неё можно писать за пределы папки.
+#[test]
+fn rar_links_are_not_extracted() {
+    use std::os::windows::fs::MetadataExt;
+
+    let dir = TempDir::new("rarlink");
+
+    let outcome = run(ActionId::ExtractArchive, &[copy_fixture(&dir, "junction.rar")]);
+
+    assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+
+    let mut pending = vec![dir.0.clone()];
+
+    while let Some(folder) = pending.pop() {
+        for entry in std::fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+
+            assert!(
+                !metadata.file_type().is_symlink() && metadata.file_attributes() & 0x400 == 0,
+                "осталась ссылка: {}",
+                path.display()
+            );
+
+            if metadata.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+
+    // Обычный файл из архива распакован (UnRAR отдаёт точку соединения как
+    // пустую папку — поэтому результат в папке с именем архива).
+    let folder = &outcome.outputs[0];
+
+    assert_eq!(std::fs::read_to_string(folder.join("ok.txt")).unwrap().trim(), "ok");
 }
 
 #[test]
@@ -963,6 +1121,31 @@ fn new_folder_and_undo() {
     assert!(a.exists() && b.exists() && !folder.exists());
 }
 
+// Если файл не вернулся (на старом месте уже новый с тем же именем), папка
+// с ним остаётся на месте — ничего пользовательского не уходит в корзину.
+#[test]
+fn new_folder_undo_never_recycles_user_files() {
+    let dir = TempDir::new("folderkeep");
+
+    let a = dir.join("a.txt");
+
+    std::fs::write(&a, b"old").unwrap();
+
+    let outcome = run(ActionId::IntoNewFolder, &[a.clone()]);
+
+    let folder = outcome.outputs[0].clone();
+
+    // Пользователь успел создать новый a.txt на старом месте.
+    std::fs::write(&a, b"new").unwrap();
+
+    let failures = undo::revert(&outcome.undo);
+
+    assert_eq!(failures.len(), 2);
+
+    assert_eq!(std::fs::read(&a).unwrap(), b"new");
+    assert_eq!(std::fs::read(folder.join("a.txt")).unwrap(), b"old");
+}
+
 #[test]
 fn outputs_never_overwrite_existing_files() {
     let dir = TempDir::new("names");
@@ -1188,7 +1371,7 @@ mod dialogs {
         // Результат действия — в поле «Имя файла».
         assert!(crate::selection::put_into_dialog(window, &[dir.join("отчёт.pdf")]));
 
-        assert_eq!(file_name_box(window), "отчёт.pdf");
+        assert_eq!(file_name_box(window), dir.join("отчёт.pdf").display().to_string());
 
         close(window, thread);
     }

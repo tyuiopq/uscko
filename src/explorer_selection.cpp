@@ -397,10 +397,12 @@ bool select_in_browser(
 
 }  // namespace
 
-// Выделенные файлы в окне Проводника на переднем плане (или на рабочем столе).
-// Для каждого пути вызывает callback. Возвращает число путей.
+// Выделенные файлы в окне Проводника foreground (или на рабочем столе).
+// Окно передаётся снаружи: оно запомнено в момент нажатия клавиш, а к этому
+// времени на переднем плане может быть уже другое. Для каждого пути
+// вызывает callback. Возвращает число путей.
 extern "C"
-int filehalo_get_selected_paths(PathCallback callback, void* context) {
+int filehalo_get_selected_paths(HWND foreground, PathCallback callback, void* context) {
     if (callback == nullptr) {
         return 0;
     }
@@ -412,8 +414,6 @@ int filehalo_get_selected_paths(PathCallback callback, void* context) {
     if (shell_windows == nullptr) {
         return 0;
     }
-
-    HWND foreground = GetForegroundWindow();
 
     IShellBrowser* browser = foreground_is_desktop(foreground)
         ? desktop_browser(shell_windows)

@@ -2,10 +2,12 @@ use std::ffi::{OsString, c_void};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+use windows_sys::Win32::Foundation::HWND;
+
 type PathCallback = unsafe extern "C" fn(context: *mut c_void, path: *const u16);
 
 unsafe extern "C" {
-    fn filehalo_get_selected_paths(callback: PathCallback, context: *mut c_void) -> i32;
+    fn filehalo_get_selected_paths(foreground: HWND, callback: PathCallback, context: *mut c_void) -> i32;
 
     fn filehalo_select_files(folder: *const u16, paths: *const u16, edit: i32) -> i32;
 }
@@ -20,12 +22,12 @@ unsafe extern "C" fn collect_path(context: *mut c_void, path: *const u16) {
     paths.push(PathBuf::from(OsString::from_wide(wide)));
 }
 
-// Все выделенные файлы в активном окне Проводника или на рабочем столе.
-pub fn selected_paths() -> Vec<PathBuf> {
+// Все выделенные файлы в окне Проводника window или на рабочем столе.
+pub fn selected_paths(window: HWND) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
 
     unsafe {
-        filehalo_get_selected_paths(collect_path, &mut paths as *mut Vec<PathBuf> as *mut c_void);
+        filehalo_get_selected_paths(window, collect_path, &mut paths as *mut Vec<PathBuf> as *mut c_void);
     }
 
     paths

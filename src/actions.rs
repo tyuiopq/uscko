@@ -548,7 +548,7 @@ impl ActionId {
             Self::IntoNewFolder => {
                 match file_tools::into_new_folder(inputs) {
                     Ok((folder, failures)) => {
-                        outcome.undo.push(Step::Created(folder.clone()));
+                        outcome.undo.push(Step::NewFolder(folder.clone()));
 
                         // Отменять можно только то, что действительно переехало.
                         for input in inputs {

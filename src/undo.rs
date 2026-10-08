@@ -51,6 +51,11 @@ pub enum Step {
 
     // Перемещён из from в to.
     Moved { from: PathBuf, to: PathBuf },
+
+    // Папка, созданная под перемещённые файлы («В новую папку»). Удаляется,
+    // только если опустела: всё, что в ней осталось (не вернулось на место
+    // или положено туда позже), — чужое, в корзину это не отправляем.
+    NewFolder(PathBuf),
 }
 
 // Копии файлов до изменения — в папке программы, не рядом с файлами.
@@ -135,6 +140,14 @@ fn revert_step(step: &Step) -> Result<(), String> {
             }
 
             recycle(path)
+        }
+
+        Step::NewFolder(folder) => {
+            if !folder.exists() || fs::remove_dir(folder).is_ok() {
+                return Ok(());
+            }
+
+            Err("В новой папке остались файлы — папка оставлена".to_string())
         }
 
         Step::Moved { from, to } => {
@@ -232,7 +245,7 @@ mod tests {
         fs::rename(&file, new_folder.join("a.txt")).unwrap();
 
         let steps = vec![
-            Step::Created(new_folder.clone()),
+            Step::NewFolder(new_folder.clone()),
             Step::Moved { from: file.clone(), to: new_folder.join("a.txt") },
         ];
 

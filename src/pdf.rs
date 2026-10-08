@@ -345,8 +345,10 @@ fn resolve_dictionary<'a>(document: &'a Document, object: &'a Object) -> Option<
 }
 
 // Именованные места документа (на них ссылаются закладки и ссылки внутри
-// текста). Каталог исходного файла в склейку не попадает, поэтому они
-// переносятся в каталог нового. Совпадающие имена — от первого файла.
+// текста). Каталог исходного файла в склейку не попадает, а одинаковые имена
+// в разных файлах («page.1», «section.1» у LaTeX) смешались бы. Поэтому
+// перед склейкой каждая ссылка по имени заменяется прямой ссылкой на
+// страницу этого же файла, и имена больше не нужны.
 #[derive(Default)]
 struct NamedDestinations {
     // Старый способ: словарь /Dests в каталоге, ключи — имена.
@@ -405,30 +407,77 @@ impl NamedDestinations {
         }
     }
 
-    fn write(self, document: &mut Document, catalog_id: ObjectId) {
-        let mut names = None;
+    // Куда ведёт имя: прямая ссылка [страница /Fit ...]. Значение может быть
+    // массивом, ссылкой на него или словарём с ключом D.
+    fn explicit(&self, document: &Document, key: &Object) -> Option<Object> {
+        let value = match key {
+            Object::Name(name) => self.by_name.get(name).ok()?,
+            Object::String(name, _) => self.by_string.get(name)?,
+            _ => return None,
+        };
 
-        if !self.by_string.is_empty() {
-            let pairs: Vec<Object> = self
-                .by_string
-                .into_iter()
-                .flat_map(|(key, value)| [Object::String(key, StringFormat::Literal), value])
-                .collect();
+        let value = resolve(document, value)?;
 
-            let tree = document.add_object(dictionary! { "Names" => pairs });
+        let array = match value {
+            Object::Dictionary(dictionary) => resolve(document, dictionary.get(b"D").ok()?)?,
+            array => array,
+        };
 
-            names = Some(dictionary! { "Dests" => tree });
+        matches!(array, Object::Array(_)).then(|| array.clone())
+    }
+
+    // Заменяет в документе ссылки по имени (Dest закладок и ссылок, D в
+    // действиях GoTo) прямыми ссылками.
+    fn apply(&self, document: &mut Document) {
+        if self.by_name.is_empty() && self.by_string.is_empty() {
+            return;
         }
 
-        let dests = (!self.by_name.is_empty()).then(|| document.add_object(self.by_name));
+        let mut replacements: Vec<(ObjectId, Vec<u8>, Object)> = Vec::new();
 
-        if let Ok(catalog) = document.get_dictionary_mut(catalog_id) {
-            if let Some(names) = names {
-                catalog.set("Names", names);
+        let mut inline_actions: Vec<(ObjectId, Object)> = Vec::new();
+
+        for (&id, object) in &document.objects {
+            let Object::Dictionary(dictionary) = object else {
+                continue;
+            };
+
+            if let Ok(key) = dictionary.get(b"Dest")
+                && let Some(explicit) = self.explicit(document, key)
+            {
+                replacements.push((id, b"Dest".to_vec(), explicit));
             }
 
-            if let Some(dests) = dests {
-                catalog.set("Dests", dests);
+            let is_goto = dictionary.get(b"S").and_then(Object::as_name).is_ok_and(|name| name == b"GoTo");
+
+            if is_goto
+                && let Ok(key) = dictionary.get(b"D")
+                && let Some(explicit) = self.explicit(document, key)
+            {
+                replacements.push((id, b"D".to_vec(), explicit));
+            }
+
+            // Действие прямо внутри ссылки (без отдельного объекта).
+            if let Ok(Object::Dictionary(action)) = dictionary.get(b"A")
+                && action.get(b"S").and_then(Object::as_name).is_ok_and(|name| name == b"GoTo")
+                && let Ok(key) = action.get(b"D")
+                && let Some(explicit) = self.explicit(document, key)
+            {
+                inline_actions.push((id, explicit));
+            }
+        }
+
+        for (id, key, explicit) in replacements {
+            if let Ok(dictionary) = document.get_dictionary_mut(id) {
+                dictionary.set(key, explicit);
+            }
+        }
+
+        for (id, explicit) in inline_actions {
+            if let Ok(dictionary) = document.get_dictionary_mut(id)
+                && let Ok(Object::Dictionary(action)) = dictionary.get_mut(b"A")
+            {
+                action.set("D", explicit);
             }
         }
     }
@@ -542,8 +591,6 @@ pub fn merge(files: &[PathBuf], mut progress: impl FnMut(usize)) -> Result<PathB
 
     let mut bookmarks = Vec::new();
 
-    let mut destinations = NamedDestinations::default();
-
     for (index, path) in files.iter().enumerate() {
         job_manager::check_cancelled()?;
 
@@ -584,7 +631,11 @@ pub fn merge(files: &[PathBuf], mut progress: impl FnMut(usize)) -> Result<PathB
             });
         }
 
+        let mut destinations = NamedDestinations::default();
+
         destinations.collect(&document);
+
+        destinations.apply(&mut document);
 
         // Каталог и узлы дерева страниц заменяются новыми. Закладки
         // и именованные места переносятся в новый каталог; формы — нет.
@@ -604,8 +655,6 @@ pub fn merge(files: &[PathBuf], mut progress: impl FnMut(usize)) -> Result<PathB
     let catalog_id = finish_page_tree(&mut merged, pages_id, kids);
 
     write_bookmarks(&mut merged, catalog_id, bookmarks);
-
-    destinations.write(&mut merged, catalog_id);
 
     merged.prune_objects();
 

@@ -247,8 +247,16 @@ struct VideoInfo {
 }
 
 fn video_info(file: &StorageFile) -> Result<VideoInfo, String> {
-    let profile = MediaEncodingProfile::CreateFromFileAsync(file)
-        .and_then(|operation| operation.join())
+    let read = || MediaEncodingProfile::CreateFromFileAsync(file).and_then(|operation| operation.join());
+
+    // Только что записанный файл Windows иногда не может прочитать сразу
+    // (видели в тестах под нагрузкой) — одна повторная попытка.
+    let profile = read()
+        .or_else(|_| {
+            std::thread::sleep(Duration::from_millis(300));
+
+            read()
+        })
         .map_err(|error| winrt_error("Не удалось прочитать видео", error))?;
 
     let video = profile

@@ -675,9 +675,18 @@ fn render_page(page: &windows::Data::Pdf::PdfPage, params: &Params) -> Result<Ve
     use windows::Data::Pdf::PdfPageRenderOptions;
     use windows::Storage::Streams::InMemoryRandomAccessStream;
 
-    let size = page.Size().map_err(|error| winrt_error("Не удалось отрисовать страницу PDF", error))?;
+    let reported = page.Size().map_err(|error| winrt_error("Не удалось отрисовать страницу PDF", error))?;
 
-    // Размер страницы в DIP (1/96 дюйма).
+    // Размер страницы движок отдаёт с учётом масштаба экрана (при 125% —
+    // в 1,25 раза больше). Приводим к DIP (1/96 дюйма), чтобы «dpi» в
+    // настройках означал настоящие точки на дюйм на любом экране.
+    let system_dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForSystem() }.max(96) as f32;
+
+    let size = windows::Foundation::Size {
+        Width: reported.Width * 96.0 / system_dpi,
+        Height: reported.Height * 96.0 / system_dpi,
+    };
+
     let scale = (params.pdf_dpi as f32 / 96.0)
         .min(MAX_RENDER_SIDE / size.Width.max(1.0))
         .min(MAX_RENDER_SIDE / size.Height.max(1.0));

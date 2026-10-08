@@ -3,7 +3,7 @@
 ## UnRAR
 
 Распаковка RAR сделана на библиотеке UnRAR (© Alexander Roshal), подключённой
-через крейт [unrar](https://github.com/muja/unrar.rs). Лицензия UnRAR требует
+через крейт [unrar-ng-sys](https://github.com/ttys3/unrar.rs) (UnRAR 7.21). Лицензия UnRAR требует
 приводить следующий абзац:
 
 > UnRAR source code may be used in any software to handle RAR archives

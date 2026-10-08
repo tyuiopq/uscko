@@ -18,6 +18,7 @@ mod media;
 mod metadata;
 mod output;
 mod params;
+mod rar;
 mod pdf;
 mod render;
 mod selection;

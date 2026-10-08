@@ -18,7 +18,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sevenz-rust2 = { version = "0.23.0", default-features = false, features = ["bzip2", "ppmd", "deflate", "compress"] }
 sha2 = "0.11.0"
-unrar = "0.5.8"
+# UnRAR 7.21 (с исправлением CVE-2025-8088); вызывается только в режиме
+# «проверка», файлы пишет сама программа — см. src/rar.rs.
+unrar-ng-sys = "0.7.7"
 tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
 windows = { version = "0.62.2", features = [
     "Data_Pdf",

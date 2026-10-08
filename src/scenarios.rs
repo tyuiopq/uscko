@@ -835,6 +835,24 @@ fn rar_links_are_not_extracted() {
     assert_eq!(std::fs::read_to_string(folder.join("ok.txt")).unwrap().trim(), "ok");
 }
 
+// Потоки NTFS из RAR (через их имена архив мог записать файл куда угодно —
+// CVE-2025-8088) не распаковываются вовсе: UnRAR работает в режиме проверки.
+#[test]
+fn rar_streams_are_not_written() {
+    let dir = TempDir::new("rarstream");
+
+    let note = single_output(run(ActionId::ExtractArchive, &[copy_fixture(&dir, "stream.rar")]));
+
+    assert_eq!(file_name(&note), "note.txt");
+    assert_eq!(std::fs::read_to_string(&note).unwrap().trim(), "visible");
+
+    let mut stream = note.as_os_str().to_os_string();
+
+    stream.push(":secret");
+
+    assert!(std::fs::File::open(PathBuf::from(stream)).is_err(), "поток NTFS распаковался");
+}
+
 #[test]
 fn zip_roundtrip_keeps_everything() {
     let dir = TempDir::new("zip");

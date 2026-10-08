@@ -1,7 +1,7 @@
 // Архивы: упаковка в ZIP, распаковка ZIP, 7z и RAR, переупаковка
 // RAR/7z -> ZIP и ZIP/RAR -> 7z.
 //
-// RAR читается официальной библиотекой UnRAR (через крейт unrar). Её
+// RAR читается официальной библиотекой UnRAR (модуль rar.rs). Её
 // лицензия требует приводить этот абзац:
 //
 //   UnRAR source code may be used in any software to handle RAR archives
@@ -32,7 +32,7 @@ use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileO
 use crate::params::Params;
 use crate::{errors, file_types, job_manager, output};
 
-const PASSWORD_PROTECTED: &str = "Архив с паролем — такие пока не поддерживаются";
+use crate::rar::PASSWORD_PROTECTED;
 
 // Эти форматы уже сжаты: повторное сжатие только тратит время.
 const STORED_EXTENSIONS: &[&str] = &[
@@ -446,87 +446,8 @@ fn extract_seven_zip(source: &Path, root: &Path) -> Result<(), String> {
     }
 }
 
-// Получилась ли на месте распакованного файла ссылка (symlink или точка
-// соединения). Такие не оставляем: ссылка может вести куда угодно за
-// пределы папки, а следующие файлы архива записались бы через неё.
-fn is_link(path: &Path) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    const REPARSE_POINT: u32 = 0x400;
-
-    fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink() || metadata.file_attributes() & REPARSE_POINT != 0)
-}
-
 fn extract_rar(source: &Path, root: &Path) -> Result<(), String> {
-    use unrar::error::{Code, UnrarError};
-
-    let describe = |error: UnrarError| match error.code {
-        Code::MissingPassword | Code::BadPassword => PASSWORD_PROTECTED.to_string(),
-
-        Code::EOpen => errors::fail("Не хватает части многотомного архива", error),
-
-        Code::BadData | Code::BadArchive | Code::UnknownFormat => {
-            errors::fail("Архив повреждён или это не RAR", error)
-        }
-
-        _ => errors::fail("Не удалось распаковать RAR", error),
-    };
-
-    // Многотомный архив всегда читается с первой части.
-    let mut archive = unrar::Archive::new(source)
-        .as_first_part()
-        .open_for_processing()
-        .map_err(describe)?;
-
-    while let Some(header) = archive.read_header().map_err(describe)? {
-        job_manager::check_cancelled()?;
-
-        let entry = header.entry();
-
-        if entry.is_encrypted() {
-            return Err(PASSWORD_PROTECTED.to_string());
-        }
-
-        let name = entry.filename.to_string_lossy().into_owned();
-
-        let relative = safe_relative_path(&name);
-
-        archive = match relative {
-            Some(relative) if entry.is_directory() => {
-                fs::create_dir_all(root.join(relative))
-                    .map_err(|error| errors::io("Не удалось распаковать", &error))?;
-
-                header.skip().map_err(describe)?
-            }
-
-            Some(relative) => {
-                let target = root.join(relative);
-
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).map_err(|error| errors::io("Не удалось распаковать", &error))?;
-                }
-
-                let next = header.extract_to(&target).map_err(describe)?;
-
-                if is_link(&target) {
-                    let _ = fs::remove_file(&target).or_else(|_| fs::remove_dir(&target));
-
-                    crate::journal::write("    пропущена ссылка из архива");
-                }
-
-                next
-            }
-
-            None => {
-                crate::journal::write("    пропущен файл архива с небезопасным путём");
-
-                header.skip().map_err(describe)?
-            }
-        };
-    }
-
-    Ok(())
+    crate::rar::extract(source, root, safe_relative_path)
 }
 
 // Распаковывает архив любого поддерживаемого формата в папку root.

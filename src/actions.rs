@@ -81,10 +81,7 @@ fn archives(selection: &Selection, keep: impl Fn(&Path) -> bool) -> Vec<PathBuf>
 
     for file in selection.matching(|file| is_archive(file) && keep(file)) {
         let first = if file_types::is_rar(&file) {
-            unrar::Archive::new(&file)
-                .first_part_option()
-                .filter(|first| first.exists())
-                .unwrap_or_else(|| file.clone())
+            crate::rar::first_volume(&file)
         } else {
             file
         };

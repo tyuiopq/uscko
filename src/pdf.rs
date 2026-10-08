@@ -717,6 +717,14 @@ fn render_page(page: &windows::Data::Pdf::PdfPage, params: &Params) -> Result<Ve
 // Одностраничный PDF -> "doc.png" рядом. Многостраничный -> папка "doc"
 // со страницами "doc 01.png", "doc 02.png", ... (или .jpg — по параметрам).
 pub fn to_images(source: &Path, params: &Params) -> Result<PathBuf, String> {
+    // Встроенный движок PDF (Windows.Data.Pdf), если с ним работают несколько
+    // потоков сразу, может уронить процесс при выходе (воспроизводилось в
+    // тестах: одновременная отрисовка нескольких PDF, один — на длинном пути).
+    // Задачи и так идут по одной; замок — чтобы так оставалось и дальше.
+    static RENDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    let _render = RENDER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let _com = winrt::ComScope::new();
 
     // Все объекты WinRT живут внутри render_document и освобождаются

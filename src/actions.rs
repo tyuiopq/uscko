@@ -231,6 +231,8 @@ pub struct ActionOutcome {
     pub cancelled: bool,
     // Как отменить сделанное (кнопка «Отменить» в окне «Готово»).
     pub undo: Vec<Step>,
+    // Папка исходных файлов только для чтения — результаты в «Загрузках».
+    pub saved_to_downloads: bool,
 }
 
 impl ActionId {

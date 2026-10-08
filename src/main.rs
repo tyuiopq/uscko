@@ -231,11 +231,18 @@ fn report(outcome: &ActionOutcome) -> Report {
     // иначе кнопку не успеть нажать.
     let undoable = !outcome.undo.is_empty();
 
+    // Рядом с исходными сохранить было нельзя — говорим, где искать.
+    let detail = if outcome.saved_to_downloads {
+        Some("Папка только для чтения — сохранено в «Загрузки»".to_string())
+    } else {
+        skip_reason(&outcome.skipped)
+    };
+
     Report {
         outcome: Outcome::Success,
         title,
-        detail: skip_reason(&outcome.skipped),
-        always: skipped > 0 || undoable,
+        detail,
+        always: skipped > 0 || undoable || outcome.saved_to_downloads,
         button: undoable.then_some(status_ui::Button::Undo),
     }
 }

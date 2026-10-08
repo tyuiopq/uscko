@@ -194,9 +194,11 @@ fn run(job: &Job) -> ActionOutcome {
 
     FILE_PROGRESS.store(0, Ordering::Relaxed);
 
+    crate::output::reset_saved_to_downloads();
+
     TOTAL_COUNT.store(if combined { 1 } else { job.inputs.len() }, Ordering::Relaxed);
 
-    job.action.execute(&job.inputs, &job.params, |done, total| {
+    let mut outcome = job.action.execute(&job.inputs, &job.params, |done, total| {
         if combined {
             set_file_progress(done as f64 / total.max(1) as f64);
         } else {
@@ -204,7 +206,11 @@ fn run(job: &Job) -> ActionOutcome {
 
             FILE_PROGRESS.store(0, Ordering::Relaxed);
         }
-    })
+    });
+
+    outcome.saved_to_downloads = crate::output::saved_to_downloads();
+
+    outcome
 }
 
 // «jpg ×2, png» — что выделено, без имён файлов.

@@ -1678,3 +1678,96 @@ mod dialogs {
         close(window, thread);
     }
 }
+
+// Путь длиннее 260 символов: все основные действия работают.
+#[test]
+fn long_paths_work() {
+    let dir = TempDir::new("long");
+
+    let mut deep = dir.0.clone();
+
+    while deep.as_os_str().len() < 290 {
+        deep.push("очень-длинная-папка-для-проверки");
+    }
+
+    std::fs::create_dir_all(&deep).unwrap();
+
+    let png = deep.join("фото.png");
+
+    photo(80, 60).save(&png).unwrap();
+
+    single_output(run(ActionId::ConvertToJpeg, &[png.clone()]));
+
+    let rotated = run(ActionId::RotateRight, &[png.clone()]);
+
+    assert!(rotated.failures.is_empty(), "{:?}", rotated.failures);
+    assert!(undo::revert(&rotated.undo).is_empty());
+
+    let pdf = single_output(run(ActionId::ImagesToPdf, &[png.clone()]));
+
+    std::fs::rename(&pdf, deep.join("документ.pdf")).unwrap();
+
+    single_output(run(ActionId::PdfToImages, &[deep.join("документ.pdf")]));
+
+    let zip = single_output(run(ActionId::CreateZip, &[png.clone()]));
+
+    std::fs::rename(&zip, deep.join("архив.zip")).unwrap();
+
+    single_output(run(ActionId::ArchiveTo7z, &[deep.join("архив.zip")]));
+
+    let rar = deep.join("rar5.rar");
+
+    std::fs::copy(fixtures().join("rar5.rar"), &rar).unwrap();
+
+    single_output(run(ActionId::ExtractArchive, &[rar]));
+
+    let folder = run(ActionId::IntoNewFolder, &[png]);
+
+    assert!(undo::revert(&folder.undo).is_empty());
+
+    let wav = deep.join("тон.wav");
+
+    write_wav(&wav, 0.5, 440.0);
+
+    single_output(run(ActionId::ConvertToMp3, &[wav]));
+}
+
+// Папка только для чтения: результат сохраняется в «Загрузки» (в тесте —
+// временную папку вместо настоящих «Загрузок»).
+#[test]
+fn read_only_folder_saves_to_downloads() {
+    let dir = TempDir::new("readonly");
+
+    let locked = dir.join("закрытая");
+    let downloads = dir.join("загрузки");
+
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::create_dir_all(&downloads).unwrap();
+
+    let png = locked.join("снимок.png");
+
+    photo(40, 30).save(&png).unwrap();
+
+    let user = std::env::var("USERNAME").unwrap();
+
+    let icacls = |arguments: &[&str]| {
+        let status = std::process::Command::new("icacls").arg(&locked).args(arguments).output().unwrap().status;
+
+        assert!(status.success(), "icacls {arguments:?}");
+    };
+
+    // Запрет создавать файлы и папки (удалять старые и читать можно).
+    icacls(&["/deny", &format!("{user}:(WD,AD)")]);
+
+    crate::output::TEST_DOWNLOADS.with(|folder| *folder.borrow_mut() = Some(downloads.clone()));
+
+    let outcome = run(ActionId::ConvertToJpeg, &[png]);
+
+    crate::output::TEST_DOWNLOADS.with(|folder| *folder.borrow_mut() = None);
+
+    icacls(&["/remove:d", &user]);
+
+    let output = single_output(outcome);
+
+    assert_eq!(output, downloads.join("снимок.jpg"));
+}

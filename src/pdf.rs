@@ -763,7 +763,7 @@ fn render_document(source: &Path, params: &Params) -> Result<PathBuf, String> {
 
     let stem = output::stem_of(source)?;
 
-    let folder = output::parent_of(source)?;
+    let folder = &output::output_folder(source)?;
 
     let target = output::available_path(folder, stem, None)?;
 

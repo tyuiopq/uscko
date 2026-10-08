@@ -9,7 +9,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -86,9 +86,98 @@ pub fn available_path(folder: &Path, stem: &OsStr, extension: Option<&str>) -> R
     Err("Не удалось подобрать свободное имя для результата".to_string())
 }
 
+// Результаты сохранялись не рядом с исходными файлами, а в «Загрузках»
+// (папка исходных только для чтения). Сбрасывается перед каждой задачей.
+static SAVED_TO_DOWNLOADS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn reset_saved_to_downloads() {
+    SAVED_TO_DOWNLOADS.store(false, Ordering::Relaxed);
+}
+
+pub fn saved_to_downloads() -> bool {
+    SAVED_TO_DOWNLOADS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    // В тестах «Загрузки» подменяются временной папкой.
+    pub static TEST_DOWNLOADS: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+fn downloads_folder() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(folder) = TEST_DOWNLOADS.with(|folder| folder.borrow().clone()) {
+        return Some(folder);
+    }
+
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Downloads, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+
+    let mut raw: *mut u16 = std::ptr::null_mut();
+
+    let found = unsafe { SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT as u32, std::ptr::null_mut(), &mut raw) } == 0;
+
+    let folder = found.then(|| {
+        let length = (0..).take_while(|&index| unsafe { *raw.add(index) } != 0).count();
+
+        PathBuf::from(OsString::from_wide(unsafe { std::slice::from_raw_parts(raw, length) }))
+    });
+
+    unsafe {
+        CoTaskMemFree(raw as *const std::ffi::c_void);
+    }
+
+    folder.filter(|folder| folder.is_dir())
+}
+
+// Можно ли создавать файлы в папке: пробуем создать и удалить пустой
+// временный файл. «Нельзя» — только нет прав или носитель только для чтения;
+// другие сбои (нет места) пусть проявятся при записи с понятной ошибкой.
+fn is_writable(folder: &Path) -> bool {
+    let probe = temp_path(folder);
+
+    match OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(file) => {
+            drop(file);
+
+            let _ = fs::remove_file(&probe);
+
+            true
+        }
+
+        Err(error) => {
+            let read_only = error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.kind() == std::io::ErrorKind::ReadOnlyFilesystem
+                || error.raw_os_error() == Some(19);
+
+            !read_only
+        }
+    }
+}
+
+// Куда сохранять результат действия над source: в его папку, а если туда
+// писать нельзя (Program Files, компакт-диск, чужая сетевая папка) — в «Загрузки».
+pub fn output_folder(source: &Path) -> Result<PathBuf, String> {
+    let parent = parent_of(source)?;
+
+    if is_writable(parent) {
+        return Ok(parent.to_path_buf());
+    }
+
+    match downloads_folder() {
+        Some(downloads) => {
+            SAVED_TO_DOWNLOADS.store(true, Ordering::Relaxed);
+
+            Ok(downloads)
+        }
+
+        None => Ok(parent.to_path_buf()),
+    }
+}
+
 // Результат рядом с исходником: "photo.jpg" -> "photo.png".
 pub fn next_to(source: &Path, extension: &str) -> Result<PathBuf, String> {
-    available_path(parent_of(source)?, stem_of(source)?, Some(extension))
+    available_path(&output_folder(source)?, stem_of(source)?, Some(extension))
 }
 
 // Результат рядом с исходником с пометкой: "photo.jpg" -> "photo (small).jpg".
@@ -97,14 +186,41 @@ pub fn next_to_with_suffix(source: &Path, suffix: &str, extension: &str) -> Resu
 
     stem.push(format!(" ({suffix})"));
 
-    available_path(parent_of(source)?, &stem, Some(extension))
+    available_path(&output_folder(source)?, &stem, Some(extension))
 }
 
+// Путь для прямых вызовов Windows. Длинный (больше ~260 символов) — с
+// префиксом \\?\: так Windows принимает его, даже если длинные пути в
+// системе не включены.
 fn wide(path: &Path) -> Vec<u16> {
-    path.as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
+    const LIMIT: usize = 240;
+
+    let text: Vec<u16> = path.as_os_str().encode_wide().collect();
+
+    let starts_with = |prefix: &str| {
+        let prefix: Vec<u16> = prefix.encode_utf16().collect();
+
+        text.starts_with(&prefix)
+    };
+
+    let mut result: Vec<u16> = Vec::with_capacity(text.len() + 9);
+
+    if text.len() > LIMIT && path.is_absolute() && !starts_with(r"\\?\") {
+        if starts_with(r"\\") {
+            // \\сервер\папка -> \\?\UNC\сервер\папка
+            result.extend(r"\\?\UNC".encode_utf16());
+            result.extend_from_slice(&text[1..]);
+        } else {
+            result.extend(r"\\?\".encode_utf16());
+            result.extend_from_slice(&text);
+        }
+    } else {
+        result = text;
+    }
+
+    result.push(0);
+
+    result
 }
 
 // Временные файлы скрыты, чтобы не мелькать в папке пользователя. Перед

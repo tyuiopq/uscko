@@ -210,7 +210,7 @@ pub fn create(items: &[PathBuf], params: &Params, mut progress: impl FnMut(usize
     }
     .unwrap_or_else(|| OsString::from("Архив"));
 
-    let target = output::available_path(base, &stem, Some("zip"))?;
+    let target = output::available_path(&output::output_folder(first)?, &stem, Some("zip"))?;
 
     output::write_file(&target, |writer| {
         let mut zip = ZipWriter::new(writer);
@@ -480,7 +480,7 @@ fn archive_stem(source: &Path) -> Result<OsString, String> {
 // или одна папка — она кладётся прямо рядом, иначе всё содержимое — в папку
 // с именем архива.
 pub fn extract(source: &Path) -> Result<PathBuf, String> {
-    let folder = output::parent_of(source)?;
+    let folder = &output::output_folder(source)?;
 
     let temp = output::temp_dir(folder)?;
 
@@ -698,7 +698,7 @@ fn pack_zip<W: Write + std::io::Seek>(root: &Path, writer: W, level: i64) -> Res
 // Переупаковывает архив в другой формат: «docs.rar» -> «docs.zip» рядом.
 // Содержимое распаковывается во временную папку и упаковывается заново.
 pub fn repack(source: &Path, format: ArchiveFormat, params: &Params) -> Result<PathBuf, String> {
-    let folder = output::parent_of(source)?;
+    let folder = &output::output_folder(source)?;
 
     let temp = output::temp_dir(folder)?;
 

@@ -1,0 +1,990 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uskko — файлы одним движением</title>
+<meta name="description" content="uskko — колесо действий с файлами для Windows.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #000;
+    --text: #f5f5f7;
+    --muted: #86868b;
+    --dim: #2b2b30;
+    --accent: #4678f5;
+    --accent-2: #78a5ff;
+    --light-bg: #f5f5f7;
+    --light-text: #1d1d1f;
+    --font: "Inter", "Segoe UI", system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { overflow-x: clip; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 17px;
+    line-height: 1.47;
+    letter-spacing: -0.01em;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: clip;
+  }
+
+  a { color: inherit; text-decoration: none; }
+
+  canvas { display: block; }
+
+  h1, h2, h3 { font-weight: 700; letter-spacing: -0.045em; line-height: 1.04; }
+
+  .grad {
+    background: linear-gradient(90deg, #9fc0ff, var(--accent-2) 40%, #a98bff);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* ---------- Навигация ---------- */
+
+  nav {
+    position: fixed;
+    inset: 0 0 auto 0;
+    z-index: 50;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, .72);
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid rgba(255, 255, 255, .06);
+  }
+
+  .logo { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: 19px; letter-spacing: -0.03em; }
+
+  .logo svg { width: 22px; height: 22px; }
+
+  /* ---------- Кнопка ---------- */
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    height: 54px;
+    padding: 0 30px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: #fff;
+    font: 600 17px var(--font);
+    letter-spacing: -0.01em;
+    transition: background .25s, transform .25s cubic-bezier(.2, .8, .2, 1);
+  }
+
+  .btn:hover { background: #5a88ff; transform: scale(1.03); }
+
+  .btn svg { width: 18px; height: 18px; }
+
+  .meta { margin-top: 16px; font-size: 14px; color: var(--muted); }
+
+  /* ---------- Сцены с закреплением ---------- */
+
+  .scene { position: relative; }
+
+  .sticky { position: sticky; top: 0; height: 100vh; height: 100svh; overflow: hidden; }
+
+  /* Первый экран */
+
+  #hero { height: 260vh; }
+
+  .hero-text { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; padding: max(110px, 14vh) 16px 0; text-align: center; will-change: transform, opacity; }
+
+  .hero-text h1 { font-size: clamp(52px, 9.5vw, 128px); }
+
+  .hero-text .lead { margin: 22px 0 34px; font-size: clamp(19px, 2.4vw, 26px); color: var(--muted); font-weight: 500; }
+
+  .hero-wheel { position: absolute; left: 50%; top: 50%; width: min(620px, 92vw); aspect-ratio: 1; margin: calc(min(620px, 92vw) / -2) 0 0 calc(min(620px, 92vw) / -2); will-change: transform; }
+
+  .hero-wheel canvas { width: 100%; height: 100%; }
+
+  .hero-glow { position: absolute; left: 50%; top: 50%; width: 1000px; height: 1000px; margin: -500px 0 0 -500px; background: radial-gradient(closest-side, rgba(70, 120, 245, .28), rgba(120, 90, 255, .08) 55%, transparent); pointer-events: none; will-change: opacity, transform; }
+
+  .hero-note { position: absolute; left: 0; right: 0; bottom: 7vh; padding: 0 16px; text-align: center; font-size: clamp(22px, 3vw, 34px); font-weight: 600; letter-spacing: -0.03em; opacity: 0; will-change: opacity, transform; }
+
+  .hero-note span { color: var(--muted); }
+
+  @media (hover: none) { .hero-note span { display: none; } }
+
+  /* Демо */
+
+  #demo { height: 480vh; }
+
+  .demo-layout { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4vh; padding: 70px 16px 20px; }
+
+  .captions { position: relative; height: clamp(64px, 9vw, 108px); width: 100%; text-align: center; }
+
+  .captions h2 { position: absolute; inset: 0; font-size: clamp(34px, 6.4vw, 84px); opacity: 0; transform: translateY(24px); transition: opacity .5s, transform .6s cubic-bezier(.2, .8, .2, 1); }
+
+  .captions h2.on { opacity: 1; transform: none; }
+
+  .window {
+    position: relative;
+    width: min(980px, 100%);
+    height: min(58vh, 560px);
+    border-radius: 16px;
+    background: #1b1c20;
+    border: 1px solid rgba(255, 255, 255, .1);
+    box-shadow: 0 50px 120px -30px rgba(0, 0, 0, .9), 0 0 0 1px #000;
+    overflow: hidden;
+  }
+
+  .titlebar { display: flex; align-items: center; gap: 12px; height: 44px; padding: 0 16px; background: #202125; border-bottom: 1px solid rgba(255, 255, 255, .06); font-size: 13px; color: #8d8e96; }
+
+  .titlebar .path { flex: 1; height: 28px; display: flex; align-items: center; padding: 0 12px; border-radius: 6px; background: #17181b; white-space: nowrap; overflow: hidden; }
+
+  .titlebar .path b { color: #d6d7dc; font-weight: 500; }
+
+  .files { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 6px; padding: 24px; }
+
+  .file { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px 4px 8px; border-radius: 8px; border: 1px solid transparent; transition: background .3s, border-color .3s, opacity .5s, transform .6s cubic-bezier(.2, .9, .3, 1.25); }
+
+  .file.selected { background: rgba(70, 120, 245, .22); border-color: rgba(120, 165, 255, .55); }
+
+  .file .icon { position: relative; width: 50px; height: 62px; border-radius: 7px; background: var(--c); display: flex; align-items: flex-end; justify-content: center; padding-bottom: 7px; font-size: 10.5px; font-weight: 700; color: rgba(255, 255, 255, .95); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .22); }
+
+  .file .icon::before { content: ""; position: absolute; top: 0; right: 0; width: 14px; height: 14px; background: linear-gradient(225deg, #1b1c20 50%, rgba(255, 255, 255, .3) 50%); border-radius: 0 7px 0 3px; }
+
+  .file span { font-size: 12.5px; color: #c4c5cc; text-align: center; }
+
+  .file.new { opacity: 0; transform: scale(.4); }
+  .file.new.shown { opacity: 1; transform: none; }
+
+  .demo-wheel { position: absolute; left: 50%; top: calc(50% + 22px); width: min(440px, 86vw); aspect-ratio: 1; transform: translate(-50%, -50%); pointer-events: none; }
+
+  .demo-wheel canvas { width: 100%; height: 100%; }
+
+  .keys { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 15px; }
+
+  .key {
+    min-width: 58px;
+    height: 50px;
+    padding: 0 16px;
+    display: grid;
+    place-items: center;
+    border-radius: 11px;
+    font-size: 16px;
+    font-weight: 600;
+    background: linear-gradient(#26272c, #1b1c20);
+    border: 1px solid rgba(255, 255, 255, .12);
+    box-shadow: 0 4px 0 #0c0c0e, inset 0 1px 0 rgba(255, 255, 255, .08);
+    transition: transform .12s, box-shadow .12s, border-color .2s, color .2s;
+  }
+
+  .key.down { transform: translateY(3px); box-shadow: 0 1px 0 #0c0c0e, inset 0 1px 0 rgba(255, 255, 255, .08); border-color: var(--accent-2); color: #fff; }
+
+  /* Категории */
+
+  #kinds { height: 720vh; }
+
+  .kinds-layout { position: absolute; inset: 0; display: grid; grid-template-columns: 1fr 1fr; align-items: center; gap: 40px; width: min(1180px, 100% - 32px); margin: 0 auto; padding-top: 52px; }
+
+  .kind-text { position: relative; height: 320px; }
+
+  .kind { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: center; opacity: 0; transform: translateY(40px); transition: opacity .55s, transform .7s cubic-bezier(.2, .8, .2, 1); }
+
+  .kind.on { opacity: 1; transform: none; }
+
+  .kind .count { font-size: 15px; font-weight: 600; color: var(--accent-2); margin-bottom: 14px; }
+
+  .kind h2 { font-size: clamp(48px, 7vw, 96px); }
+
+  .kind p { margin-top: 18px; font-size: clamp(18px, 1.8vw, 22px); color: var(--muted); max-width: 440px; }
+
+  .kind-wheel { width: min(560px, 46vw); aspect-ratio: 1; justify-self: center; }
+
+  .kind-wheel canvas { width: 100%; height: 100%; }
+
+  .progress { position: absolute; left: 50%; bottom: 5vh; transform: translateX(-50%); display: flex; gap: 8px; }
+
+  .progress i { width: 8px; height: 8px; border-radius: 4px; background: #3a3a3f; transition: width .4s, background .4s; }
+
+  .progress i.on { width: 28px; background: var(--text); }
+
+  .kinds-intro { padding: 22vh 16px 0; text-align: center; }
+
+  .kinds-intro h2 { font-size: clamp(40px, 7vw, 96px); }
+
+  /* Форматы (светлая секция) */
+
+  .formats { background: var(--light-bg); color: var(--light-text); padding: 150px 0 160px; overflow: hidden; }
+
+  .formats h2 { text-align: center; font-size: clamp(40px, 6.5vw, 88px); padding: 0 16px; }
+
+  .formats .sub { text-align: center; margin-top: 18px; font-size: clamp(18px, 2vw, 22px); color: #6e6e73; padding: 0 16px; }
+
+  .rows { margin-top: 90px; display: flex; flex-direction: column; gap: 22px; }
+
+  .row { display: flex; gap: 22px; width: max-content; will-change: transform; }
+
+  .tag { font-size: clamp(42px, 7vw, 92px); font-weight: 800; letter-spacing: -0.05em; line-height: 1; padding: 22px 34px; border-radius: 28px; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .04), 0 10px 30px -12px rgba(0, 0, 0, .12); white-space: nowrap; }
+
+  .tag.blue { background: var(--accent); color: #fff; }
+
+  .tag.ghost { background: transparent; box-shadow: inset 0 0 0 2px #d2d2d7; color: #86868b; }
+
+  /* Манифест */
+
+  .manifesto { padding: 26vh 0 22vh; }
+
+  .manifesto .wrap { width: min(1180px, 100% - 32px); margin: 0 auto; }
+
+  .manifesto p.big { font-size: clamp(44px, 8vw, 116px); font-weight: 800; letter-spacing: -0.055em; line-height: 1.02; }
+
+  .manifesto .w { color: var(--dim); transition: color .5s; }
+
+  .manifesto .w.lit { color: var(--text); }
+
+  .manifesto .after { margin-top: 48px; font-size: clamp(20px, 2.4vw, 28px); color: var(--muted); max-width: 720px; font-weight: 500; opacity: 0; transform: translateY(30px); transition: opacity .9s, transform .9s cubic-bezier(.2, .8, .2, 1); }
+
+  .manifesto .after.in { opacity: 1; transform: none; }
+
+  .manifesto .after b { color: var(--text); font-weight: 600; }
+
+  /* Финал */
+
+  .final { position: relative; text-align: center; padding: 120px 16px 150px; overflow: hidden; }
+
+  .final-wheel { width: min(380px, 80vw); aspect-ratio: 1; margin: 0 auto -10px; }
+
+  .final-wheel canvas { width: 100%; height: 100%; }
+
+  .final h2 { font-size: clamp(64px, 12vw, 160px); letter-spacing: -0.06em; }
+
+  .final .lead { margin: 14px 0 38px; font-size: clamp(19px, 2.4vw, 26px); color: var(--muted); font-weight: 500; }
+
+  .final::before { content: ""; position: absolute; left: 50%; top: 30%; width: 900px; height: 900px; margin: -450px 0 0 -450px; background: radial-gradient(closest-side, rgba(70, 120, 245, .2), transparent); pointer-events: none; }
+
+  footer { border-top: 1px solid #1d1d1f; padding: 26px 16px 34px; display: flex; justify-content: center; gap: 28px; color: #6e6e73; font-size: 13px; }
+
+  .toast { position: fixed; left: 50%; bottom: 30px; z-index: 60; transform: translate(-50%, 30px); opacity: 0; pointer-events: none; padding: 14px 22px; border-radius: 14px; background: rgba(40, 40, 44, .92); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); font-size: 15px; white-space: nowrap; transition: .45s cubic-bezier(.2, .9, .3, 1.2); }
+
+  .toast.shown { opacity: 1; transform: translate(-50%, 0); }
+
+  .reveal { opacity: 0; transform: translateY(50px); transition: opacity 1s cubic-bezier(.2, .8, .2, 1), transform 1s cubic-bezier(.2, .8, .2, 1); }
+
+  .reveal.in { opacity: 1; transform: none; }
+
+  /* ---------- Узкие экраны ---------- */
+
+  @media (max-width: 860px) {
+    .kinds-layout { grid-template-columns: 1fr; grid-template-rows: auto auto; align-content: center; gap: 10px; padding-top: 60px; }
+    .kind-text { height: 190px; text-align: center; }
+    .kind p { margin: 12px auto 0; font-size: 17px; }
+    .kind-wheel { width: min(400px, 84vw, 48vh); }
+    .window { height: min(52vh, 460px); }
+    .files { grid-template-columns: repeat(auto-fill, minmax(86px, 1fr)); padding: 14px; }
+    .file .icon { width: 42px; height: 52px; }
+  }
+
+  @media (max-width: 560px) {
+    body { font-size: 16px; }
+    .btn { width: 100%; max-width: 360px; }
+    .tag { padding: 16px 24px; border-radius: 20px; }
+    .toast { white-space: normal; width: calc(100% - 32px); text-align: center; }
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="#" class="logo">
+    <svg viewBox="0 0 32 32" aria-hidden="true">
+      <circle cx="16" cy="16" r="12.5" fill="none" stroke="#4678f5" stroke-width="5" stroke-dasharray="16.5 3.1"/>
+      <circle cx="16" cy="16" r="3.4" fill="#fff"/>
+    </svg>
+    uskko
+  </a>
+</nav>
+
+<!-- Первый экран: колесо поднимается и растёт при прокрутке -->
+<section class="scene" id="hero">
+  <div class="sticky">
+    <div class="hero-glow" id="heroGlow"></div>
+    <div class="hero-wheel" id="heroWheelBox"><canvas id="heroWheel"></canvas></div>
+    <div class="hero-text" id="heroText">
+      <h1>Файлы.<br><span class="grad">Одним движением.</span></h1>
+      <p class="lead">Все действия с файлами уже под курсором.</p>
+      <a href="uskko-setup-0.1.0.exe" class="btn" download>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12M6 11l6 6 6-6M5 20h14"/></svg>
+        Скачать для Windows
+      </a>
+      <p class="meta">Версия 0.1 · 6,8 МБ</p>
+    </div>
+    <p class="hero-note" id="heroNote">Открывается там, где курсор. <span>Наведите мышь.</span></p>
+  </div>
+</section>
+
+<!-- Демо: каждый шаг привязан к прокрутке -->
+<section class="scene" id="demo">
+  <div class="sticky">
+    <div class="demo-layout">
+      <div class="captions" id="captions">
+        <h2>Выделите файл.</h2>
+        <h2>Зажмите <span class="grad">Alt + Q</span>.</h2>
+        <h2>Наведите на действие.</h2>
+        <h2>Отпустите.</h2>
+        <h2>Готово. <span class="grad">Уже выделен.</span></h2>
+      </div>
+      <div class="window">
+        <div class="titlebar">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="#f5c451"><path d="M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          <div class="path">Этот компьютер › Изображения › <b>&nbsp;Отпуск</b></div>
+        </div>
+        <div class="files">
+          <div class="file" id="srcFile"><div class="icon" style="--c:linear-gradient(160deg,#ffb36b,#ff5f8f 55%,#7b5cff)">PNG</div><span>море.png</span></div>
+          <div class="file"><div class="icon" style="--c:linear-gradient(160deg,#ff6b6b,#c53b5a)">PDF</div><span>билеты.pdf</span></div>
+          <div class="file"><div class="icon" style="--c:linear-gradient(160deg,#8f7bff,#5a43d6)">MP4</div><span>закат.mp4</span></div>
+          <div class="file"><div class="icon" style="--c:linear-gradient(160deg,#f5c451,#d98a1c)">ZIP</div><span>фото.zip</span></div>
+          <div class="file"><div class="icon" style="--c:linear-gradient(160deg,#3fd0ff,#2a7dd6)">MP3</div><span>прибой.mp3</span></div>
+          <div class="file"><div class="icon" style="--c:linear-gradient(160deg,#9be15d,#2fa36b)">JPG</div><span>горы.jpg</span></div>
+          <div class="file"><div class="icon" style="--c:linear-gradient(160deg,#5ee0a0,#24a46d)">RAR</div><span>архив.rar</span></div>
+          <div class="file"><div class="icon" style="--c:linear-gradient(160deg,#9aa3b5,#5d6576)">TXT</div><span>список.txt</span></div>
+          <div class="file new" id="newFile"><div class="icon" style="--c:linear-gradient(160deg,#ffb36b,#ff5f8f 55%,#7b5cff)">WEBP</div><span>море.webp</span></div>
+        </div>
+        <div class="demo-wheel"><canvas id="demoWheel"></canvas></div>
+      </div>
+      <div class="keys">
+        <div class="key" id="kAlt">Alt</div>
+        <span>+</span>
+        <div class="key" id="kQ">Q</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="kinds-intro">
+  <h2 class="reveal">Своё колесо<br><span class="grad">для каждого типа файлов.</span></h2>
+</div>
+
+<!-- Категории: колесо меняется при прокрутке -->
+<section class="scene" id="kinds">
+  <div class="sticky">
+    <div class="kinds-layout">
+      <div class="kind-text" id="kindText"></div>
+      <div class="kind-wheel"><canvas id="kindWheel"></canvas></div>
+    </div>
+    <div class="progress" id="kindDots"></div>
+  </div>
+</section>
+
+<section class="formats">
+  <h2 class="reveal">Из одного формата в другой.</h2>
+  <p class="sub reveal">Без конвертеров и сайтов.</p>
+  <div class="rows">
+    <div class="row" id="row1">
+      <span class="tag">PNG</span><span class="tag blue">JPG</span><span class="tag">WebP</span><span class="tag ghost">ICO</span><span class="tag">PDF</span><span class="tag blue">MP4</span><span class="tag">WMV</span><span class="tag ghost">720p</span><span class="tag">PNG</span><span class="tag blue">JPG</span><span class="tag">WebP</span>
+    </div>
+    <div class="row" id="row2">
+      <span class="tag ghost">RAR</span><span class="tag">ZIP</span><span class="tag blue">7z</span><span class="tag">MP3</span><span class="tag ghost">M4A</span><span class="tag">WAV</span><span class="tag blue">FLAC</span><span class="tag">SHA-256</span><span class="tag ghost">RAR</span><span class="tag">ZIP</span><span class="tag blue">7z</span>
+    </div>
+  </div>
+</section>
+
+<section class="manifesto">
+  <div class="wrap">
+    <p class="big" id="manifesto">Без окон. Без меню. Без облака.</p>
+    <p class="after" id="after">Файлы обрабатываются <b>на вашем компьютере</b>. Интернет не нужен, аккаунт тоже.</p>
+  </div>
+</section>
+
+<section class="final">
+  <div class="final-wheel reveal"><canvas id="finalWheel"></canvas></div>
+  <h2 class="reveal">uskko</h2>
+  <p class="lead reveal">Для Windows 10 и 11. Бесплатно.</p>
+  <div class="reveal">
+    <a href="uskko-setup-0.1.0.exe" class="btn" download>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12M6 11l6 6 6-6M5 20h14"/></svg>
+      Скачать для Windows
+    </a>
+    <p class="meta">Версия 0.1 · 6,8 МБ</p>
+  </div>
+</section>
+
+<footer>
+  <span>© 2026 oblako</span>
+  <span>uskko 0.1</span>
+</footer>
+
+<div class="toast" id="toast">Ссылка на загрузку появится совсем скоро</div>
+
+<script>
+// =====================================================================
+// Колесо — та же отрисовка, что в программе (src/wheel.rs, src/icons.rs):
+// перспектива с наклоном к курсору, выезжающая секция, иконки 24×24.
+// =====================================================================
+
+const OUTER = 140, INNER = 56, CENTER = 50, ICON_SIZE = 22, ICON_SHIFT = 10, LABEL_SHIFT = 13;
+const DEAD_ZONE = 44, SECTOR_GAP = 3, POP_OUT = 9, LIFT = 26, TILT_DEPTH = 44, FOCAL = 700;
+const LOGICAL = 380;
+
+const SECTOR = [38, 41, 50, 250], PLATE = [14, 15, 19, 235], ACCENT_INNER = [70, 120, 245, 250];
+const ACCENT_OUTER = [120, 165, 255, 250], CENTER_FILL = [22, 24, 30, 252];
+const TEXT = [235, 238, 245, 255], TEXT_MUTED = [160, 168, 185, 255];
+const FONT = '"Inter", "Segoe UI", system-ui, sans-serif';
+
+const mix = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+const rgba = (c, alpha = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${(c[3] / 255) * alpha})`;
+const clamp = (v, lo = 0, hi = 1) => Math.min(hi, Math.max(lo, v));
+const easeOut = (t) => 1 - Math.pow(1 - clamp(t), 3);
+const easeInOut = (t) => (t = clamp(t), t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+const range = (p, a, b) => clamp((p - a) / (b - a));
+const rad = (d) => (d * Math.PI) / 180;
+
+// ---------- Иконки ----------
+
+class Shape {
+  constructor() { this.p = new Path2D(); }
+  polyline(pts) { this.p.moveTo(...pts[0]); for (const pt of pts.slice(1)) this.p.lineTo(...pt); }
+  polygon(pts) { this.polyline(pts); this.p.closePath(); }
+  line(x1, y1, x2, y2) { this.polyline([[x1, y1], [x2, y2]]); }
+  rect(x, y, w, h, r) { this.p.roundRect(x, y, w, h, r); }
+  circle(cx, cy, r) { this.p.moveTo(cx + r, cy); this.p.arc(cx, cy, r, 0, Math.PI * 2); }
+  arc(cx, cy, r, start, sweep) {
+    const steps = Math.max(2, Math.ceil(Math.abs(sweep) / 6));
+    const pt = (d) => [cx + Math.cos(rad(d)) * r, cy + Math.sin(rad(d)) * r];
+    this.p.moveTo(...pt(start));
+    for (let i = 1; i <= steps; i++) this.p.lineTo(...pt(start + (sweep * i) / steps));
+    const end = rad(start + sweep);
+    const dir = sweep >= 0 ? [-Math.sin(end), Math.cos(end)] : [Math.sin(end), -Math.cos(end)];
+    return [pt(start + sweep), dir];
+  }
+  arrowHead(tip, [dx, dy], len) {
+    const l = Math.hypot(dx, dy) || 1;
+    dx /= l; dy /= l;
+    const side = (a) => {
+      const s = Math.sin(rad(a)), c = Math.cos(rad(a));
+      return [tip[0] + (-dx * c + dy * s) * len, tip[1] + (-dx * s - dy * c) * len];
+    };
+    this.polyline([side(40), tip, side(-40)]);
+  }
+}
+
+const ICONS = {
+  picture(s) { s.rect(3, 4, 18, 16, 2.5); s.circle(9, 9.5, 1.8); s.polyline([[3.5, 18.5], [9, 13], [13, 16.5], [16, 13.5], [20.5, 18]]); },
+  document(s) { s.polygon([[6, 3], [14, 3], [19, 8], [19, 21], [6, 21]]); s.polyline([[14, 3], [14, 8], [19, 8]]); s.line(9, 13, 15, 13); s.line(9, 17, 15, 17); },
+  compress(s) { s.polyline([[4, 14], [10, 14], [10, 20]]); s.polyline([[20, 10], [14, 10], [14, 4]]); s.line(14, 10, 21, 3); s.line(3, 21, 10, 14); },
+  resize(s) { s.rect(3, 12, 9, 9, 2); s.polyline([[3, 8], [3, 5], [5, 3], [19, 3], [21, 5], [21, 19], [19, 21], [16, 21]]); s.line(19, 5, 13.5, 10.5); s.polyline([[13.5, 6], [13.5, 10.5], [18, 10.5]]); },
+  noLocation(s) { s.arc(12, 10, 6.5, 180, 180); s.p.bezierCurveTo(18.5, 14.5, 13.5, 17.5, 12, 21); s.p.bezierCurveTo(10.5, 17.5, 5.5, 14.5, 5.5, 10); s.circle(12, 10, 2.2); s.line(3.5, 3.5, 20.5, 20.5); },
+  merge(s) { s.polyline([[5, 21], [12, 13], [19, 21]]); s.line(12, 13, 12, 3); s.polyline([[8, 7], [12, 3], [16, 7]]); },
+  archive(s) { s.rect(3, 4, 18, 5, 1.5); s.polyline([[5, 9], [5, 18.5], [6.5, 20], [17.5, 20], [19, 18.5], [19, 9]]); s.line(10, 13, 14, 13); },
+  extract(s) { s.polyline([[4, 11], [4, 18.5], [5.5, 20], [18.5, 20], [20, 18.5], [20, 11]]); s.line(12, 16, 12, 3); s.polyline([[8, 7], [12, 3], [16, 7]]); },
+  repack(s) { s.rect(3, 4, 18, 5, 1.5); s.polyline([[5, 9], [5, 18.5], [6.5, 20], [17.5, 20], [19, 18.5], [19, 9]]); s.line(8.5, 12.5, 15.5, 12.5); s.arrowHead([15.5, 12.5], [1, 0], 2.6); s.line(15.5, 16.5, 8.5, 16.5); s.arrowHead([8.5, 16.5], [-1, 0], 2.6); },
+  copy(s) { s.rect(9, 9, 12, 12, 2); s.polyline([[5, 15], [4, 15], [3, 14], [3, 4], [4, 3], [14, 3], [15, 4], [15, 5]]); },
+  hash(s) { s.line(10, 3, 8, 21); s.line(16, 3, 14, 21); s.line(4, 9, 20, 9); s.line(4, 15, 20, 15); },
+  newFolder(s) { s.polygon([[3, 6], [3, 5], [4, 4], [9, 4], [11, 7], [20, 7], [21, 8], [21, 19], [20, 20], [4, 20], [3, 19]]); s.line(12, 10.5, 12, 16.5); s.line(9, 13.5, 15, 13.5); },
+  film(s) { s.rect(3, 3, 18, 18, 2.5); s.line(7, 3, 7, 21); s.line(17, 3, 17, 21); s.line(3, 12, 21, 12); s.line(3, 7.5, 7, 7.5); s.line(3, 16.5, 7, 16.5); s.line(17, 7.5, 21, 7.5); s.line(17, 16.5, 21, 16.5); },
+  music(s) { s.polyline([[9, 18], [9, 5], [21, 3], [21, 16]]); s.circle(6, 18, 3); s.circle(18, 16, 3); },
+  sound(s) { s.polygon([[3, 9], [7, 9], [12, 5], [12, 19], [7, 15], [3, 15]]); s.arc(13, 12, 3.5, -50, 100); s.arc(13, 12, 7.5, -50, 100); },
+};
+
+const iconPaths = {};
+for (const [name, build] of Object.entries(ICONS)) { const s = new Shape(); build(s); iconPaths[name] = s.p; }
+
+function drawIcon(ctx, name, cx, cy, size, color) {
+  const k = size / 24;
+  ctx.save();
+  ctx.translate(cx - 12 * k, cy - 12 * k);
+  ctx.scale(k, k);
+  ctx.lineWidth = 2;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = color;
+  ctx.stroke(iconPaths[name]);
+  ctx.restore();
+}
+
+// ---------- Раскладки по умолчанию (src/config.rs) ----------
+
+const a = (icon, label, title) => ({ icon, label, title: title || label });
+
+const LAYOUTS = {
+  images: { caption: "Картинки", subtitle: "1 файл", slots: [
+    a("picture", "PNG", "Конвертировать в PNG"), a("compress", "Сжать"), a("picture", "JPG", "Конвертировать в JPG"),
+    a("resize", "Уменьшить", "Уменьшить до 1920 px"), a("picture", "WebP", "Конвертировать в WebP"),
+    a("noLocation", "Очистить", "Удалить метаданные"), a("document", "PDF", "Собрать в PDF"), a("archive", "ZIP", "Упаковать в ZIP")] },
+  pdf: { caption: "PDF", subtitle: "3 файла", slots: [
+    a("picture", "PNG", "Страницы в PNG"), a("merge", "Склеить", "Склеить PDF"), a("archive", "ZIP", "Упаковать в ZIP"), a("copy", "Путь", "Копировать путь")] },
+  archive: { caption: "Архивы", subtitle: "1 файл", slots: [
+    a("extract", "Распаковать", "Распаковать сюда"), a("repack", "В ZIP", "Переупаковать в ZIP"), a("newFolder", "В папку", "Переложить в новую папку"),
+    a("copy", "Путь", "Копировать путь"), a("repack", "В 7z", "Переупаковать в 7z")] },
+  video: { caption: "Видео", subtitle: "1 файл", slots: [
+    a("film", "MP4", "Конвертировать в MP4"), a("compress", "Сжать", "Сжать видео"), a("resize", "720p", "Уменьшить до 720p"),
+    a("sound", "Звук", "Извлечь звук в MP3"), a("film", "WMV", "Конвертировать в WMV")] },
+  audio: { caption: "Аудио", subtitle: "4 файла", slots: [
+    a("music", "MP3", "Конвертировать в MP3"), a("music", "M4A", "Конвертировать в M4A"), a("music", "WAV", "Конвертировать в WAV"),
+    a("music", "FLAC", "Конвертировать в FLAC"), a("merge", "Склеить", "Склеить аудио")] },
+  files: { caption: "Файлы", subtitle: "5 файлов", slots: [
+    a("archive", "ZIP", "Упаковать в ZIP"), a("hash", "SHA-256", "Копировать SHA-256"), a("newFolder", "В папку", "Переложить в новую папку"), a("copy", "Путь", "Копировать путь")] },
+};
+
+// ---------- Текст ----------
+
+function fitSize(ctx, text, weight, size, maxWidth, min = 8) {
+  ctx.font = `${weight} ${size}px ${FONT}`;
+  while (ctx.measureText(text).width > maxWidth && size > min) {
+    size -= 0.5;
+    ctx.font = `${weight} ${size}px ${FONT}`;
+  }
+  return size;
+}
+
+function fitLines(ctx, text, weight, maxWidth, maxLines, size) {
+  for (; size >= 8; size -= 0.5) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    const lines = [];
+    let line = "";
+    for (const word of text.split(" ")) {
+      const next = line ? line + " " + word : word;
+      if (ctx.measureText(next).width <= maxWidth || !line) line = next;
+      else { lines.push(line); line = word; }
+    }
+    lines.push(line);
+    if (lines.length <= maxLines && lines.every((l) => ctx.measureText(l).width <= maxWidth)) return [lines, size];
+  }
+  return [[text], 8];
+}
+
+// ---------- Колесо ----------
+
+class WheelView {
+  constructor(canvas, layout) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    this.open = 1;
+    this.tilt = [0, 0];
+    this.targetTilt = [0, 0];
+    this.active = null;
+    this.pointer = null;
+    this.mouseUntil = 0;
+    this.setLayout(layout);
+    canvas.addEventListener("pointermove", (e) => {
+      if (e.pointerType !== "mouse") return;
+      const box = canvas.getBoundingClientRect();
+      const k = box.width / LOGICAL;
+      this.mouseUntil = performance.now() + 1500;
+      this.point((e.clientX - box.left - box.width / 2) / k, (e.clientY - box.top - box.height / 2) / k);
+    });
+    canvas.addEventListener("pointerleave", () => { this.mouseUntil = 0; });
+  }
+
+  setLayout(layout) {
+    if (this.layout === layout) return;
+    this.layout = layout;
+    this.hover = layout.slots.map(() => 0);
+    this.active = null;
+  }
+
+  get mouse() { return performance.now() < this.mouseUntil; }
+
+  // Курсор в логических единицах от центра (как set_cursor в программе).
+  point(dx, dy) {
+    this.pointer = [dx, dy];
+    const d = Math.hypot(dx, dy);
+    const n = this.layout.slots.length;
+    if (d < DEAD_ZONE || d > OUTER + POP_OUT + 40) this.active = null;
+    else {
+      const deg = ((Math.atan2(dx, -dy) * 180) / Math.PI + 360) % 360;
+      this.active = Math.round(deg / (360 / n)) % n;
+    }
+    const strength = Math.min(d / OUTER, 1);
+    this.targetTilt = d <= 1 ? [0, 0] : [(dx / d) * strength, (dy / d) * strength];
+  }
+
+  // Курсор на середину секции.
+  pointSlot(slot, radius = (OUTER + INNER) / 2) {
+    const ang = rad(slot * (360 / this.layout.slots.length));
+    this.point(Math.sin(ang) * radius, -Math.cos(ang) * radius);
+  }
+
+  center() { this.pointer = null; this.active = null; this.targetTilt = [0, 0]; }
+
+  tick(dt) {
+    const f = (rate) => 1 - Math.pow(1 - rate, dt * 60);
+    this.hover = this.hover.map((h, i) => h + ((i === this.active ? 1 : 0) - h) * f(0.28));
+    this.tilt = this.tilt.map((t, i) => t + (this.targetTilt[i] - t) * f(0.18));
+  }
+
+  draw(cursor = false) {
+    const { canvas, ctx } = this;
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    const w = Math.round(canvas.clientWidth * dpr);
+    if (!w) return;
+    if (canvas.width !== w) { canvas.width = w; canvas.height = w; }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, w, w);
+    const scale = w / LOGICAL;
+    paintWheel(ctx, w / 2, w / 2, scale, this);
+    if (cursor && this.pointer && this.open > 0.05) drawCursor(ctx, w / 2 + this.pointer[0] * scale, w / 2 + this.pointer[1] * scale, scale);
+  }
+}
+
+function paintWheel(ctx, cx, cy, scale, s) {
+  const progress = easeOut(s.open);
+  if (progress <= 0.001) return;
+  const zoom = 0.78 + 0.22 * progress;
+  const alpha = progress;
+  const [tx, ty] = s.tilt;
+
+  const project = (x, y, z) => {
+    const depth = z + ((x * tx + y * ty) / OUTER) * TILT_DEPTH;
+    const f = (FOCAL / (FOCAL + depth)) * zoom * scale;
+    return [cx + x * f, cy + y * f];
+  };
+
+  const circle = (r) => {
+    const p = new Path2D();
+    for (let i = 0; i <= 96; i++) {
+      const t = (i / 96) * Math.PI * 2;
+      const [x, y] = project(Math.cos(t) * r, Math.sin(t) * r, 0);
+      i ? p.lineTo(x, y) : p.moveTo(x, y);
+    }
+    p.closePath();
+    return p;
+  };
+
+  // Тень.
+  const sr = (OUTER + 28) * scale * zoom, sy = cy + 10 * scale;
+  const shadow = ctx.createRadialGradient(cx, sy, 0, cx, sy, sr);
+  shadow.addColorStop(0, `rgba(0,0,0,${0.45 * alpha})`);
+  shadow.addColorStop(0.75, `rgba(0,0,0,${0.25 * alpha})`);
+  shadow.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = shadow;
+  ctx.fillRect(cx - sr, sy - sr, sr * 2, sr * 2);
+
+  // Пластина.
+  const plate = circle(OUTER + 5);
+  ctx.fillStyle = rgba(PLATE, alpha);
+  ctx.fill(plate);
+  ctx.lineWidth = scale;
+  ctx.strokeStyle = `rgba(255,255,255,${(22 / 255) * alpha})`;
+  ctx.stroke(plate);
+
+  const n = s.layout.slots.length;
+  const step = 360 / n;
+  const order = [...Array(n).keys()].sort((x, y) => s.hover[x] - s.hover[y]);
+  for (const slot of order) drawSector(ctx, project, s, slot, step, alpha, scale);
+
+  const center = circle(CENTER);
+  ctx.fillStyle = rgba(CENTER_FILL, alpha);
+  ctx.fill(center);
+  ctx.strokeStyle = `rgba(255,255,255,${(30 / 255) * alpha})`;
+  ctx.lineWidth = scale;
+  ctx.stroke(center);
+
+  // Подпись в центре.
+  const [ax, ay] = project(0, 0, 0);
+  const ps = zoom * scale;
+  const maxW = (CENTER * 2 - 16) * ps;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  if (s.active !== null) {
+    const [lines, size] = fitLines(ctx, s.layout.slots[s.active].title, 600, maxW, 3, 14 * ps);
+    const lh = size * 1.15;
+    const top = ay - (lh * (lines.length - 1)) / 2;
+    ctx.fillStyle = rgba(TEXT, alpha);
+    lines.forEach((l, i) => ctx.fillText(l, ax, top + i * lh));
+  } else {
+    fitSize(ctx, s.layout.caption, 600, 14 * ps, maxW);
+    ctx.fillStyle = rgba(TEXT, alpha);
+    ctx.fillText(s.layout.caption, ax, ay - 8 * ps);
+    fitSize(ctx, s.layout.subtitle, 400, 11.5 * ps, maxW);
+    ctx.fillStyle = rgba(TEXT_MUTED, alpha);
+    ctx.fillText(s.layout.subtitle, ax, ay + 10 * ps);
+  }
+}
+
+function drawSector(ctx, project, s, slot, step, alpha, scale) {
+  const view = s.layout.slots[slot];
+  const hover = s.hover[slot];
+  const middle = slot * step;
+  const toRad = (d) => rad(d - 90);
+  const m = toRad(middle);
+  const cos = Math.cos(m), sin = Math.sin(m);
+  const off = [cos * POP_OUT * hover, sin * POP_OUT * hover];
+  const lift = -LIFT * hover;
+  const halfOuter = step / 2 - (SECTOR_GAP / 2 / OUTER) * (180 / Math.PI);
+  const halfInner = step / 2 - (SECTOR_GAP / 2 / INNER) * (180 / Math.PI);
+  const segs = Math.max(6, Math.ceil(step / 3));
+
+  const path = new Path2D();
+  for (let i = 0; i <= segs; i++) {
+    const t = toRad(middle - halfOuter + (2 * halfOuter * i) / segs);
+    const [x, y] = project(Math.cos(t) * OUTER + off[0], Math.sin(t) * OUTER + off[1], lift);
+    i ? path.lineTo(x, y) : path.moveTo(x, y);
+  }
+  for (let i = segs; i >= 0; i--) {
+    const t = toRad(middle - halfInner + (2 * halfInner * i) / segs);
+    path.lineTo(...project(Math.cos(t) * INNER + off[0], Math.sin(t) * INNER + off[1], lift));
+  }
+  path.closePath();
+
+  const at = (r) => project(cos * r + off[0], sin * r + off[1], lift);
+  const [x0, y0] = at(INNER), [x1, y1] = at(OUTER);
+  const g = ctx.createLinearGradient(x0, y0, x1, y1);
+  g.addColorStop(0, rgba(mix(SECTOR, ACCENT_INNER, hover), alpha));
+  g.addColorStop(1, rgba(mix(SECTOR, ACCENT_OUTER, hover), alpha));
+  ctx.fillStyle = g;
+  ctx.fill(path);
+  ctx.strokeStyle = rgba(mix([255, 255, 255, 16], [255, 255, 255, 90], hover), alpha);
+  ctx.lineWidth = scale;
+  ctx.stroke(path);
+
+  const labelRadius = (OUTER + INNER) / 2;
+  const [lx, ly] = at(labelRadius);
+  const chord = 2 * labelRadius * Math.sin(Math.min(rad(halfOuter), Math.PI / 2));
+  const maxW = clamp(chord - 10, 30, OUTER - INNER - 8) * scale;
+  const color = rgba(TEXT, alpha);
+
+  drawIcon(ctx, view.icon, lx, ly - ICON_SHIFT * scale, (ICON_SIZE + hover * 2) * scale, color);
+
+  const size = fitSize(ctx, view.label, 600, (12.5 + hover * 1.5) * scale, maxW, 8 * scale);
+  ctx.font = `600 ${size}px ${FONT}`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = color;
+  ctx.fillText(view.label, lx, ly + LABEL_SHIFT * scale);
+}
+
+function drawCursor(ctx, x, y, scale) {
+  const k = scale * 1.15;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(k, k);
+  const p = new Path2D("M0 0 L0 17 L4.2 13.2 L7 19.5 L9.6 18.4 L6.9 12.2 L12.5 12.2 Z");
+  ctx.shadowColor = "rgba(0,0,0,.5)";
+  ctx.shadowBlur = 6;
+  ctx.shadowOffsetY = 2;
+  ctx.fillStyle = "#fff";
+  ctx.fill(p);
+  ctx.shadowColor = "transparent";
+  ctx.lineWidth = 1.2;
+  ctx.strokeStyle = "#000";
+  ctx.lineJoin = "round";
+  ctx.stroke(p);
+  ctx.restore();
+}
+
+// =====================================================================
+// Сцены
+// =====================================================================
+
+const $ = (id) => document.getElementById(id);
+const vh = () => innerHeight;
+
+// Прогресс прокрутки сцены: 0 — сцена только закрепилась, 1 — отпускается.
+function sceneProgress(el) {
+  const box = el.getBoundingClientRect();
+  return clamp(-box.top / (box.height - vh()));
+}
+
+const visible = new Set();
+const watch = new IntersectionObserver((entries) => {
+  for (const e of entries) e.isIntersecting ? visible.add(e.target) : visible.delete(e.target);
+}, { rootMargin: "100px" });
+
+// ---------- Первый экран ----------
+
+const heroWheel = new WheelView($("heroWheel"), LAYOUTS.images);
+watch.observe($("hero"));
+
+function hero(p, t) {
+  const e = easeInOut(range(p, 0, 0.55));
+  $("heroText").style.transform = `translateY(${-e * 160}px) scale(${1 - e * 0.08})`;
+  $("heroText").style.opacity = 1 - range(p, 0.05, 0.35);
+  $("heroText").style.pointerEvents = p > 0.3 ? "none" : "";
+
+  // Колесо выезжает снизу, растёт и встаёт в центр.
+  const y = (1 - e) * vh() * 0.4;
+  const sc = 0.62 + e * 0.5;
+  const tiltY = (1 - e) * 26;
+  $("heroWheelBox").style.transform = `translateY(${y}px) perspective(1200px) rotateX(${tiltY}deg) scale(${sc})`;
+  $("heroGlow").style.opacity = 0.4 + e * 0.6;
+  $("heroGlow").style.transform = `translateY(${y * 0.6}px) scale(${0.7 + e * 0.5})`;
+
+  const note = range(p, 0.55, 0.7) * (1 - range(p, 0.92, 1));
+  $("heroNote").style.opacity = note;
+  $("heroNote").style.transform = `translateY(${(1 - note) * 20}px)`;
+
+  // Пока мышь не над колесом — подсветка обходит секции.
+  if (!heroWheel.mouse) {
+    const n = heroWheel.layout.slots.length;
+    heroWheel.pointSlot(Math.floor(t / 0.9) % n);
+  }
+}
+
+// ---------- Демо ----------
+
+const demoWheel = new WheelView($("demoWheel"), LAYOUTS.images);
+const captions = [...$("captions").children];
+watch.observe($("demo"));
+
+function demo(p) {
+  const phase = p < 0.14 ? 0 : p < 0.3 ? 1 : p < 0.62 ? 2 : p < 0.76 ? 3 : 4;
+  captions.forEach((c, i) => c.classList.toggle("on", i === phase));
+
+  $("srcFile").classList.toggle("selected", p > 0.05 && p < 0.8);
+  $("newFile").classList.toggle("shown", p > 0.8);
+  $("newFile").classList.toggle("selected", p > 0.82);
+
+  $("kAlt").classList.toggle("down", p > 0.17 && p < 0.7);
+  $("kQ").classList.toggle("down", p > 0.19 && p < 0.7);
+
+  // Раскрытие и закрытие — по прокрутке.
+  demoWheel.open = p < 0.7 ? range(p, 0.2, 0.27) : 1 - range(p, 0.7, 0.75);
+
+  // Курсор: из центра по кругу к WebP (секция 4, вниз), задевая соседние.
+  if (p < 0.32) demoWheel.center();
+  else {
+    const k = easeInOut(range(p, 0.32, 0.6));
+    const r = Math.min(1, k * 4) * ((OUTER + INNER) / 2 + 6);
+    const ang = rad(-20 + k * 200);
+    demoWheel.point(Math.sin(ang) * r, -Math.cos(ang) * r);
+  }
+}
+
+// ---------- Категории ----------
+
+const KINDS = [
+  { key: "images", count: "1 картинка", name: "Картинки", text: "PNG, JPG, WebP и ICO. Сжать, уменьшить, повернуть, убрать метаданные, собрать в PDF." },
+  { key: "pdf", count: "3 PDF", name: "PDF", text: "Склеить несколько в один. Разложить страницы на картинки." },
+  { key: "archive", count: "1 архив", name: "Архивы", text: "RAR, ZIP и 7z. Распаковать рядом или переупаковать в другой формат." },
+  { key: "video", count: "1 видео", name: "Видео", text: "В MP4 или WMV. Сжать, уменьшить до 720p, вытащить звук." },
+  { key: "audio", count: "4 трека", name: "Аудио", text: "MP3, M4A, WAV, FLAC. Склеить несколько в один." },
+  { key: "files", count: "5 файлов", name: "Что угодно", text: "Скопировать путь или SHA-256, упаковать в ZIP, переложить в новую папку." },
+];
+
+$("kindText").innerHTML = KINDS.map((k) => `<div class="kind"><p class="count">${k.count}</p><h2>${k.name}</h2><p>${k.text}</p></div>`).join("");
+$("kindDots").innerHTML = KINDS.map(() => "<i></i>").join("");
+
+const kindWheel = new WheelView($("kindWheel"), LAYOUTS.images);
+const kindEls = [...$("kindText").children], dots = [...$("kindDots").children];
+let kindIndex = -1, kindSince = 0;
+watch.observe($("kinds"));
+
+function kinds(p, t) {
+  const pos = p * KINDS.length;
+  const index = Math.min(KINDS.length - 1, Math.floor(pos));
+  const local = pos - index;
+
+  if (index !== kindIndex) {
+    kindIndex = index;
+    kindSince = t;
+    kindEls.forEach((el, i) => el.classList.toggle("on", i === index));
+    dots.forEach((el, i) => el.classList.toggle("on", i === index));
+  }
+
+  // На границе категорий колесо закрывается и открывается уже другим.
+  const closing = index < KINDS.length - 1 ? range(local, 0.86, 1) : 0;
+  const opening = index > 0 ? range(local, 0, 0.14) : 1;
+  kindWheel.open = Math.min(opening, 1 - closing);
+  kindWheel.setLayout(LAYOUTS[KINDS[index].key]);
+
+  if (!kindWheel.mouse) {
+    const n = kindWheel.layout.slots.length;
+    const elapsed = t - kindSince;
+    elapsed < 0.4 ? kindWheel.center() : kindWheel.pointSlot(Math.floor((elapsed - 0.4) / 0.85) % n);
+  }
+}
+
+// ---------- Финал ----------
+
+const finalWheel = new WheelView($("finalWheel"), LAYOUTS.files);
+watch.observe($("finalWheel"));
+
+// ---------- Форматы ----------
+
+function formats() {
+  const box = document.querySelector(".formats").getBoundingClientRect();
+  if (box.bottom < 0 || box.top > vh()) return;
+  const p = clamp((vh() - box.top) / (vh() + box.height));
+  const shift = (el, from, to) => {
+    const extra = Math.max(el.scrollWidth - innerWidth, 0);
+    el.style.transform = `translateX(${-(from + (to - from) * p) * extra}px)`;
+  };
+  shift($("row1"), 0.05, 0.85);
+  shift($("row2"), 0.85, 0.05);
+}
+
+// ---------- Манифест ----------
+
+const manifesto = $("manifesto");
+manifesto.innerHTML = manifesto.textContent.split(" ").map((w) => `<span class="w">${w}</span>`).join(" ");
+const words = [...manifesto.children];
+
+function lightWords() {
+  const box = manifesto.getBoundingClientRect();
+  const p = clamp((vh() * 0.8 - box.top) / (box.height + vh() * 0.3));
+  const count = Math.round(p * words.length);
+  words.forEach((w, i) => w.classList.toggle("lit", i < count));
+  $("after").classList.toggle("in", count === words.length);
+}
+
+// ---------- Главный цикл ----------
+
+let last = performance.now();
+
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  const t = now / 1000;
+
+  if (visible.has($("hero"))) {
+    hero(sceneProgress($("hero")), t);
+    heroWheel.tick(dt);
+    heroWheel.draw();
+  }
+
+  if (visible.has($("demo"))) {
+    demo(sceneProgress($("demo")));
+    demoWheel.tick(dt);
+    demoWheel.draw(true);
+  }
+
+  if (visible.has($("kinds"))) {
+    kinds(sceneProgress($("kinds")), t);
+    kindWheel.tick(dt);
+    kindWheel.draw();
+  }
+
+  if (visible.has($("finalWheel"))) {
+    if (!finalWheel.mouse) finalWheel.pointSlot(Math.floor(t / 1.1) % finalWheel.layout.slots.length);
+    finalWheel.tick(dt);
+    finalWheel.draw();
+  }
+
+  formats();
+  lightWords();
+  requestAnimationFrame(frame);
+}
+
+document.fonts.ready.finally(() => requestAnimationFrame(frame));
+
+// ---------- Появление ----------
+
+const reveal = new IntersectionObserver((entries) => {
+  for (const e of entries) if (e.isIntersecting) { e.target.classList.add("in"); reveal.unobserve(e.target); }
+}, { threshold: 0.2 });
+document.querySelectorAll(".reveal").forEach((el) => reveal.observe(el));
+
+// ---------- Заглушки «Скачать» ----------
+
+let toastTimer;
+
+</script>
+</body>
+</html>
